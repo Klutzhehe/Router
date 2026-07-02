@@ -49,13 +49,13 @@ class HeatmapVisualizer:
             for comp in board.components:
                 rect = patches.Rectangle(
                     (comp.x, comp.y), comp.width, comp.height,
-                    linewidth=1, edgecolor='#4B5563', facecolor='none', alpha=0.5
+                    linewidth=1, edgecolor='#4B5563', facecolor='none', alpha=0.5, zorder=5
                 )
                 ax.add_patch(rect)
             for pin in board.pins.values():
                 circle = patches.Circle(
                     (pin.global_x, pin.global_y), radius=3,
-                    facecolor='none', edgecolor='#FFFFFF', linewidth=0.5, alpha=0.8
+                    facecolor='none', edgecolor='#FFFFFF', linewidth=0.5, alpha=0.8, zorder=6
                 )
                 ax.add_patch(circle)
                 
@@ -153,9 +153,24 @@ class HeatmapVisualizer:
         
         # Plot 2: Heatmap Overlay
         im = ax2.imshow(heatmap, cmap='inferno', origin='lower')
+        
+        # Overlay transparent components and pads for reference
+        for comp in board_before.board.components:
+            rect = patches.Rectangle(
+                (comp.x, comp.y), comp.width, comp.height,
+                linewidth=1, edgecolor='#4B5563', facecolor='none', alpha=0.5, zorder=5
+            )
+            ax2.add_patch(rect)
+        for pin in board_before.board.pins.values():
+            circle = patches.Circle(
+                (pin.global_x, pin.global_y), radius=3,
+                facecolor='none', edgecolor='#FFFFFF', linewidth=0.5, alpha=0.8, zorder=6
+            )
+            ax2.add_patch(circle)
+
         if path:
             xs, ys = zip(*[(wp[0], wp[1]) for wp in path])
-            ax2.plot(xs, ys, color='#06B6D4', linewidth=2.0)
+            ax2.plot(xs, ys, color='#06B6D4', linewidth=2.0, zorder=10)
         ax2.set_title("Planned Heatmap & Path", color=self.text_color, fontsize=12)
         ax2.set_xticks([])
         ax2.set_yticks([])
