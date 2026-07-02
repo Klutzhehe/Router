@@ -92,7 +92,7 @@ class AStarPathfinder:
                 return path, g
                 
             state_key = (curr, last_dir)
-            if state_key in visited and visited[state_key] <= g:
+            if state_key in visited and visited[state_key] < g:
                 continue
             visited[state_key] = g
             
@@ -218,7 +218,7 @@ class AStarPathfinder:
                 return path, g
                 
             state_key = (curr, last_dir)
-            if state_key in visited and visited[state_key] <= g:
+            if state_key in visited and visited[state_key] < g:
                 continue
             visited[state_key] = g
             
