@@ -341,8 +341,12 @@ def main():
         b_mask = []
         
         for ep in sampled_episodes:
-            start = np.random.randint(0, max(ep.length - seq_len + 1, 1))
-            end = start + seq_len
+            if ep.length >= seq_len:
+                start = np.random.randint(0, ep.length - seq_len)
+                end = start + seq_len
+            else:
+                start = 0
+                end = ep.length
             
             ctx_slice = ep.context_embeddings[start:end]
             tgt_slice = getattr(ep, 'target_context_embeddings', ep.context_embeddings)[start:end]
