@@ -850,6 +850,16 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         self.gamma = t_cfg.get('gamma', 0.997)
         self.lambda_ = t_cfg.get('lambda_', 0.95)
         
+        # Optional torch.compile() for PyTorch 2.0+ GPU acceleration
+        self.compile_models = t_cfg.get('compile_models', True)
+        if self.compile_models and hasattr(torch, 'compile') and self.device.type == 'cuda':
+            print("Compiling world model and policy with torch.compile()...")
+            try:
+                self.jepa = torch.compile(self.jepa)
+                self.policy = torch.compile(self.policy)
+            except Exception as e:
+                print(f"torch.compile failed (falling back to uncompiled execution): {e}")
+        
         self.metrics_history = {
             'timesteps': [],
             'completion_rate': [],
@@ -1134,53 +1144,53 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             
             current_horizon = self._current_imagination_horizon()
             
-            for t in range(current_horizon):
-                net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
-                    net_embeddings, unrouted_mask, h, z, deterministic=False
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                for t in range(current_horizon):
+                    net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
+                        net_embeddings, unrouted_mask, h, z, deterministic=False
+                    )
+                    
+                    pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                    pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                    pred_continue = torch.sigmoid(pred_continue_logits)
+                    
+                    traj_h.append(h)
+                    traj_z.append(z)
+                    traj_actions_net.append(net_idx)
+                    traj_actions_heat.append(heatmap_latent)
+                    traj_rewards.append(pred_reward)
+                    traj_continues.append(pred_continue)
+                    traj_values.append(value)
+                    traj_log_probs_net.append(log_prob_net)
+                    traj_log_probs_heat.append(log_prob_heatmap)
+                    
+                    action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
+                    h, z = self.jepa.predict_step(h, z, action_emb)
+                    
+                    unrouted_mask = unrouted_mask.clone()
+                    unrouted_mask.scatter_(1, net_idx.unsqueeze(-1), False)
+                    
+                bootstrap_value = self.policy.get_value(h, z)
+                
+                traj_h = torch.stack(traj_h, dim=0)
+                traj_z = torch.stack(traj_z, dim=0)
+                traj_rewards = torch.stack(traj_rewards, dim=0)
+                traj_continues = torch.stack(traj_continues, dim=0)
+                traj_values = torch.stack(traj_values, dim=0)
+                traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
+                traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
+                
+                lambda_returns = compute_lambda_returns(
+                    rewards=traj_rewards,
+                    values=traj_values,
+                    continues=traj_continues,
+                    bootstrap=bootstrap_value,
+                    gamma=self.gamma,
+                    lam=self.lambda_
                 )
                 
-                pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                pred_continue = torch.sigmoid(pred_continue_logits)
-                
-                traj_h.append(h)
-                traj_z.append(z)
-                traj_actions_net.append(net_idx)
-                traj_actions_heat.append(heatmap_latent)
-                traj_rewards.append(pred_reward)
-                traj_continues.append(pred_continue)
-                traj_values.append(value)
-                traj_log_probs_net.append(log_prob_net)
-                traj_log_probs_heat.append(log_prob_heatmap)
-                
-                action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
-                h, z = self.jepa.predict_step(h, z, action_emb)
-                
-                unrouted_mask = unrouted_mask.clone()
-                unrouted_mask.scatter_(1, net_idx.unsqueeze(-1), False)
-                
-            bootstrap_value = self.policy.get_value(h, z)
-            
-            traj_h = torch.stack(traj_h, dim=0)
-            traj_z = torch.stack(traj_z, dim=0)
-            traj_rewards = torch.stack(traj_rewards, dim=0)
-            traj_continues = torch.stack(traj_continues, dim=0)
-            traj_values = torch.stack(traj_values, dim=0)
-            traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
-            traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
-            
-            lambda_returns = compute_lambda_returns(
-                rewards=traj_rewards,
-                values=traj_values,
-                continues=traj_continues,
-                bootstrap=bootstrap_value,
-                gamma=self.gamma,
-                lam=self.lambda_
-            )
-            
-            targets = lambda_returns.detach()
-            
-            critic_loss = F.mse_loss(traj_values, targets)
+                targets = lambda_returns.detach()
+                critic_loss = F.mse_loss(traj_values, targets)
             
             self.critic_opt.zero_grad(set_to_none=True)
             self.scaler_ac.scale(critic_loss).backward()
@@ -1188,9 +1198,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             grad_norm_crit = torch.nn.utils.clip_grad_norm_(self.policy.value_head.parameters(), 100.0)
             self.scaler_ac.step(self.critic_opt)
             
-            advantages = (targets - traj_values).detach()
-            loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
-            loss_policy = loss_policy.mean()
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                advantages = (targets - traj_values).detach()
+                loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
+                loss_policy = loss_policy.mean()
             
             self.actor_opt.zero_grad(set_to_none=True)
             self.scaler_ac.scale(loss_policy).backward()
