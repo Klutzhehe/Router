@@ -823,6 +823,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             list(self.policy.net_scorer.parameters()) +
             list(self.policy.heatmap_mlp.parameters()) +
             list(self.policy.heatmap_mean.parameters()) +
+            list(self.decoder.parameters()) +
             [self.policy.heatmap_log_std]
         )
         self.actor_opt = torch.optim.AdamW(actor_params, lr=actor_lr)
@@ -900,11 +901,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         return net_embs, unrouted_mask, fused_spatial
 
     def _phase1_collect_real(self, num_steps: int, explore: bool = True) -> float:
-        self.vit.eval()
-        self.gnn.eval()
-        self.fusion.eval()
-        self.jepa.eval()
-        self.policy.eval()
+        self.vit.train()
+        self.gnn.train()
+        self.fusion.train()
+        self.jepa.train()
+        self.policy.train()
+        self.decoder.train()
         
         steps_collected = 0
         completion_rates = []
@@ -922,25 +924,37 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
                 layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
                 
-                with torch.no_grad():
-                    context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
-                    target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
-                    net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
-                    
-                    net_idx_tensor, heatmap_latent, log_prob_net, log_prob_heatmap = self.policy.act(
-                        net_embs, unrouted_mask, h, z, explore=explore
-                    )
-                    
-                    action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent)
-                    h, z, _, _ = self.jepa.rssm_step(h, z, context_emb, action_emb)
-                    
-                    heatmaps_via = self.decoder(
-                        heatmap_latent, fused_spatial,
-                        self.env.H, self.env.W, active_layers_mask=layer_mask
-                    )
+                # 1. Forward pass WITH gradients enabled for supervised path training
+                context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
+                target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
+                net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
                 
-                heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].cpu().numpy()
-                via_prob_np = heatmaps_via[0, 8].cpu().numpy()
+                # Run policy forward to select net and sample heatmap_latent (differentiable rsample)
+                net_idx_tensor, log_prob_net, ent_net = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
+                
+                selected_net_emb = net_embs[0, net_idx_tensor.item()].unsqueeze(0)
+                state = torch.cat([h, z], dim=-1)
+                x_feat = torch.cat([selected_net_emb, state], dim=-1)
+                h_feat = self.policy.heatmap_mlp(x_feat)
+                mean = self.policy.heatmap_mean(h_feat)
+                log_std = torch.clamp(self.policy.heatmap_log_std, min=-20.0, max=2.0).expand_as(mean)
+                std = torch.exp(log_std)
+                
+                dist = torch.distributions.Normal(mean, std)
+                if not explore:
+                    heatmap_latent = mean
+                else:
+                    heatmap_latent = dist.rsample()  # Differentiable path!
+                
+                # Decode heatmap using current fused_spatial
+                heatmaps_via = self.decoder(
+                    heatmap_latent, fused_spatial,
+                    self.env.H, self.env.W, active_layers_mask=layer_mask
+                )
+                
+                # Step the environment using detached numpy arrays
+                heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].detach().cpu().numpy()
+                via_prob_np = heatmaps_via[0, 8].detach().cpu().numpy()
                 
                 self.last_heatmap = heatmaps_np
                 self.last_net_idx = net_idx_tensor.item()
@@ -950,19 +964,52 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 )
                 done = terminated or truncated
                 
-                action_tuple = (net_idx_tensor.squeeze(0).cpu(), heatmap_latent.squeeze(0).cpu())
-                
-                if not hasattr(episode, 'target_context_embeddings'):
-                    episode.target_context_embeddings = []
-                if not hasattr(episode, 'net_embeddings_list'):
-                    episode.net_embeddings_list = []
-                if not hasattr(episode, 'unrouted_masks_list'):
-                    episode.unrouted_masks_list = []
+                # Supervised update for decoder and encoders on successful paths
+                if next_info.get('connected', False) and 'path' in next_info and len(next_info['path']) > 1:
+                    all_routed_path = next_info['path']
+                    # target has same layers as env + 1 (for via)
+                    target_heatmap = torch.zeros((self.env.board.num_layers + 1, self.env.H, self.env.W), device=self.device)
+                    for idx, wp in enumerate(all_routed_path):
+                        wx, wy, wl = wp
+                        if 0 <= wx < self.env.W and 0 <= wy < self.env.H and 0 <= wl < self.env.board.num_layers:
+                            target_heatmap[wl, wy, wx] = 1.0
+                            # Mark via
+                            if idx > 0 and all_routed_path[idx-1][2] != wl:
+                                target_heatmap[-1, wy, wx] = 1.0
+                                
+                    # Match channels: pred has shape (9, H, W). We take layers 0..num_layers, and layer 8 (via map)
+                    pred_layers = heatmaps_via[0, :self.env.board.num_layers]
+                    pred_via = heatmaps_via[0, 8:9]
+                    pred_selected = torch.cat([pred_layers, pred_via], dim=0)
                     
-                episode.append(context_emb.squeeze(0).cpu(), action_tuple, reward, done)
-                episode.target_context_embeddings.append(target_context_emb.squeeze(0).cpu())
-                episode.net_embeddings_list.append(net_embs.squeeze(0).cpu())
-                episode.unrouted_masks_list.append(unrouted_mask.squeeze(0).cpu())
+                    loss_dec = F.mse_loss(pred_selected, target_heatmap)
+                    
+                    self.actor_opt.zero_grad(set_to_none=True)
+                    self.wm_opt.zero_grad(set_to_none=True)
+                    
+                    self.scaler_ac.scale(loss_dec).backward()
+                    
+                    self.scaler_ac.step(self.actor_opt)
+                    self.scaler_ac.step(self.wm_opt)  # Backprop to vit/gnn/fusion
+                    self.scaler_ac.update()
+                
+                # Detached RSSM update and Replay Buffer appending
+                with torch.no_grad():
+                    action_tuple = (net_idx_tensor.squeeze(0).cpu(), heatmap_latent.squeeze(0).cpu())
+                    action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent.detach())
+                    h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
+                    
+                    if not hasattr(episode, 'target_context_embeddings'):
+                        episode.target_context_embeddings = []
+                    if not hasattr(episode, 'net_embeddings_list'):
+                        episode.net_embeddings_list = []
+                    if not hasattr(episode, 'unrouted_masks_list'):
+                        episode.unrouted_masks_list = []
+                        
+                    episode.append(context_emb.squeeze(0).cpu(), action_tuple, reward, done)
+                    episode.target_context_embeddings.append(target_context_emb.squeeze(0).cpu())
+                    episode.net_embeddings_list.append(net_embs.squeeze(0).cpu())
+                    episode.unrouted_masks_list.append(unrouted_mask.squeeze(0).cpu())
                 
                 obs = next_obs
                 info = next_info

@@ -273,7 +273,9 @@ class JEPAWorldModel(nn.Module):
         global_spatial = cls_spatial
         global_graph = fused_pads.mean(dim=1)
         context_emb = torch.cat([global_spatial, global_graph], dim=-1)
-        return context_emb
+        
+        # Apply LayerNorm to stabilize embedding scales and prevent collapse/saturation
+        return F.layer_norm(context_emb, (context_emb.shape[-1],))
 
     def rssm_step(
         self,
