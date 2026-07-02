@@ -949,6 +949,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 info = next_info
                 steps_collected += 1
                 self.total_timesteps += 1
+                if steps_collected % 5 == 0 or steps_collected == num_steps:
+                    print(f"  Collected {steps_collected}/{num_steps} steps...")
                 
             if episode.length > 0:
                 episode.net_embeddings = episode.net_embeddings_list[0]
@@ -1230,7 +1232,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         
         if len(self.replay_buffer) < 5:
             print("Collecting initial warmup episodes for replay buffer...")
-            self._phase1_collect_real(num_steps=128, explore=True)
+            self._phase1_collect_real(num_steps=64, explore=True)
             
         while self.total_timesteps < total_timesteps:
             mean_completion = self._phase1_collect_real(num_steps=self.real_steps_per_iteration, explore=True)
