@@ -205,6 +205,9 @@ class PPOJEPATrainer:
             'stage': [],
         }
         
+        self.last_heatmap = None
+        self.last_net_idx = None
+        
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
 
@@ -856,6 +859,9 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             'stage': [],
         }
         
+        self.last_heatmap = None
+        self.last_net_idx = None
+        
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
 
@@ -925,6 +931,9 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 
                 heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].cpu().numpy()
                 via_prob_np = heatmaps_via[0, 8].cpu().numpy()
+                
+                self.last_heatmap = heatmaps_np
+                self.last_net_idx = net_idx_tensor.item()
                 
                 next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
                     net_idx_tensor.item(), heatmaps_np, via_prob_np
