@@ -198,12 +198,10 @@ class HeatmapVisualizer:
             ax.grid(True, color=self.grid_color, linestyle='--', linewidth=0.5)
             if data:
                 steps = np.arange(len(data))
-                ax.plot(steps, data, color=color, linewidth=1.5)
-                # Calculate and plot moving average
-                window = min(20, len(data))
-                if window > 1:
-                    ma = np.convolve(data, np.ones(window)/window, mode='valid')
-                    ax.plot(steps[window-1:], ma, color='#F59E0B', linewidth=2.0, label='MA')
+                ax.plot(steps, data, color=color, linewidth=0.8, alpha=0.25)
+                # Calculate and plot contiguous moving average (max window 20)
+                ma = [np.mean(data[max(0, i - 19) : i + 1]) for i in range(len(data))]
+                ax.plot(steps, ma, color='#F59E0B', linewidth=2.0, label='MA')
             ax.set_title(title, color=self.text_color, fontsize=12)
             ax.set_ylabel(ylabel, color=self.text_color)
             ax.set_xlabel('Episodes / Updates', color=self.text_color)
