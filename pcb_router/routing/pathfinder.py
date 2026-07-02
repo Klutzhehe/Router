@@ -151,6 +151,32 @@ class AStarPathfinder:
                         next_f = next_g + self._heuristic(next_pos, target)
                         heapq.heappush(pq, (next_f, next_g, next_pos, new_dir))
                         
+        # Debug fail information
+        print(f"[A* DEBUG] Failed to find path from {source} to {target} after {iterations} iterations.")
+        print(f"  Board size: {W}x{H}, Active layers: {active_layers}")
+        if board_state is not None:
+            for l in active_layers:
+                occ_map = obstacle_maps.get(l)
+                if occ_map is not None:
+                    src_blocked = occ_map[sy, sx]
+                    tgt_blocked = occ_map[ty, tx]
+                    print(f"  Layer {l}: source blocked={src_blocked}, target blocked={tgt_blocked}")
+                    
+                    # Print 5x5 neighborhood occupancy around source
+                    y_min, y_max = max(0, sy - 2), min(H - 1, sy + 2)
+                    x_min, x_max = max(0, sx - 2), min(W - 1, sx + 2)
+                    # Slice slice bounds inclusive
+                    neighborhood_src = occ_map[y_min:y_max+1, x_min:x_max+1].astype(int)
+                    print(f"  Layer {l} source neighborhood (5x5, center is source):\n{neighborhood_src}")
+                    
+                    # Print 5x5 neighborhood occupancy around target
+                    y_min, y_max = max(0, ty - 2), min(H - 1, ty + 2)
+                    x_min, x_max = max(0, tx - 2), min(W - 1, tx + 2)
+                    neighborhood_tgt = occ_map[y_min:y_max+1, x_min:x_max+1].astype(int)
+                    print(f"  Layer {l} target neighborhood (5x5, center is target):\n{neighborhood_tgt}")
+        else:
+            print("  board_state is None!")
+
         return None, float('inf')
 
     def find_path_multi_target(self, heatmaps, via_prob, source, targets, active_layers, max_iterations=200000):
