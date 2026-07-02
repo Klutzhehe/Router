@@ -405,6 +405,8 @@ class BoardGenerator:
             w_orig = comp.width
             h_orig = comp.height
             
+        pin_layer = -1 if pkg_type in ['DIP', 'connector'] else 0
+            
         if pkg_type == 'DIP':
             # Two vertical rows
             pins_per_row = num_pins // 2
@@ -414,8 +416,8 @@ class BoardGenerator:
             for i in range(pins_per_row):
                 y = board_margin = 15 + i * pin_spacing
                 # Pin ID, local coordinate relative to comp bottom-left, global coordinate, pad_shape
-                self._add_pin(comp, start_id + i, x_left, y, 0, 0)
-                self._add_pin(comp, start_id + pins_per_row + i, x_right, y, 0, 0)
+                self._add_pin(comp, start_id + i, x_left, y, pin_layer, 0)
+                self._add_pin(comp, start_id + pins_per_row + i, x_right, y, pin_layer, 0)
                 
         elif pkg_type == 'QFP':
             # Four rows on each side
@@ -424,16 +426,16 @@ class BoardGenerator:
             
             # Bottom side
             for i in range(pins_per_side):
-                self._add_pin(comp, start_id + i, 15 + i * pin_spacing, 10, 0, 1)
+                self._add_pin(comp, start_id + i, 15 + i * pin_spacing, 10, pin_layer, 1)
             # Right side
             for i in range(pins_per_side):
-                self._add_pin(comp, start_id + pins_per_side + i, side_len - 10, 15 + i * pin_spacing, 0, 1)
+                self._add_pin(comp, start_id + pins_per_side + i, side_len - 10, 15 + i * pin_spacing, pin_layer, 1)
             # Top side
             for i in range(pins_per_side):
-                self._add_pin(comp, start_id + 2*pins_per_side + i, side_len - 15 - i * pin_spacing, side_len - 10, 0, 1)
+                self._add_pin(comp, start_id + 2*pins_per_side + i, side_len - 15 - i * pin_spacing, side_len - 10, pin_layer, 1)
             # Left side
             for i in range(pins_per_side):
-                self._add_pin(comp, start_id + 3*pins_per_side + i, 10, side_len - 15 - i * pin_spacing, 0, 1)
+                self._add_pin(comp, start_id + 3*pins_per_side + i, 10, side_len - 15 - i * pin_spacing, pin_layer, 1)
                 
         elif pkg_type == 'BGA':
             # Grid layout
@@ -441,19 +443,19 @@ class BoardGenerator:
             idx = 0
             for r in range(grid_side):
                 for c in range(grid_side):
-                    self._add_pin(comp, start_id + idx, 15 + c * 10, 15 + r * 10, 0, 0)
+                    self._add_pin(comp, start_id + idx, 15 + c * 10, 15 + r * 10, pin_layer, 0)
                     idx += 1
                     
         elif pkg_type == 'SOT':
             # 3 pins: 2 on one side, 1 on the other
-            self._add_pin(comp, start_id, 5, 5, 0, 1)
-            self._add_pin(comp, start_id + 1, w_orig - 5, 5, 0, 1)
-            self._add_pin(comp, start_id + 2, w_orig // 2, h_orig - 5, 0, 1)
+            self._add_pin(comp, start_id, 5, 5, pin_layer, 1)
+            self._add_pin(comp, start_id + 1, w_orig - 5, 5, pin_layer, 1)
+            self._add_pin(comp, start_id + 2, w_orig // 2, h_orig - 5, pin_layer, 1)
             
         else: # connector
             # Single vertical row
             for i in range(num_pins):
-                self._add_pin(comp, start_id + i, w_orig // 2, 12 + i * pin_spacing, 0, 0)
+                self._add_pin(comp, start_id + i, w_orig // 2, 12 + i * pin_spacing, pin_layer, 0)
 
     def _add_pin(self, comp: Component, pin_id: int, local_x: int, local_y: int, layer: int, pad_shape: int):
         # Calculate global coordinates based on component position and rotation
