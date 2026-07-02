@@ -78,23 +78,44 @@ class BoardState:
                 y2 = min(self.height, ko.y + ko.height)
                 occ[y1:y2, x1:x2] = 1.0
                 
-        # 4. Add pads of other nets (pin can't route through other net pads)
+        # 4. Add pads of other nets with DRC clearance buffer
         if self.current_net_id is not None:
+            # Pre-compute net class rules for lookup
+            net_rules = {}
+            for net in self.board.nets:
+                rules = self.board.design_rules.get(net.net_class, self.board.design_rules.get('default', {}))
+                net_rules[net.id] = rules
+            default_rules = self.board.design_rules.get('default', {})
+            
             for pin in self.board.pins.values():
                 if pin.net_id != self.current_net_id:
                     if pin.layer == layer:
+                        rules = net_rules.get(pin.net_id, default_rules)
+                        clearance = rules.get('clearance', 0.15)
+                        trace_width = rules.get('width', 0.15)
+                        
+                        # Pad radius is 3. We inflate the pad obstacle by:
+                        # clearance + trace_radius to ensure the trace center stays far enough away.
+                        pad_r = 3.0
+                        clearance_cells = clearance / self.resolution
+                        trace_r_cells = (trace_width / 2.0) / self.resolution
+                        avoid_r = pad_r + clearance_cells + trace_r_cells
+                        
                         cx, cy = pin.global_x, pin.global_y
-                        y_min = max(0, cy - 3)
-                        y_max = min(self.height - 1, cy + 3)
-                        x_min = max(0, cx - 3)
-                        x_max = min(self.width - 1, cx + 3)
+                        
+                        # Calculate bounds based on inflated avoidance radius
+                        r_ceil = int(avoid_r + 0.99)
+                        y_min = max(0, cy - r_ceil)
+                        y_max = min(self.height - 1, cy + r_ceil)
+                        x_min = max(0, cx - r_ceil)
+                        x_max = min(self.width - 1, cx + r_ceil)
                         
                         if pin.pad_shape == 0:  # circular
                             for y in range(y_min, y_max + 1):
                                 for x in range(x_min, x_max + 1):
-                                    if (x - cx)**2 + (y - cy)**2 <= 3**2:
+                                    if (x - cx)**2 + (y - cy)**2 <= avoid_r**2:
                                         occ[y, x] = 1.0
-                        else:  # rectangular / oval
+                        else:  # rectangular / oval (approximated as square of size 2*avoid_r)
                             occ[y_min:y_max+1, x_min:x_max+1] = 1.0
                             
         return np.clip(occ, 0, 1)
