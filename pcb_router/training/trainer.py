@@ -1190,22 +1190,22 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 )
                 
                 targets = lambda_returns.detach()
-                critic_loss = F.mse_loss(traj_values, targets)
             
+            self.actor_opt.zero_grad(set_to_none=True)
             self.critic_opt.zero_grad(set_to_none=True)
-            self.scaler_ac.scale(critic_loss).backward()
-            self.scaler_ac.unscale_(self.critic_opt)
-            grad_norm_crit = torch.nn.utils.clip_grad_norm_(self.policy.value_head.parameters(), 100.0)
-            self.scaler_ac.step(self.critic_opt)
             
             with torch.cuda.amp.autocast(enabled=self.use_amp):
+                critic_loss = F.mse_loss(traj_values, targets)
                 advantages = (targets - traj_values).detach()
                 loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
                 loss_policy = loss_policy.mean()
+                total_loss = loss_policy + critic_loss
             
-            self.actor_opt.zero_grad(set_to_none=True)
-            self.scaler_ac.scale(loss_policy).backward()
+            self.scaler_ac.scale(total_loss).backward()
             self.scaler_ac.unscale_(self.actor_opt)
+            self.scaler_ac.unscale_(self.critic_opt)
+            
+            grad_norm_crit = torch.nn.utils.clip_grad_norm_(self.policy.value_head.parameters(), 100.0)
             
             all_actor_params = []
             for group in self.actor_opt.param_groups:
@@ -1213,6 +1213,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             grad_norm_act = torch.nn.utils.clip_grad_norm_(all_actor_params, 100.0)
             
             self.scaler_ac.step(self.actor_opt)
+            self.scaler_ac.step(self.critic_opt)
             self.scaler_ac.update()
             
             self.policy.update_target_critic(ema_decay=self.train_cfg.get('training', {}).get('critic_target_ema', 0.98))

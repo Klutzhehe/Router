@@ -53,7 +53,7 @@ class PPOPolicy(nn.Module):
         scores = self.net_scorer(net_embeddings).squeeze(-1) # (B, num_nets)
         
         # Mask out routed/invalid nets
-        scores = scores.masked_fill(~unrouted_mask, -1e9)
+        scores = scores.masked_fill(~unrouted_mask, -1e4)
         # Prevent NaN if all nets are masked out
         all_masked = (~unrouted_mask).all(dim=-1, keepdim=True)
         scores = torch.where(all_masked, torch.zeros_like(scores), scores)
@@ -137,7 +137,7 @@ class PPOPolicy(nn.Module):
         
         # Net selection evaluations
         scores = self.net_scorer(net_embeddings).squeeze(-1)
-        scores = scores.masked_fill(~unrouted_mask, -1e9)
+        scores = scores.masked_fill(~unrouted_mask, -1e4)
         # Prevent NaN if all nets are masked out
         all_masked = (~unrouted_mask).all(dim=-1, keepdim=True)
         scores = torch.where(all_masked, torch.zeros_like(scores), scores)
@@ -235,7 +235,7 @@ class DreamerActorCritic(nn.Module):
         x = torch.cat([net_embeddings, state_proj], dim=-1)
         scores = self.net_scorer(x).squeeze(-1)
         
-        scores = scores.masked_fill(~unrouted_mask, -1e9)
+        scores = scores.masked_fill(~unrouted_mask, -1e4)
         all_masked = (~unrouted_mask).all(dim=-1, keepdim=True)
         scores = torch.where(all_masked, torch.zeros_like(scores), scores)
         probs = F.softmax(scores, dim=-1)
@@ -302,7 +302,7 @@ class DreamerActorCritic(nn.Module):
         state_proj = self.state_proj(state).unsqueeze(1).expand(-1, net_embeddings.shape[1], -1)
         x = torch.cat([net_embeddings, state_proj], dim=-1)
         scores = self.net_scorer(x).squeeze(-1)
-        scores = scores.masked_fill(~unrouted_mask, -1e9)
+        scores = scores.masked_fill(~unrouted_mask, -1e4)
         all_masked = (~unrouted_mask).all(dim=-1, keepdim=True)
         scores = torch.where(all_masked, torch.zeros_like(scores), scores)
         probs = F.softmax(scores, dim=-1)
