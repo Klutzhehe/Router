@@ -689,8 +689,24 @@ class PPOJEPATrainer:
             'curriculum': self.curriculum.get_state(),
             'total_timesteps': self.total_timesteps
         }
-        torch.save(state, path)
-        print(f"Checkpoint saved to {path}")
+        
+        # Save atomically to prevent file corruption if interrupted
+        import tempfile
+        temp_dir = os.path.dirname(path)
+        if not temp_dir:
+            temp_dir = "."
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        temp_fd, temp_path = tempfile.mkstemp(dir=temp_dir, suffix=".tmp")
+        try:
+            os.close(temp_fd)
+            torch.save(state, temp_path)
+            os.replace(temp_path, path)
+            print(f"Checkpoint saved atomically to {path}")
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
 
     def load_checkpoint(self, path: str):
         if os.path.exists(path):
@@ -875,6 +891,60 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
+
+    def save_checkpoint(self, path: str):
+        state = {
+            'vit': self.vit.state_dict(),
+            'gnn': self.gnn.state_dict(),
+            'fusion': self.fusion.state_dict(),
+            'jepa': self.jepa.state_dict(),
+            'policy': self.policy.state_dict(),
+            'decoder': self.decoder.state_dict(),
+            'wm_opt': self.wm_opt.state_dict(),
+            'actor_opt': self.actor_opt.state_dict(),
+            'critic_opt': self.critic_opt.state_dict(),
+            'curriculum': self.curriculum.get_state(),
+            'total_timesteps': self.total_timesteps
+        }
+        
+        # Save atomically to prevent file corruption if interrupted
+        import tempfile
+        temp_dir = os.path.dirname(path)
+        if not temp_dir:
+            temp_dir = "."
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        temp_fd, temp_path = tempfile.mkstemp(dir=temp_dir, suffix=".tmp")
+        try:
+            os.close(temp_fd)
+            torch.save(state, temp_path)
+            os.replace(temp_path, path)
+            print(f"Dreamer checkpoint saved atomically to {path}")
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+
+    def load_checkpoint(self, path: str):
+        if os.path.exists(path):
+            state = torch.load(path, map_location=self.device)
+            self.vit.load_state_dict(state['vit'])
+            self.gnn.load_state_dict(state['gnn'])
+            self.fusion.load_state_dict(state['fusion'])
+            self.jepa.load_state_dict(state['jepa'])
+            self.policy.load_state_dict(state['policy'])
+            self.decoder.load_state_dict(state['decoder'])
+            if 'wm_opt' in state:
+                self.wm_opt.load_state_dict(state['wm_opt'])
+            if 'actor_opt' in state:
+                self.actor_opt.load_state_dict(state['actor_opt'])
+            if 'critic_opt' in state:
+                self.critic_opt.load_state_dict(state['critic_opt'])
+            self.curriculum.load_state(state['curriculum'])
+            self.total_timesteps = state['total_timesteps']
+            print(f"Dreamer checkpoint loaded successfully from {path} (Step {self.total_timesteps})")
+        else:
+            print(f"No checkpoint found at {path}")
 
     def _get_net_embeddings_and_mask(self, raster_tensor, x_dict, edge_index_dict):
         spatial_patches, cls_spatial = self.vit(raster_tensor)
