@@ -742,3 +742,537 @@ class PPOJEPATrainer:
                 pass
         except Exception as e:
             print(f"Warning: Failed to save visual checkpoint: {e}")
+
+
+from pcb_router.models.jepa import JEPAWorldModel
+from pcb_router.models.policy import DreamerActorCritic
+from pcb_router.training.replay_buffer import ReplayBuffer, Episode
+from collections import defaultdict
+import random
+
+def compute_lambda_returns(rewards, values, continues, bootstrap, gamma, lam):
+    H, B = rewards.shape
+    returns = torch.zeros_like(rewards)
+    last_return = bootstrap
+    for t in reversed(range(H)):
+        returns[t] = rewards[t] + gamma * continues[t] * ((1.0 - lam) * values[t] + lam * last_return)
+        last_return = returns[t]
+    return returns
+
+class DreamerJEPATrainer(PPOJEPATrainer):
+    def __init__(
+        self,
+        config_path: str = 'configs/training.yaml',
+        model_config_path: str = 'configs/model.yaml',
+        curriculum_config_path: str = 'configs/curriculum.yaml',
+        device: str = 'auto',
+        checkpoint_dir: Optional[str] = None,
+        load_checkpoint_path: Optional[str] = None
+    ):
+        super().__init__(
+            config_path=config_path,
+            model_config_path=model_config_path,
+            curriculum_config_path=curriculum_config_path,
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+            load_checkpoint_path=None
+        )
+        
+        jepa_cfg = self.model_cfg.get('jepa', {})
+        self.jepa = JEPAWorldModel(
+            vit_encoder=self.vit,
+            gnn_encoder=self.gnn,
+            fusion=self.fusion,
+            deterministic_size=512,
+            stochastic_groups=32,
+            stochastic_classes=32,
+            ema_decay=jepa_cfg.get('ema_decay', 0.995)
+        ).to(self.device)
+        
+        pol_cfg = self.model_cfg.get('policy', {})
+        vit_cfg = self.model_cfg.get('vit', {})
+        self.policy = DreamerActorCritic(
+            h_dim=512,
+            z_dim=1024,
+            embed_dim=vit_cfg.get('embed_dim', 384),
+            net_selector_dim=pol_cfg.get('net_selector_dim', 256),
+            heatmap_latent_dim=pol_cfg.get('heatmap_latent_dim', 256),
+            value_hidden_dim=pol_cfg.get('value_hidden_dim', 256)
+        ).to(self.device)
+        
+        t_cfg = self.train_cfg.get('training', {})
+        wm_lr = float(t_cfg.get('world_model_lr', 3e-4))
+        actor_lr = float(t_cfg.get('actor_lr', 8e-5))
+        critic_lr = float(t_cfg.get('critic_lr', 8e-5))
+        weight_decay = float(t_cfg.get('wm_weight_decay', 1e-6))
+        
+        self.wm_opt = torch.optim.AdamW(
+            list(self.vit.parameters()) +
+            list(self.gnn.parameters()) +
+            list(self.fusion.parameters()) +
+            list(self.jepa.parameters()),
+            lr=wm_lr,
+            weight_decay=weight_decay
+        )
+        
+        actor_params = (
+            list(self.policy.state_proj.parameters()) +
+            list(self.policy.net_scorer.parameters()) +
+            list(self.policy.heatmap_mlp.parameters()) +
+            list(self.policy.heatmap_mean.parameters()) +
+            [self.policy.heatmap_log_std]
+        )
+        self.actor_opt = torch.optim.AdamW(actor_params, lr=actor_lr)
+        self.critic_opt = torch.optim.AdamW(self.policy.value_head.parameters(), lr=critic_lr)
+        
+        self.use_amp = t_cfg.get('use_amp', True)
+        self.scaler_wm = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler_ac = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        
+        self.replay_buffer = ReplayBuffer(capacity_episodes=t_cfg.get('replay_buffer_size', 5000))
+        
+        self.imagination_horizon_start = t_cfg.get('imagination_horizon_start', 5)
+        self.imagination_horizon_end = t_cfg.get('imagination_horizon_end', 15)
+        self.imagination_horizon_ramp_iters = t_cfg.get('imagination_horizon_ramp_iters', 20000)
+        self.imagination_horizon = self.imagination_horizon_start
+        
+        self.entropy_coef_start = float(t_cfg.get('entropy_coef_start', 3e-3))
+        self.entropy_coef_end = float(t_cfg.get('entropy_coef_end', 3e-4))
+        self.entropy_coef_decay_iters = t_cfg.get('entropy_coef_decay_iters', 50000)
+        
+        self.real_steps_per_iteration = t_cfg.get('real_steps_per_iteration', 64)
+        self.train_ratio = t_cfg.get('train_ratio', 100)
+        self.imagine_batch_size = t_cfg.get('imagine_batch_size', 512)
+        
+        self.gamma = t_cfg.get('gamma', 0.997)
+        self.lambda_ = t_cfg.get('lambda_', 0.95)
+        
+        self.metrics_history = {
+            'timesteps': [],
+            'completion_rate': [],
+            'loss_wm': [],
+            'loss_actor': [],
+            'loss_critic': [],
+            'stage': [],
+        }
+        
+        if load_checkpoint_path is not None:
+            self.load_checkpoint(load_checkpoint_path)
+
+    def _get_net_embeddings_and_mask(self, raster_tensor, x_dict, edge_index_dict):
+        spatial_patches, cls_spatial = self.vit(raster_tensor)
+        node_embs = self.gnn(x_dict, edge_index_dict)
+        pad_embs = node_embs['pad'].unsqueeze(0)
+        fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
+        
+        num_nets = len(self.env.board.nets)
+        max_nets = 100
+        net_embs = torch.zeros((1, max_nets, self.vit.embed_dim), device=self.device)
+        unrouted_mask = torch.zeros((1, max_nets), dtype=torch.bool, device=self.device)
+        
+        temp_net_embs = torch.zeros((num_nets, self.vit.embed_dim), device=self.device)
+        for net_idx, net in enumerate(self.env.board.nets):
+            pin_indices = [idx for idx, p in enumerate(self.env.board.pins.values()) if p.net_id == net.id]
+            if pin_indices:
+                temp_net_embs[net_idx] = fused_pads[0, pin_indices].mean(dim=0)
+        net_embs[0, :num_nets] = temp_net_embs
+        
+        for net_idx, net in enumerate(self.env.board.nets):
+            if net.id not in self.env.routed_nets:
+                unrouted_mask[0, net_idx] = True
+                
+        return net_embs, unrouted_mask, fused_spatial
+
+    def _phase1_collect_real(self, num_steps: int, explore: bool = True) -> float:
+        self.vit.eval()
+        self.gnn.eval()
+        self.fusion.eval()
+        self.jepa.eval()
+        self.policy.eval()
+        
+        steps_collected = 0
+        completion_rates = []
+        
+        while steps_collected < num_steps:
+            obs, info = self.env.reset()
+            episode = Episode()
+            h, z = self.jepa.initial_state(batch_size=1, device=self.device)
+            done = False
+            
+            while not done and steps_collected < num_steps:
+                raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                graph = info['graph']
+                x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
+                edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
+                layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                
+                with torch.no_grad():
+                    context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
+                    target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
+                    net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
+                    
+                    net_idx_tensor, heatmap_latent, log_prob_net, log_prob_heatmap = self.policy.act(
+                        net_embs, unrouted_mask, h, z, explore=explore
+                    )
+                    
+                    action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent)
+                    h, z, _, _ = self.jepa.rssm_step(h, z, context_emb, action_emb)
+                    
+                    heatmaps_via = self.decoder(
+                        heatmap_latent, fused_spatial,
+                        self.env.H, self.env.W, active_layers_mask=layer_mask
+                    )
+                
+                heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].cpu().numpy()
+                via_prob_np = heatmaps_via[0, 8].cpu().numpy()
+                
+                next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
+                    net_idx_tensor.item(), heatmaps_np, via_prob_np
+                )
+                done = terminated or truncated
+                
+                action_tuple = (net_idx_tensor.squeeze(0).cpu(), heatmap_latent.squeeze(0).cpu())
+                
+                if not hasattr(episode, 'target_context_embeddings'):
+                    episode.target_context_embeddings = []
+                if not hasattr(episode, 'net_embeddings_list'):
+                    episode.net_embeddings_list = []
+                if not hasattr(episode, 'unrouted_masks_list'):
+                    episode.unrouted_masks_list = []
+                    
+                episode.append(context_emb.squeeze(0).cpu(), action_tuple, reward, done)
+                episode.target_context_embeddings.append(target_context_emb.squeeze(0).cpu())
+                episode.net_embeddings_list.append(net_embs.squeeze(0).cpu())
+                episode.unrouted_masks_list.append(unrouted_mask.squeeze(0).cpu())
+                
+                obs = next_obs
+                info = next_info
+                steps_collected += 1
+                self.total_timesteps += 1
+                
+            if episode.length > 0:
+                episode.net_embeddings = episode.net_embeddings_list[0]
+                episode.unrouted_masks = episode.unrouted_masks_list
+                self.replay_buffer.add_episode(episode)
+                completion_rates.append(info.get('completion_rate', 0.0))
+                
+        return np.mean(completion_rates) if completion_rates else 0.0
+
+    def _phase2_train_world_model(self):
+        self.jepa.train()
+        self.vit.train()
+        self.gnn.train()
+        self.fusion.train()
+        
+        batch_size = self.train_cfg.get('training', {}).get('batch_size', 64)
+        seq_len = self.train_cfg.get('training', {}).get('seq_len', 50)
+        
+        sampled_episodes = random.choices(self.replay_buffer.episodes, k=batch_size)
+        
+        b_ctx = []
+        b_tgt_ctx = []
+        b_net = []
+        b_heat = []
+        b_rew = []
+        b_cont = []
+        b_mask = []
+        
+        for ep in sampled_episodes:
+            start = random.randint(0, max(ep.length - seq_len + 1, 1))
+            end = start + seq_len
+            
+            ctx_slice = ep.context_embeddings[start:end]
+            tgt_slice = getattr(ep, 'target_context_embeddings', ep.context_embeddings)[start:end]
+            act_slice = ep.actions[start:end]
+            rew_slice = ep.rewards[start:end]
+            done_slice = ep.dones[start:end]
+            
+            net_act = [a[0] for a in act_slice]
+            heat_act = [a[1] for a in act_slice]
+            
+            ctx_tensor = torch.stack(ctx_slice)
+            tgt_tensor = torch.stack(tgt_slice)
+            net_tensor = torch.stack(net_act)
+            heat_tensor = torch.stack(heat_act)
+            rew_tensor = torch.tensor(rew_slice, dtype=torch.float32)
+            cont_tensor = 1.0 - torch.tensor(done_slice, dtype=torch.float32)
+            mask_tensor = torch.ones(len(ctx_slice), dtype=torch.float32)
+            
+            pad_len = seq_len - len(ctx_slice)
+            if pad_len > 0:
+                ctx_tensor = torch.cat([ctx_tensor, torch.zeros(pad_len, 768)], dim=0)
+                tgt_tensor = torch.cat([tgt_tensor, torch.zeros(pad_len, 768)], dim=0)
+                net_tensor = torch.cat([net_tensor, torch.zeros(pad_len, dtype=torch.long)], dim=0)
+                heat_tensor = torch.cat([heat_tensor, torch.zeros(pad_len, 256)], dim=0)
+                rew_tensor = torch.cat([rew_tensor, torch.zeros(pad_len)], dim=0)
+                cont_tensor = torch.cat([cont_tensor, torch.zeros(pad_len)], dim=0)
+                mask_tensor = torch.cat([mask_tensor, torch.zeros(pad_len)], dim=0)
+                
+            b_ctx.append(ctx_tensor)
+            b_tgt_ctx.append(tgt_tensor)
+            b_net.append(net_tensor)
+            b_heat.append(heat_tensor)
+            b_rew.append(rew_tensor)
+            b_cont.append(cont_tensor)
+            b_mask.append(mask_tensor)
+            
+        batch = {
+            'context_embeddings': torch.stack(b_ctx).to(self.device),
+            'target_context_embeddings': torch.stack(b_tgt_ctx).to(self.device),
+            'net_actions': torch.stack(b_net).to(self.device),
+            'heatmap_actions': torch.stack(b_heat).to(self.device),
+            'rewards': torch.stack(b_rew).to(self.device),
+            'continues': torch.stack(b_cont).to(self.device),
+            'masks': torch.stack(b_mask).to(self.device)
+        }
+        
+        grad_clip = self.train_cfg.get('training', {}).get('wm_grad_clip', 100.0)
+        
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            losses = self.jepa.compute_loss(batch)
+            total_loss = (
+                self.jepa.invariance_weight * losses['loss_pred'] +
+                self.jepa.variance_weight * losses['loss_variance'] +
+                self.jepa.covariance_weight * losses['loss_covariance'] +
+                losses['loss_kl'] +
+                losses['loss_reward'] +
+                losses['loss_continue']
+            )
+
+        self.wm_opt.zero_grad(set_to_none=True)
+        self.scaler_wm.scale(total_loss).backward()
+        self.scaler_wm.unscale_(self.wm_opt)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.jepa.parameters(), grad_clip)
+        self.scaler_wm.step(self.wm_opt)
+        self.scaler_wm.update()
+        
+        self.jepa.update_target_weights()
+        
+        with torch.no_grad():
+            B_b, T_b = batch['context_embeddings'].shape[0], batch['context_embeddings'].shape[1]
+            h, z = self.jepa.initial_state(B_b, self.device)
+            flat_net = batch['net_actions'].reshape(-1)
+            flat_heat = batch['heatmap_actions'].reshape(-1, batch['heatmap_actions'].shape[-1])
+            action_embs = self.jepa.get_action_embedding(flat_net, flat_heat).reshape(B_b, T_b, -1)
+            
+            all_h, all_z = [], []
+            for t in range(T_b - 1):
+                h, z, _, _ = self.jepa.rssm_step(h, z, batch['context_embeddings'][:, t], action_embs[:, t])
+                all_h.append(h)
+                all_z.append(z)
+            if all_h:
+                self.replay_buffer.cache_latents(torch.stack(all_h, dim=1), torch.stack(all_z, dim=1))
+                
+        return {
+            'loss_wm': total_loss.item(),
+            'loss_wm_pred': losses['loss_pred'].item(),
+            'loss_wm_kl': losses['loss_kl'].item(),
+            'loss_wm_reward': losses['loss_reward'].item(),
+            'loss_wm_continue': losses['loss_continue'].item(),
+            'wm_grad_norm': grad_norm.item()
+        }
+
+    def _phase3_train_actor_critic(self):
+        self.jepa.eval()
+        self.vit.eval()
+        self.gnn.eval()
+        self.fusion.eval()
+        
+        for p in self.jepa.parameters():
+            p.requires_grad = False
+            
+        metrics = defaultdict(list)
+        
+        for update_step in range(self.train_ratio):
+            init_states = self.replay_buffer.sample_latents(self.imagine_batch_size, device=self.device)
+            
+            if init_states is None:
+                h0, z0 = self.jepa.initial_state(self.imagine_batch_size, device=self.device)
+            else:
+                h0, z0 = init_states['h'], init_states['z']
+                
+            h0 = h0.detach()
+            z0 = z0.detach()
+            
+            sampled_episodes = random.choices(self.replay_buffer.episodes, k=self.imagine_batch_size)
+            
+            net_embs_list = []
+            unrouted_mask_list = []
+            for ep in sampled_episodes:
+                net_embs_list.append(ep.net_embeddings)
+                idx = random.randint(0, ep.length - 1)
+                unrouted_mask_list.append(ep.unrouted_masks[idx])
+                
+            net_embeddings = torch.stack(net_embs_list).to(self.device)
+            unrouted_mask = torch.stack(unrouted_mask_list).to(self.device)
+            
+            h, z = h0, z0
+            traj_h = []
+            traj_z = []
+            traj_actions_net = []
+            traj_actions_heat = []
+            traj_rewards = []
+            traj_continues = []
+            traj_values = []
+            traj_log_probs_net = []
+            traj_log_probs_heat = []
+            
+            current_horizon = self._current_imagination_horizon()
+            
+            for t in range(current_horizon):
+                net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
+                    net_embeddings, unrouted_mask, h, z, deterministic=False
+                )
+                
+                pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                pred_continue = torch.sigmoid(pred_continue_logits)
+                
+                traj_h.append(h)
+                traj_z.append(z)
+                traj_actions_net.append(net_idx)
+                traj_actions_heat.append(heatmap_latent)
+                traj_rewards.append(pred_reward)
+                traj_continues.append(pred_continue)
+                traj_values.append(value)
+                traj_log_probs_net.append(log_prob_net)
+                traj_log_probs_heat.append(log_prob_heatmap)
+                
+                action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
+                h, z = self.jepa.predict_step(h, z, action_emb)
+                
+                unrouted_mask = unrouted_mask.clone()
+                unrouted_mask.scatter_(1, net_idx.unsqueeze(-1), False)
+                
+            bootstrap_value = self.policy.get_value(h, z)
+            
+            traj_h = torch.stack(traj_h, dim=0)
+            traj_z = torch.stack(traj_z, dim=0)
+            traj_rewards = torch.stack(traj_rewards, dim=0)
+            traj_continues = torch.stack(traj_continues, dim=0)
+            traj_values = torch.stack(traj_values, dim=0)
+            traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
+            traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
+            
+            lambda_returns = compute_lambda_returns(
+                rewards=traj_rewards,
+                values=traj_values,
+                continues=traj_continues,
+                bootstrap=bootstrap_value,
+                gamma=self.gamma,
+                lam=self.lambda_
+            )
+            
+            targets = lambda_returns.detach()
+            
+            critic_loss = F.mse_loss(traj_values, targets)
+            
+            self.critic_opt.zero_grad(set_to_none=True)
+            self.scaler_ac.scale(critic_loss).backward()
+            self.scaler_ac.unscale_(self.critic_opt)
+            grad_norm_crit = torch.nn.utils.clip_grad_norm_(self.policy.value_head.parameters(), 100.0)
+            self.scaler_ac.step(self.critic_opt)
+            
+            advantages = (targets - traj_values).detach()
+            loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
+            loss_policy = loss_policy.mean()
+            
+            self.actor_opt.zero_grad(set_to_none=True)
+            self.scaler_ac.scale(loss_policy).backward()
+            self.scaler_ac.unscale_(self.actor_opt)
+            
+            all_actor_params = []
+            for group in self.actor_opt.param_groups:
+                all_actor_params.extend(group['params'])
+            grad_norm_act = torch.nn.utils.clip_grad_norm_(all_actor_params, 100.0)
+            
+            self.scaler_ac.step(self.actor_opt)
+            self.scaler_ac.update()
+            
+            self.policy.update_target_critic(ema_decay=self.train_cfg.get('training', {}).get('critic_target_ema', 0.98))
+            
+            metrics['loss_actor'].append(loss_policy.item())
+            metrics['loss_critic'].append(critic_loss.item())
+            metrics['imagined_return_mean'].append(targets.mean().item())
+            metrics['actor_grad_norm'].append(grad_norm_act.item())
+            metrics['critic_grad_norm'].append(grad_norm_crit.item())
+            
+        for p in self.jepa.parameters():
+            p.requires_grad = True
+            
+        return {
+            'loss_actor': np.mean(metrics['loss_actor']),
+            'loss_critic': np.mean(metrics['loss_critic']),
+            'imagined_return_mean': np.mean(metrics['imagined_return_mean']),
+            'actor_grad_norm': np.mean(metrics['actor_grad_norm']),
+            'critic_grad_norm': np.mean(metrics['critic_grad_norm'])
+        }
+
+    def _current_entropy_coef(self) -> float:
+        if self.total_timesteps >= self.entropy_coef_decay_iters:
+            return self.entropy_coef_end
+        frac = self.total_timesteps / self.entropy_coef_decay_iters
+        return self.entropy_coef_start + frac * (self.entropy_coef_end - self.entropy_coef_start)
+
+    def _current_imagination_horizon(self) -> int:
+        if self.total_timesteps >= self.imagination_horizon_ramp_iters:
+            return self.imagination_horizon_end
+        frac = self.total_timesteps / self.imagination_horizon_ramp_iters
+        return int(self.imagination_horizon_start + frac * (self.imagination_horizon_end - self.imagination_horizon_start))
+
+    def train(self, total_timesteps: int, on_update=None):
+        print("Starting GNN + JEPA DreamerV3-style training...")
+        progress_bar = tqdm(total=total_timesteps, desc="Training")
+        
+        if len(self.replay_buffer) < 5:
+            print("Collecting initial warmup episodes for replay buffer...")
+            self._phase1_collect_real(num_steps=128, explore=True)
+            
+        while self.total_timesteps < total_timesteps:
+            mean_completion = self._phase1_collect_real(num_steps=self.real_steps_per_iteration, explore=True)
+            wm_metrics = self._phase2_train_world_model()
+            ac_metrics = self._phase3_train_actor_critic()
+            
+            self.metrics_history['timesteps'].append(self.total_timesteps)
+            self.metrics_history['completion_rate'].append(mean_completion)
+            self.metrics_history['loss_wm'].append(wm_metrics['loss_wm'])
+            self.metrics_history['loss_actor'].append(ac_metrics['loss_actor'])
+            self.metrics_history['loss_critic'].append(ac_metrics['loss_critic'])
+            self.metrics_history['stage'].append(self.curriculum.current_stage_name)
+            
+            print(f"[Step {self.total_timesteps}/{total_timesteps}] "
+                  f"Stage: '{self.curriculum.current_stage_name}' | "
+                  f"Completion: {mean_completion:.2f} | "
+                  f"Loss WM: {wm_metrics['loss_wm']:.4f} | "
+                  f"Loss Actor: {ac_metrics['loss_actor']:.4f} | "
+                  f"Loss Critic: {ac_metrics['loss_critic']:.4f}")
+            
+            progress_bar.n = self.total_timesteps
+            progress_bar.set_postfix({
+                'stage': self.curriculum.current_stage_name,
+                'comp_rate': f"{mean_completion:.2f}",
+                'loss_wm': f"{wm_metrics['loss_wm']:.3f}",
+                'loss_actor': f"{ac_metrics['loss_actor']:.3f}"
+            })
+            progress_bar.refresh()
+            
+            self.curriculum.completion_history.append(mean_completion)
+            self.curriculum.episodes_in_stage += 1
+            
+            if self.curriculum.should_advance():
+                self.curriculum.advance()
+                self.env.reset()
+                
+            if self.total_timesteps % self.train_cfg.get('training', {}).get('save_interval', 50000) == 0:
+                self.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{self.total_timesteps}.pt")
+                
+            self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
+            
+            if on_update is not None:
+                on_update(self, {
+                    'timesteps': self.total_timesteps,
+                    'completion_rate': mean_completion,
+                    **wm_metrics,
+                    **ac_metrics
+                })
+

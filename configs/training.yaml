@@ -44,3 +44,35 @@ checkpoint:
   keep_last_n: 3
   save_optimizer: true
   save_curriculum_state: true
+
+
+# DreamerV3 training hyperparameters
+training:
+  real_steps_per_iteration: 64
+  train_ratio: 100
+  replay_buffer_size: 5000
+  batch_size: 64
+  seq_len: 50
+  imagine_batch_size: 512
+  imagination_horizon_start: 5
+  imagination_horizon_end: 15
+  imagination_horizon_ramp_iters: 20000
+
+  world_model_lr: 3.0e-4
+  actor_lr: 8.0e-5
+  critic_lr: 8.0e-5
+  wm_weight_decay: 1.0e-6
+  wm_grad_clip: 100.0
+  actor_grad_clip: 100.0
+  critic_grad_clip: 100.0
+
+  gamma: 0.997
+  lambda_: 0.95
+
+  entropy_coef_start: 3.0e-3
+  entropy_coef_end: 3.0e-4
+  entropy_coef_decay_iters: 50000
+
+  use_amp: true
+  critic_target_ema: 0.98
+
