@@ -31,7 +31,8 @@ class AStarPathfinder:
         dy = abs(y1 - y2)
         d2d = (dx + dy) + (math.sqrt(2.0) - 2.0) * min(dx, dy)
         d3d = d2d + abs(z1 - z2) * self.base_via_cost
-        return d3d
+        # Scale heuristic to match step cost scale, preventing search timeouts (200k max_iterations)
+        return d3d * (1.0 + self.heatmap_weight)
 
     def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=200000, board_state=None):
         """

@@ -54,9 +54,28 @@ class BoardState:
         block the path. Pad copper (ch0-ch7) is intentionally excluded because
         pads are valid routing endpoints, not obstacles.
         """
-        obstacles = self.raster[9].numpy()   # keepout zones / board edge
-        routed    = self.raster[10].numpy()  # ch10 = all routed traces (not pads)
-        return np.clip(obstacles + routed, 0, 1)
+        # 1. Start with routed copper (channel 10)
+        occ = self.raster[10].numpy().copy()
+        
+        # 2. Add obstacles that exist on this specific layer (or all layers: -1)
+        for obs in self.board.obstacles:
+            if obs.layer == -1 or obs.layer == layer:
+                x1 = max(0, obs.x)
+                y1 = max(0, obs.y)
+                x2 = min(self.width, obs.x + obs.width)
+                y2 = min(self.height, obs.y + obs.height)
+                occ[y1:y2, x1:x2] = 1.0
+                
+        # 3. Add keep-out zones
+        for ko in self.board.keep_out_zones:
+            if ko.layer == -1 or ko.layer == layer:
+                x1 = max(0, ko.x)
+                y1 = max(0, ko.y)
+                x2 = min(self.width, ko.x + ko.width)
+                y2 = min(self.height, ko.y + ko.height)
+                occ[y1:y2, x1:x2] = 1.0
+                
+        return np.clip(occ, 0, 1)
 
     def _render_initial_state(self):
         # Channel 9: Obstacles and Keep-outs
