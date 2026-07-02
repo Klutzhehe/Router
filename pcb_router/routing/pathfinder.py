@@ -76,9 +76,29 @@ class AStarPathfinder:
         visited = {}    # key: (pos, last_dir) -> g_score
         
         iterations = 0
+        min_h_seen = self._heuristic(start_node, target)
+        total_pushes = 1
+        total_pops = 0
+        first_pops = []
+        last_pops = []
+        
         while pq and iterations < max_iterations:
             iterations += 1
             f, g, curr, last_dir = heapq.heappop(pq)
+            total_pops += 1
+            
+            # Record some popped states for debugging
+            state_info = (f"{f:.2f}", f"{g:.2f}", curr, last_dir)
+            if len(first_pops) < 15:
+                first_pops.append(state_info)
+            else:
+                last_pops.append(state_info)
+                if len(last_pops) > 15:
+                    last_pops.pop(0)
+            
+            h_curr = self._heuristic(curr, target)
+            if h_curr < min_h_seen:
+                min_h_seen = h_curr
             
             if curr == target:
                 # Reconstruct path
@@ -128,6 +148,7 @@ class AStarPathfinder:
                         came_from[next_state] = state_key
                         next_f = next_g + self._heuristic(next_pos, target)
                         heapq.heappush(pq, (next_f, next_g, next_pos, new_dir))
+                        total_pushes += 1
             
             # 2. Check Layer Transitions (vias)
             for dl in [-1, 1]:
@@ -150,10 +171,15 @@ class AStarPathfinder:
                         came_from[next_state] = state_key
                         next_f = next_g + self._heuristic(next_pos, target)
                         heapq.heappush(pq, (next_f, next_g, next_pos, new_dir))
+                        total_pushes += 1
                         
         # Debug fail information
         print(f"[A* DEBUG] Failed to find path from {source} to {target} after {iterations} iterations.")
         print(f"  Board size: {W}x{H}, Active layers: {active_layers}")
+        print(f"  Total pushes: {total_pushes}, Total pops: {total_pops}, PQ size at end: {len(pq)}")
+        print(f"  Start heuristic: {self._heuristic(source, target):.2f}, Min heuristic seen: {min_h_seen:.2f}")
+        print(f"  First 15 popped states (f, g, pos, dir): {first_pops}")
+        print(f"  Last 15 popped states (f, g, pos, dir): {last_pops}")
         if board_state is not None:
             for l in active_layers:
                 occ_map = obstacle_maps.get(l)
