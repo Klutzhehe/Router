@@ -30,7 +30,10 @@ class AStarPathfinder:
         dx = abs(x1 - x2)
         dy = abs(y1 - y2)
         d2d = (dx + dy) + (math.sqrt(2.0) - 2.0) * min(dx, dy)
-        d3d = d2d + abs(z1 - z2) * self.base_via_cost
+        
+        # If either coordinate is on layer -1 (through-hole), layer transition cost to connect is 0
+        z_dist = 0 if (z1 == -1 or z2 == -1) else abs(z1 - z2)
+        d3d = d2d + z_dist * self.base_via_cost
         # Scale heuristic to match step cost scale, preventing search timeouts (200k max_iterations)
         return d3d * (1.0 + self.heatmap_weight)
 
@@ -56,12 +59,13 @@ class AStarPathfinder:
         if not (0 <= tx < W and 0 <= ty < H):
             return None, float('inf')
         # Early-exit: already at destination
-        if source == target:
-            return [source], 0.0
+        if (tl == -1 and sx == tx and sy == ty) or (tl != -1 and source == target):
+            p_sl = 0 if sl == -1 else sl
+            return [(sx, sy, p_sl)], 0.0
 
         # Pre-build obstacle maps per layer (cells that are blocked to traversal).
         # Source and target cells are always passable regardless of occupancy.
-        exempt = {(source[0], source[1]), (target[0], target[1])}
+        exempt = {(sx, sy), (tx, ty)}
         obstacle_maps = {}  # layer -> 2D bool array, True = blocked
         if board_state is not None:
             for l in active_layers:
@@ -69,16 +73,21 @@ class AStarPathfinder:
                 obstacle_maps[l] = occ >= self.obstacle_threshold
 
         # Priority Queue: stores tuples of (f_score, g_score, (x, y, layer), last_direction)
-        start_node = source
         pq = []
-        heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, (0, 0, 0)))
+        if sl == -1:
+            for l in active_layers:
+                start_node = (sx, sy, l)
+                heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, (0, 0, 0)))
+        else:
+            start_node = source
+            heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, (0, 0, 0)))
         
         came_from = {}  # key: (pos, last_dir) -> parent (pos, last_dir)
         visited = {}    # key: (pos, last_dir) -> g_score
         
         iterations = 0
-        min_h_seen = self._heuristic(start_node, target)
-        total_pushes = 1
+        min_h_seen = min(self._heuristic((sx, sy, l if sl == -1 else sl), target) for l in active_layers)
+        total_pushes = len(pq)
         total_pops = 0
         first_pops = []
         last_pops = []
@@ -101,14 +110,16 @@ class AStarPathfinder:
             if h_curr < min_h_seen:
                 min_h_seen = h_curr
             
-            if curr == target:
+            # Target reached check
+            is_reached = (curr[0] == tx and curr[1] == ty) if tl == -1 else (curr == target)
+            if is_reached:
                 # Reconstruct path
                 path = []
                 temp = (curr, last_dir)
                 while temp in came_from:
                     path.append(temp[0])
                     temp = came_from[temp]
-                path.append(source)
+                path.append(temp[0])  # Append the physical start node
                 path.reverse()
                 return path, g
                 
