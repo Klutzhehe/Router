@@ -146,6 +146,7 @@ class PCBRoutingEnv(gym.Env):
             terminated = False
             truncated = (self.step_count >= self.max_steps)
             info = self._get_info()
+            info['connected'] = False
             info['time_astar'] = 0.0
             info['time_post'] = 0.0
             info['time_drc'] = 0.0
@@ -272,6 +273,7 @@ class PCBRoutingEnv(gym.Env):
         
         obs = self._get_obs()
         info = self._get_info()
+        info['connected'] = success
         info['time_astar'] = t_astar
         info['time_post'] = t_post
         info['time_drc'] = t_drc
