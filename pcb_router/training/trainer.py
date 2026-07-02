@@ -1052,7 +1052,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                     pred_via = heatmaps_via[0, 8:9]
                     pred_selected = torch.cat([pred_layers, pred_via], dim=0)
                     
-                    loss_dec = F.mse_loss(pred_selected, target_heatmap)
+                    # Use weighted BCE to handle the massive class imbalance of sparse path pixels
+                    bce_loss = F.binary_cross_entropy(pred_selected, target_heatmap, reduction='none')
+                    weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
+                    loss_dec = (bce_loss * weight_mask).mean()
                     
                     self.actor_opt.zero_grad(set_to_none=True)
                     self.wm_opt.zero_grad(set_to_none=True)
