@@ -1,0 +1,744 @@
+import os
+import yaml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import copy
+from tqdm import tqdm
+from typing import Dict, Any, List, Optional
+
+from pcb_router.models.vit_encoder import ViTEncoder
+from pcb_router.models.gnn_encoder import HeteroGATEncoder
+from pcb_router.models.fusion import CrossAttentionFusion
+from pcb_router.models.jepa import SpatialJEPA
+from pcb_router.models.policy import PPOPolicy
+from pcb_router.models.heatmap_decoder import HeatmapDecoder
+
+from pcb_router.env.pcb_env import PCBRoutingEnv
+from pcb_router.training.curriculum import CurriculumManager
+from pcb_router.training.rewards import RewardCalculator
+
+class RolloutBuffer:
+    def __init__(self):
+        self.rasters = []
+        self.graphs = []
+        self.layer_masks = []
+        
+        self.net_actions = []
+        self.heatmap_actions = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+        
+        self.log_probs_net = []
+        self.log_probs_heatmap = []
+        
+        self.advantages = []
+        self.returns = []
+        
+        # Pre-computed net embeddings (CPU tensors) cached during rollout
+        # Shape per step: (max_nets, embed_dim). Avoids storing full board deep copies.
+        self.net_embs_cache = []
+        self.unrouted_masks = []
+
+    def clear(self):
+        self.rasters.clear()
+        self.graphs.clear()
+        self.layer_masks.clear()
+        self.net_actions.clear()
+        self.heatmap_actions.clear()
+        self.rewards.clear()
+        self.dones.clear()
+        self.values.clear()
+        self.log_probs_net.clear()
+        self.log_probs_heatmap.clear()
+        self.advantages.clear()
+        self.returns.clear()
+        self.net_embs_cache.clear()
+        self.unrouted_masks.clear()
+
+    def compute_gae(self, last_value: float, last_done: bool, gamma: float = 0.99, gae_lambda: float = 0.95):
+        self.advantages = [0.0] * len(self.rewards)
+        self.returns = [0.0] * len(self.rewards)
+        
+        last_gae_lam = 0.0
+        val_next = last_value
+        done_next = last_done
+        
+        for t in reversed(range(len(self.rewards))):
+            val_curr = self.values[t]
+            rew = self.rewards[t]
+            non_terminal = 1.0 - float(self.dones[t])
+            
+            delta = rew + gamma * val_next * (1.0 - float(done_next)) - val_curr
+            last_gae_lam = delta + gamma * gae_lambda * (1.0 - float(done_next)) * last_gae_lam
+            
+            self.advantages[t] = last_gae_lam
+            self.returns[t] = self.advantages[t] + val_curr
+            
+            val_next = val_curr
+            done_next = self.dones[t]
+
+
+class PPOJEPATrainer:
+    def __init__(
+        self,
+        config_path: str = 'configs/training.yaml',
+        model_config_path: str = 'configs/model.yaml',
+        curriculum_config_path: str = 'configs/curriculum.yaml',
+        device: str = 'auto',
+        checkpoint_dir: Optional[str] = None,
+        load_checkpoint_path: Optional[str] = None
+    ):
+        # 1. Device selection
+        if device == 'auto':
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+        print(f"Using training device: {self.device}")
+        
+        # Load configs
+        with open(config_path, 'r') as f:
+            self.train_cfg = yaml.safe_load(f)
+        with open(model_config_path, 'r') as f:
+            self.model_cfg = yaml.safe_load(f)
+            
+        # 2. Init Curriculum Manager
+        self.curriculum = CurriculumManager(curriculum_config_path)
+        
+        # 3. Create Gym Env
+        self.env = PCBRoutingEnv(
+            board_config=self.curriculum.get_board_config(),
+            reward_weights=self.curriculum.get_reward_weights()
+        )
+        
+        # 4. Init Models
+        # ViT Encoder
+        vit_cfg = self.model_cfg['vit']
+        self.vit = ViTEncoder(
+            image_channels=vit_cfg['image_channels'],
+            patch_size=vit_cfg['patch_size'],
+            embed_dim=vit_cfg['embed_dim'],
+            num_heads=vit_cfg['num_heads'],
+            num_layers=vit_cfg['num_layers'],
+            mlp_ratio=vit_cfg['mlp_ratio'],
+            dropout=vit_cfg['dropout'],
+            max_grid_size=vit_cfg['max_grid_size']
+        ).to(self.device)
+        
+        # GNN Encoder
+        gnn_cfg = self.model_cfg['gnn']
+        self.gnn = HeteroGATEncoder(
+            hidden_dim=gnn_cfg['hidden_dim'],
+            out_dim=gnn_cfg['out_dim'],
+            num_layers=gnn_cfg['num_layers'],
+            num_heads=gnn_cfg['num_heads'],
+            dropout=gnn_cfg['dropout']
+        ).to(self.device)
+        
+        # Cross Attention Fusion
+        fus_cfg = self.model_cfg['fusion']
+        self.fusion = CrossAttentionFusion(
+            num_layers=fus_cfg['num_layers'],
+            embed_dim=fus_cfg['embed_dim'],
+            num_heads=fus_cfg['num_heads'],
+            dropout=fus_cfg['dropout']
+        ).to(self.device)
+        
+        # Spatial-JEPA
+        jepa_cfg = self.model_cfg['jepa']
+        self.jepa = SpatialJEPA(
+            vit_encoder=self.vit, # target encoder is copy of self.vit
+            predictor_layers=jepa_cfg['predictor_layers'],
+            predictor_dim=jepa_cfg['predictor_dim'],
+            predictor_heads=jepa_cfg['predictor_heads'],
+            ema_decay=jepa_cfg['ema_decay'],
+            vicreg_weight=jepa_cfg['vicreg_weight'],
+            variance_weight=jepa_cfg['variance_weight'],
+            invariance_weight=jepa_cfg['invariance_weight'],
+            covariance_weight=jepa_cfg['covariance_weight']
+        ).to(self.device)
+        
+        # Policy
+        pol_cfg = self.model_cfg['policy']
+        self.policy = PPOPolicy(
+            embed_dim=vit_cfg['embed_dim'],
+            net_selector_dim=pol_cfg['net_selector_dim'],
+            heatmap_latent_dim=pol_cfg['heatmap_latent_dim'],
+            value_hidden_dim=pol_cfg['value_hidden_dim']
+        ).to(self.device)
+        
+        # Heatmap Decoder
+        dec_cfg = self.model_cfg['heatmap_decoder']
+        self.decoder = HeatmapDecoder(
+            latent_dim=dec_cfg['latent_dim'],
+            spatial_dim=vit_cfg['embed_dim'],
+            max_layers=dec_cfg['max_layers']
+        ).to(self.device)
+        
+        # 5. Optimizers
+        self.optimizer = torch.optim.AdamW(
+            list(self.vit.parameters()) +
+            list(self.gnn.parameters()) +
+            list(self.fusion.parameters()) +
+            list(self.jepa.predictor_blocks.parameters()) +
+            list(self.jepa.action_proj.parameters()) +
+            list(self.policy.parameters()) +
+            list(self.decoder.parameters()),
+            lr=float(self.train_cfg['ppo']['learning_rate']),
+            weight_decay=float(self.train_cfg['optimizer']['weight_decay'])
+        )
+        
+        self.buffer = RolloutBuffer()
+        self.total_timesteps = 0
+        self.checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else self.train_cfg['checkpoint']['save_dir']
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Metrics history for live plotting in Colab / external hooks
+        self.metrics_history = {
+            'timesteps': [],
+            'completion_rate': [],
+            'loss_policy': [],
+            'loss_value': [],
+            'loss_jepa': [],
+            'stage': [],
+        }
+        
+        if load_checkpoint_path is not None:
+            self.load_checkpoint(load_checkpoint_path)
+
+    def collect_rollouts(self, num_steps: int) -> float:
+        import time
+        self.buffer.clear()
+        
+        obs, info = self.env.reset()
+        done = False
+        
+        eval_completion_rates = []
+        
+        # A* success rate tracking (Fix #3)
+        astar_connected_count = 0
+        astar_attempted_count = 0
+        
+        step_timings = {
+            'obs': [], 'vit': [], 'gnn': [], 'fusion': [],
+            'net_emb': [], 'policy': [], 'decoder': [], 'env': [],
+            'astar': [], 'post': [], 'drc': [], 'graph': []
+        }
+        
+        for step in range(num_steps):
+            t_start = time.perf_counter()
+            # Move observation to PyTorch
+            raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device) # (1, 13, H, W)
+            layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)     # (1, 8)
+            
+            # GNN inputs
+            graph = info['graph']
+            # Convert PyG HeteroData dicts to device
+            x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()} if hasattr(graph, 'x_dict') else {k: v['x'].to(self.device) for k, v in graph.items() if isinstance(v, dict) and 'x' in v}
+            edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()} if hasattr(graph, 'edge_index_dict') else {k: v.to(self.device) for k, v in graph.items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
+            t_obs = time.perf_counter() - t_start
+            
+            with torch.no_grad():
+                # 1. Spatial encoding
+                t_vit_start = time.perf_counter()
+                spatial_patches, cls_spatial = self.vit(raster_tensor) # (1, N_patches, 384)
+                t_vit = time.perf_counter() - t_vit_start
+                
+                # 2. Graph encoding
+                t_gnn_start = time.perf_counter()
+                node_embs = self.gnn(x_dict, edge_index_dict)
+                pad_embs = node_embs['pad'].unsqueeze(0) # add batch dim -> (1, N_pads, 384)
+                t_gnn = time.perf_counter() - t_gnn_start
+                
+                # 3. Bidirectional Fusion
+                t_fusion_start = time.perf_counter()
+                fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
+                t_fusion = time.perf_counter() - t_fusion_start
+                
+                # Group pad embeddings to net embeddings by average
+                t_net_emb_start = time.perf_counter()
+                num_nets = len(self.env.board.nets)
+                max_nets = 100
+                net_embs = torch.zeros((1, max_nets, self.vit.embed_dim), device=self.device)
+                unrouted_mask = torch.zeros((1, max_nets), dtype=torch.bool, device=self.device)
+                
+                temp_net_embs = torch.zeros((num_nets, self.vit.embed_dim), device=self.device)
+                for net_idx, net in enumerate(self.env.board.nets):
+                    # Average pad embeddings belonging to this net
+                    pin_indices = [idx for idx, p in enumerate(self.env.board.pins.values()) if p.net_id == net.id]
+                    if pin_indices:
+                        temp_net_embs[net_idx] = fused_pads[0, pin_indices].mean(dim=0)
+                        
+                net_embs[0, :num_nets] = temp_net_embs
+                
+                # Create mask for unrouted nets
+                for net_idx, net in enumerate(self.env.board.nets):
+                    if net.id not in self.env.routed_nets:
+                        unrouted_mask[0, net_idx] = True
+                t_net_emb = time.perf_counter() - t_net_emb_start
+                        
+                # 4. Policy forward
+                t_policy_start = time.perf_counter()
+                net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
+                    net_embs, unrouted_mask, fused_spatial, cls_spatial
+                )
+                t_policy = time.perf_counter() - t_policy_start
+                
+                # 5. Decode heatmap
+                t_decoder_start = time.perf_counter()
+                heatmaps_via = self.decoder(
+                    heatmap_latent, fused_spatial,
+                    self.env.H, self.env.W, active_layers_mask=layer_mask
+                ) # (1, 9, H, W)
+                t_decoder = time.perf_counter() - t_decoder_start
+                
+            # Convert heatmaps to numpy for environment pathfinding
+            heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].cpu().numpy()
+            via_prob_np = heatmaps_via[0, 8].cpu().numpy()
+            
+            # Step environment with actions
+            t_env_start = time.perf_counter()
+            next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
+                net_idx.item(), heatmaps_np, via_prob_np
+            )
+            t_env = time.perf_counter() - t_env_start
+            
+            # Track A* connection success rate (Fix #3)
+            astar_attempted_count += 1
+            if next_info.get('connected', False):
+                astar_connected_count += 1
+            
+            # Get selected net and start pin for visualization layer selection
+            selected_net = self.env.board.nets[net_idx.item()] if net_idx.item() < len(self.env.board.nets) else None
+            src_pin = self.env.board.pins[selected_net.pin_ids[0]] if selected_net else None
+            
+            # Record timings
+            step_timings['obs'].append(t_obs)
+            step_timings['vit'].append(t_vit)
+            step_timings['gnn'].append(t_gnn)
+            step_timings['fusion'].append(t_fusion)
+            step_timings['net_emb'].append(t_net_emb)
+            step_timings['policy'].append(t_policy)
+            step_timings['decoder'].append(t_decoder)
+            step_timings['env'].append(t_env)
+            step_timings['astar'].append(next_info.get('time_astar', 0.0))
+            step_timings['post'].append(next_info.get('time_post', 0.0))
+            step_timings['drc'].append(next_info.get('time_drc', 0.0))
+            step_timings['graph'].append(next_info.get('time_graph', 0.0))
+            
+            if step == 0 or (step + 1) % 10 == 0 or step == num_steps - 1:
+                t_inf = (t_vit + t_gnn + t_fusion + t_net_emb + t_policy + t_decoder) * 1000
+                t_as = next_info.get('time_astar', 0.0) * 1000
+                t_po = next_info.get('time_post', 0.0) * 1000
+                t_dr = next_info.get('time_drc', 0.0) * 1000
+                t_gr = next_info.get('time_graph', 0.0) * 1000
+                t_en = t_env * 1000
+                # Running A* success rate at this point in the rollout
+                astar_rate_so_far = astar_connected_count / max(astar_attempted_count, 1)
+                connected_flag = '✓' if next_info.get('connected', False) else '✗'
+                
+                print(f"    [Rollout Step {step + 1}/{num_steps}] A*: {connected_flag} ({astar_connected_count}/{astar_attempted_count} = {astar_rate_so_far:.0%} connected) | Reward: {reward:+.3f}\n"
+                      f"      +-- Model Inference: {t_inf:.1f}ms [ViT: {t_vit*1000:.1f}ms | GNN: {t_gnn*1000:.1f}ms | Fusion: {t_fusion*1000:.1f}ms | Policy: {t_policy*1000:.1f}ms | Dec: {t_decoder*1000:.1f}ms]\n"
+                      f"      +-- Environment Step: {t_en:.1f}ms [A* Search: {t_as:.1f}ms | Post-Proc: {t_po:.1f}ms | DRC: {t_dr:.1f}ms | GraphUpdate: {t_gr:.1f}ms]")
+                
+                # Render and display comparison dashboard in Jupyter/Colab
+                try:
+                    from pcb_router.visualization.heatmap_viz import HeatmapVisualizer
+                    import matplotlib.pyplot as plt
+                    import IPython.display as ipydisplay
+                    
+                    viz = HeatmapVisualizer(theme_dark=True)
+                    # Select the heatmap slice corresponding to starting pin layer
+                    h_idx = src_pin.layer if (src_pin and src_pin.layer < len(heatmaps_np)) else 0
+                    # Only deepcopy board state when visualization actually runs
+                    board_before = copy.deepcopy(self.env.board_state)
+                    fig = viz.render_routing_comparison(
+                        board_before=board_before,
+                        board_after=copy.deepcopy(self.env.board_state),
+                        heatmap=heatmaps_np[h_idx],
+                        path=next_info.get('path', [])
+                    )
+                    ipydisplay.display(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    pass
+            
+            done = terminated or truncated
+            
+            # Store in rollout buffer
+            self.buffer.rasters.append(obs['board_raster'])
+            self.buffer.graphs.append(graph)
+            self.buffer.layer_masks.append(obs['layer_mask'])
+            self.buffer.net_actions.append(net_idx.item())
+            self.buffer.heatmap_actions.append(heatmap_latent.squeeze(0).cpu().numpy())
+            self.buffer.rewards.append(reward)
+            self.buffer.dones.append(done)
+            self.buffer.values.append(value.item())
+            self.buffer.log_probs_net.append(log_prob_net.item())
+            self.buffer.log_probs_heatmap.append(log_prob_heatmap.item())
+            # Cache pre-computed net embeddings on CPU instead of deep-copying the full board.
+            # net_embs shape: (1, max_nets, embed_dim) → squeeze to (max_nets, embed_dim)
+            self.buffer.net_embs_cache.append(net_embs.squeeze(0).cpu())
+            self.buffer.unrouted_masks.append(unrouted_mask.squeeze(0).cpu().numpy())
+            
+            self.total_timesteps += 1
+            
+            if done:
+                # Record completion rate to curriculum
+                self.curriculum.record_episode(next_info['completion_rate'], next_info['drc_violations'] / len(self.env.board.nets))
+                eval_completion_rates.append(next_info['completion_rate'])
+                obs, info = self.env.reset()
+            else:
+                obs = next_obs
+                info = next_info
+                
+        # GAE Advantages computation
+        self.buffer.compute_gae(
+            last_value=value.item(),
+            last_done=done,
+            gamma=self.train_cfg['ppo']['gamma'],
+            gae_lambda=self.train_cfg['ppo']['gae_lambda']
+        )
+        
+        # Print summary of timings for this rollout collection
+        m_inf = (np.mean(step_timings['vit']) + np.mean(step_timings['gnn']) + np.mean(step_timings['fusion']) + 
+                 np.mean(step_timings['net_emb']) + np.mean(step_timings['policy']) + np.mean(step_timings['decoder'])) * 1000
+        m_vit = np.mean(step_timings['vit']) * 1000
+        m_gnn = np.mean(step_timings['gnn']) * 1000
+        m_fusion = np.mean(step_timings['fusion']) * 1000
+        m_policy = np.mean(step_timings['policy']) * 1000
+        m_decoder = np.mean(step_timings['decoder']) * 1000
+        
+        m_env = np.mean(step_timings['env']) * 1000
+        m_astar = np.mean(step_timings['astar']) * 1000
+        m_post = np.mean(step_timings['post']) * 1000
+        m_drc = np.mean(step_timings['drc']) * 1000
+        m_graph = np.mean(step_timings['graph']) * 1000
+        
+        # A* success rate summary for the full rollout (Fix #3)
+        astar_success_rate = astar_connected_count / max(astar_attempted_count, 1)
+        astar_diagnosis = (
+            "CRITICAL — A* almost never finds a path. Check env/pathfinding, not policy."
+            if astar_success_rate < 0.05 else
+            "LOW — pathfinding is struggling. Heatmap guidance may be inverted/uninformative."
+            if astar_success_rate < 0.30 else
+            "MODERATE — pathfinding works sometimes. Policy is learning to guide A*."
+            if astar_success_rate < 0.70 else
+            "GOOD — A* connects most of the time. Completion rate should be rising."
+        )
+        print(f"    [Rollout Collection Finished] Mean Timings across {num_steps} steps:\n"
+              f"      +-- Model Inference: {m_inf:.1f}ms [ViT: {m_vit:.1f}ms | GNN: {m_gnn:.1f}ms | Fusion: {m_fusion:.1f}ms | Policy: {m_policy:.1f}ms | Dec: {m_decoder:.1f}ms]\n"
+              f"      +-- Environment Step: {m_env:.1f}ms [A* Search: {m_astar:.1f}ms | Post-Proc: {m_post:.1f}ms | DRC: {m_drc:.1f}ms | GraphUpdate: {m_graph:.1f}ms]\n"
+              f"      +-- A* Success Rate: {astar_connected_count}/{astar_attempted_count} ({astar_success_rate:.1%}) — {astar_diagnosis}")
+        
+        return np.mean(eval_completion_rates) if eval_completion_rates else 0.0
+
+    def update(self) -> Dict[str, float]:
+        """Runs PPO update and JEPA representation update"""
+        import gc
+        
+        # Convert rollout buffer to tensors
+        rasters = torch.tensor(np.array(self.buffer.rasters), dtype=torch.float32).to(self.device) # (T, 13, H, W)
+        layer_masks = torch.tensor(np.array(self.buffer.layer_masks), dtype=torch.float32).to(self.device) # (T, 8)
+        
+        net_actions = torch.tensor(self.buffer.net_actions, dtype=torch.long).to(self.device)
+        heatmap_actions = torch.tensor(np.array(self.buffer.heatmap_actions), dtype=torch.float32).to(self.device)
+        
+        old_log_probs_net = torch.tensor(self.buffer.log_probs_net, dtype=torch.float32).to(self.device)
+        old_log_probs_heatmap = torch.tensor(self.buffer.log_probs_heatmap, dtype=torch.float32).to(self.device)
+        
+        advantages = torch.tensor(self.buffer.advantages, dtype=torch.float32).to(self.device)
+        returns = torch.tensor(self.buffer.returns, dtype=torch.float32).to(self.device)
+        
+        # Load pre-computed net embeddings from buffer (no GNN+Fusion re-forward needed)
+        # Shape: (T, max_nets, embed_dim) — cached as CPU tensors during rollout collection
+        all_net_embs = torch.stack(self.buffer.net_embs_cache, dim=0).to(self.device)  # (T, max_nets, embed_dim)
+        all_unrouted_masks = torch.tensor(
+            np.array(self.buffer.unrouted_masks), dtype=torch.bool
+        ).to(self.device)  # (T, max_nets)
+        
+        # Convert dones to a tensor on the correct device once
+        dones = torch.tensor(self.buffer.dones, dtype=torch.bool, device=self.device)
+        
+        # Standardize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        num_epochs = self.train_cfg['ppo']['num_epochs']
+        batch_size = self.train_cfg['ppo']['batch_size']
+        T = len(self.buffer.rewards)
+        
+        # --- Pre-compute JEPA embeddings ONCE before epoch loop ---
+        # Run ViT on rasters under no_grad in small chunks to avoid memory spikes / RAM OOM in Colab
+        with torch.no_grad():
+            chunk_size = 8
+            
+            all_z_curr_list = []
+            for idx in range(0, T - 1, chunk_size):
+                chunk = rasters[idx:min(idx + chunk_size, T - 1)]
+                z_curr, _ = self.vit(chunk)
+                all_z_curr_list.append(z_curr)
+            all_z_curr_all = torch.cat(all_z_curr_list, dim=0) if all_z_curr_list else torch.empty((0, self.vit.embed_dim), device=self.device)
+            
+            all_z_next_target_list = []
+            for idx in range(1, T, chunk_size):
+                chunk = rasters[idx:min(idx + chunk_size, T)]
+                z_next, _ = self.jepa.target_encoder(chunk)
+                all_z_next_target_list.append(z_next)
+            all_z_next_target_all = torch.cat(all_z_next_target_list, dim=0) if all_z_next_target_list else torch.empty((0, self.vit.embed_dim), device=self.device)
+            
+        policy_loss_epoch = 0.0
+        value_loss_epoch = 0.0
+        jepa_loss_epoch = 0.0
+        num_updates = 0
+        
+        # PPO update epochs
+        for epoch in range(num_epochs):
+            # Create random minibatches on the device
+            permutation = torch.randperm(T, device=self.device)
+            for i in range(0, T, batch_size):
+                indices = permutation[i:i+batch_size]
+                if len(indices) < batch_size // 2:
+                    continue
+                
+                b_rasters = rasters[indices]
+                b_net_acts = net_actions[indices]
+                b_heatmap_acts = heatmap_actions[indices]
+                
+                b_old_log_net = old_log_probs_net[indices]
+                b_old_log_heat = old_log_probs_heatmap[indices]
+                
+                b_advantages = advantages[indices]
+                b_returns = returns[indices]
+                
+                # Use cached net embeddings — no GNN/Fusion re-forward per sample
+                b_net_embs = all_net_embs[indices]       # (B, max_nets, embed_dim)
+                b_unrouted_mask = all_unrouted_masks[indices]  # (B, max_nets)
+                
+                # Run ViT forward in batch (needed for gradient flow through spatial features)
+                b_spatial_patches, b_cls_spatial = self.vit(b_rasters) # (B, N_patches, embed_dim), (B, embed_dim)
+                
+                # Policy evaluation
+                log_prob_net, log_prob_heatmap, value, ent_net, ent_heatmap = self.policy.evaluate_actions(
+                    b_net_embs, b_unrouted_mask, b_spatial_patches, b_cls_spatial,
+                    b_net_acts, b_heatmap_acts
+                )
+                
+                # PPO Loss — Net selector
+                ratio_net = torch.exp(log_prob_net - b_old_log_net)
+                surr1_net = ratio_net * b_advantages
+                surr2_net = torch.clamp(ratio_net, 1.0 - self.train_cfg['ppo']['clip_epsilon'], 1.0 + self.train_cfg['ppo']['clip_epsilon']) * b_advantages
+                loss_policy_net = -torch.min(surr1_net, surr2_net).mean()
+                
+                # PPO Loss — Heatmap
+                ratio_heat = torch.exp(log_prob_heatmap - b_old_log_heat)
+                surr1_heat = ratio_heat * b_advantages
+                surr2_heat = torch.clamp(ratio_heat, 1.0 - self.train_cfg['ppo']['clip_epsilon'], 1.0 + self.train_cfg['ppo']['clip_epsilon']) * b_advantages
+                loss_policy_heat = -torch.min(surr1_heat, surr2_heat).mean()
+                
+                loss_policy = loss_policy_net + loss_policy_heat
+                
+                # Value Loss
+                loss_val = F.mse_loss(value, b_returns)
+                
+                # ── Batched JEPA Loss ────────────────────────────────────
+                # Map minibatch indices to the transition indices (0 to T-2 and not done)
+                valid_idx_mask = (indices < T - 1) & (~dones[indices])
+                jepa_indices = indices[valid_idx_mask].to(self.device)
+                
+                if len(jepa_indices) > 0:
+                    b_z_curr = all_z_curr_all[jepa_indices]
+                    b_z_next_target = all_z_next_target_all[jepa_indices]
+                    b_act_net = net_actions[jepa_indices]
+                    b_act_heat = heatmap_actions[jepa_indices]
+                    
+                    # Predict next state embedding in a single batch call
+                    b_z_next_pred = self.jepa.predict(b_z_curr, (b_act_net, b_act_heat))
+                    
+                    # Batch VICReg losses
+                    loss_inv = F.mse_loss(b_z_next_pred, b_z_next_target.detach())
+                    loss_var = self.jepa.compute_variance_loss(b_z_next_pred) + self.jepa.compute_variance_loss(b_z_next_target.detach())
+                    loss_cov = self.jepa.compute_covariance_loss(b_z_next_pred) + self.jepa.compute_covariance_loss(b_z_next_target.detach())
+                    
+                    loss_jepa = (
+                        self.jepa.invariance_weight * loss_inv +
+                        self.jepa.variance_weight * loss_var +
+                        self.jepa.covariance_weight * loss_cov
+                    )
+                else:
+                    loss_jepa = torch.tensor(0.0, device=self.device)
+                
+                # Total Combined Loss
+                loss_total = (
+                    loss_policy +
+                    self.train_cfg['ppo']['value_loss_coef'] * loss_val -
+                    self.train_cfg['ppo']['entropy_coef'] * (ent_net.mean() + ent_heatmap.mean()) +
+                    self.train_cfg['jepa_loss']['prediction_weight'] * loss_jepa
+                )
+                
+                # Backprop
+                self.optimizer.zero_grad()
+                loss_total.backward()
+                # Clip gradients for all optimized parameters to prevent gradient explosion
+                nn.utils.clip_grad_norm_(
+                    [p for g in self.optimizer.param_groups for p in g['params']],
+                    self.train_cfg['ppo']['max_grad_norm']
+                )
+                self.optimizer.step()
+                
+                # Update EMA target encoder weights
+                self.jepa.update_target_weights(self.vit)
+                
+                policy_loss_epoch += loss_policy.item()
+                value_loss_epoch += loss_val.item()
+                jepa_loss_epoch += loss_jepa.item()
+                num_updates += 1
+        
+        # Free pre-computed JEPA pairs and flush GPU cache
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        denom = max(num_updates, 1)
+        return {
+            'loss_policy': policy_loss_epoch / denom,
+            'loss_value': value_loss_epoch / denom,
+            'loss_jepa': jepa_loss_epoch / denom
+        }
+
+    def train(self, total_timesteps: int, on_update=None):
+        """
+        Main training loop.
+        Args:
+            total_timesteps: Total env steps to train for.
+            on_update: Optional callback called after each rollout+update cycle.
+                       Signature: on_update(trainer, metrics_dict) -> None
+                       Use this in Colab to inject live visualization between updates.
+        """
+        print("Starting GNN + JEPA PCB Router joint training...")
+        progress_bar = tqdm(total=total_timesteps, desc="Training")
+        
+        while self.total_timesteps < total_timesteps:
+            # 1. Collect Rollouts
+            rollout_steps = self.train_cfg['ppo']['num_rollout_steps']
+            mean_completion = self.collect_rollouts(rollout_steps)
+            
+            # 2. Run Updates
+            metrics = self.update()
+            
+            # 3. Record metrics history
+            self.metrics_history['timesteps'].append(self.total_timesteps)
+            self.metrics_history['completion_rate'].append(mean_completion)
+            self.metrics_history['loss_policy'].append(metrics['loss_policy'])
+            self.metrics_history['loss_value'].append(metrics['loss_value'])
+            self.metrics_history['loss_jepa'].append(metrics['loss_jepa'])
+            self.metrics_history['stage'].append(self.curriculum.current_stage_name)
+            
+            # Print epoch logs
+            print(f"[Step {self.total_timesteps}/{total_timesteps}] "
+                  f"Stage: '{self.curriculum.current_stage_name}' | "
+                  f"Board size: {self.env.W}x{self.env.H} | "
+                  f"Completion rate: {mean_completion:.2f} | "
+                  f"Loss Policy: {metrics['loss_policy']:.4f} | "
+                  f"Loss JEPA: {metrics['loss_jepa']:.4f}")
+            
+            # Update progress bar
+            progress_bar.n = self.total_timesteps
+            progress_bar.set_postfix({
+                'stage': self.curriculum.current_stage_name,
+                'comp_rate': f"{mean_completion:.2f}",
+                'loss_policy': f"{metrics['loss_policy']:.3f}",
+                'loss_jepa': f"{metrics['loss_jepa']:.3f}"
+            })
+            progress_bar.refresh()
+            
+            # 4. Check Curriculum Advancement
+            if self.curriculum.should_advance():
+                self.curriculum.advance()
+                # Update environment board size and components matching new stage
+                self.env.reset()
+                
+            # 5. Checkpoint
+            if self.total_timesteps % self.train_cfg['training']['save_interval'] == 0:
+                self.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{self.total_timesteps}.pt")
+                
+            # 6. Visual Checkpoint (Every Rollout Update)
+            self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
+            
+            # 7. Optional external callback (for Colab live viz)
+            if on_update is not None:
+                on_update(self, {
+                    'timesteps': self.total_timesteps,
+                    'completion_rate': mean_completion,
+                    **metrics
+                })
+
+    def save_checkpoint(self, path: str):
+        state = {
+            'vit': self.vit.state_dict(),
+            'gnn': self.gnn.state_dict(),
+            'fusion': self.fusion.state_dict(),
+            'jepa': self.jepa.state_dict(),
+            'policy': self.policy.state_dict(),
+            'decoder': self.decoder.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'curriculum': self.curriculum.get_state(),
+            'total_timesteps': self.total_timesteps
+        }
+        torch.save(state, path)
+        print(f"Checkpoint saved to {path}")
+
+    def load_checkpoint(self, path: str):
+        if os.path.exists(path):
+            state = torch.load(path, map_location=self.device)
+            self.vit.load_state_dict(state['vit'])
+            self.gnn.load_state_dict(state['gnn'])
+            self.fusion.load_state_dict(state['fusion'])
+            self.jepa.load_state_dict(state['jepa'])
+            self.policy.load_state_dict(state['policy'])
+            self.decoder.load_state_dict(state['decoder'])
+            self.optimizer.load_state_dict(state['optimizer'])
+            self.curriculum.load_state(state['curriculum'])
+            self.total_timesteps = state['total_timesteps']
+            print(f"Checkpoint loaded successfully from {path} (Step {self.total_timesteps})")
+        else:
+            print(f"No checkpoint found at {path}")
+
+    def save_visual_checkpoint(self, path: str):
+        try:
+            from pcb_router.visualization.renderer import BoardRenderer
+            import matplotlib
+            matplotlib.use('Agg') # Use non-interactive backend to prevent GUI issues
+            import matplotlib.pyplot as plt
+            
+            renderer = BoardRenderer(theme_dark=True)
+            # Render layout (showing all layers since it is multi-layer routing)
+            fig = renderer.render_board(
+                board_state=self.env.board_state,
+                board=self.env.board,
+                show_all_layers=True
+            )
+            
+            # Add a title
+            if len(fig.axes) > 0:
+                fig.axes[0].set_title(
+                    f"Step {self.total_timesteps} | Stage: {self.curriculum.current_stage_name}\n"
+                    f"Mean Completion: {self.curriculum.completion_rate_ma:.2f}",
+                    color='white', fontsize=12
+                )
+            
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fig.savefig(path, facecolor=fig.get_facecolor(), edgecolor='none', bbox_inches='tight')
+            fig.clear() # Clear figure memory to prevent leaks
+            print(f"Visual training snapshot saved to {path}")
+            
+            # If inside Colab or Jupyter, display it inline
+            try:
+                import IPython.display as ipydisplay
+                ipydisplay.display(ipydisplay.Image(filename=path))
+            except Exception as e:
+                # Do not spam if IPython is not available, but log other issues
+                pass
+        except Exception as e:
+            print(f"Warning: Failed to save visual checkpoint: {e}")

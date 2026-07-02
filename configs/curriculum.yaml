@@ -1,0 +1,134 @@
+# Curriculum Learning Configuration
+# Constraints-early ordering: learn diff pairs + length tuning before multi-net congestion
+
+progression:
+  completion_threshold: 0.95   # >95% routing completion to advance
+  drc_violation_threshold: 0.02  # <2% DRC violation rate to advance
+  min_episodes: 500            # minimum episodes before advancement check
+  eval_window: 100             # evaluate over last N episodes
+
+stages:
+  # Stage 1: Single net, single layer — basic pathfinding
+  - name: "single_net_single_layer"
+    description: "Route 1 net (2 pins) on a single layer with obstacles"
+    board_generator:
+      num_nets: 1
+      num_layers: 2
+      board_size_range: [200, 400]    # 2-4cm at 0.1mm/px
+      num_components_range: [2, 4]
+      obstacle_density: 0.1
+      diff_pairs: false
+      length_matching: false
+      keep_out_zones: false
+    reward_weights:
+      completion: 1.5
+      wirelength: 0.05
+      drc_violations: 0.2
+      congestion: 0.0
+      length_error: 0.0
+      all_complete_bonus: 0.3
+
+  # Stage 2: Differential pairs & length tuning — constraint handling
+  - name: "diff_pairs_length_tuning"
+    description: "Route 1-3 diff pairs with length matching on single layer"
+    board_generator:
+      num_nets_range: [2, 6]         # 1-3 diff pairs = 2-6 nets
+      num_layers: 2
+      board_size_range: [300, 500]
+      num_components_range: [2, 6]
+      obstacle_density: 0.05
+      diff_pairs: true
+      num_diff_pairs_range: [1, 3]
+      length_matching: true
+      length_tolerance_mm: 1.0
+      keep_out_zones: false
+    reward_weights:
+      completion: 1.2
+      wirelength: 0.08
+      drc_violations: 0.3
+      congestion: 0.05
+      length_error: 0.3
+      all_complete_bonus: 0.4
+
+  # Stage 3: Multi-net, single layer — net ordering & congestion
+  - name: "multi_net_single_layer"
+    description: "Route 5-15 nets on a single layer"
+    board_generator:
+      num_nets_range: [5, 15]
+      num_layers: 2
+      board_size_range: [400, 600]
+      num_components_range: [4, 10]
+      obstacle_density: 0.1
+      diff_pairs: true
+      num_diff_pairs_range: [0, 2]
+      length_matching: true
+      length_tolerance_mm: 1.0
+      keep_out_zones: false
+    reward_weights:
+      completion: 1.0
+      wirelength: 0.1
+      drc_violations: 0.4
+      congestion: 0.2
+      length_error: 0.2
+      all_complete_bonus: 0.5
+
+  # Stage 4: Multi-net, multi-layer — via placement & layer assignment
+  - name: "multi_net_multi_layer"
+    description: "Route 10-30 nets across 2-4 layers"
+    board_generator:
+      num_nets_range: [10, 30]
+      num_layers_range: [2, 4]
+      board_size_range: [500, 800]
+      num_components_range: [6, 15]
+      obstacle_density: 0.1
+      diff_pairs: true
+      num_diff_pairs_range: [1, 4]
+      length_matching: true
+      length_tolerance_mm: 0.5
+      keep_out_zones: false
+    reward_weights:
+      completion: 1.0
+      wirelength: 0.1
+      drc_violations: 0.5
+      congestion: 0.2
+      length_error: 0.25
+      all_complete_bonus: 0.5
+
+  # Stage 5: Full design rules
+  - name: "full_design_rules"
+    description: "All constraints: keep-outs, width rules, impedance, copper pours"
+    board_generator:
+      num_nets_range: [15, 50]
+      num_layers_range: [2, 6]
+      board_size_range: [600, 1024]
+      num_components_range: [8, 25]
+      obstacle_density: 0.15
+      diff_pairs: true
+      num_diff_pairs_range: [2, 6]
+      length_matching: true
+      length_tolerance_mm: 0.3
+      keep_out_zones: true
+      num_keep_out_zones_range: [1, 5]
+      width_rules: true
+      net_classes: ["signal", "power", "high_speed"]
+    reward_weights:
+      completion: 1.0
+      wirelength: 0.1
+      drc_violations: 0.5
+      congestion: 0.2
+      length_error: 0.3
+      all_complete_bonus: 0.5
+
+  # Stage 6: Real-world boards
+  - name: "real_world"
+    description: "Route actual KiCad designs with all constraints"
+    board_generator:
+      source: "kicad_import"
+      # Uses real board files instead of procedural generation
+    reward_weights:
+      completion: 1.0
+      wirelength: 0.1
+      drc_violations: 0.5
+      congestion: 0.2
+      length_error: 0.3
+      all_complete_bonus: 0.5

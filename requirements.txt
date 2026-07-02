@@ -1,0 +1,26 @@
+# Core ML
+torch>=2.0.0
+torch-geometric>=2.4.0
+torch-scatter
+torch-sparse
+
+# RL
+gymnasium>=0.29.0
+
+# Data & Config
+numpy>=1.24.0
+pyyaml>=6.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+streamlit>=1.28.0
+plotly>=5.15.0
+
+# Logging
+wandb>=0.15.0
+tensorboard>=2.14.0
+
+# Utilities
+tqdm>=4.65.0
+dataclasses-json>=0.6.0
