@@ -54,8 +54,8 @@ class BoardState:
         block the path. Pad copper (ch0-ch7) is intentionally excluded because
         pads are valid routing endpoints, not obstacles.
         """
-        obstacles = self.raster[9].numpy()            # keepout zones, board edge violations
-        routed    = self.raster[min(layer, 7)].numpy() # layer-specific routed copper
+        obstacles = self.raster[9].numpy()   # keepout zones / board edge
+        routed    = self.raster[10].numpy()  # ch10 = all routed traces (not pads)
         return np.clip(obstacles + routed, 0, 1)
 
     def _render_initial_state(self):

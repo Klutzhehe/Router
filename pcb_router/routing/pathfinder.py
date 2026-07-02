@@ -46,7 +46,18 @@ class AStarPathfinder:
         """
         N_layers, H, W = heatmaps.shape
         active_layers_set = set(active_layers)
-        
+
+        # Early-exit: source/target out of board bounds
+        sx, sy, sl = source
+        tx, ty, tl = target
+        if not (0 <= sx < W and 0 <= sy < H):
+            return None, float('inf')
+        if not (0 <= tx < W and 0 <= ty < H):
+            return None, float('inf')
+        # Early-exit: already at destination
+        if source == target:
+            return [source], 0.0
+
         # Pre-build obstacle maps per layer (cells that are blocked to traversal).
         # Source and target cells are always passable regardless of occupancy.
         exempt = {(source[0], source[1]), (target[0], target[1])}
@@ -55,7 +66,7 @@ class AStarPathfinder:
             for l in active_layers:
                 occ = board_state.get_occupancy(l)  # (H, W) float, 1.0 = occupied
                 obstacle_maps[l] = occ >= self.obstacle_threshold
-        
+
         # Priority Queue: stores tuples of (f_score, g_score, (x, y, layer), last_direction)
         start_node = source
         pq = []
