@@ -24,6 +24,7 @@ class BoardState:
         self.traces = []
         self.vias = []
         self.routed_net_ids = set()
+        self.current_net_id = None
         
         # Render static elements
         self._render_initial_state()
@@ -34,6 +35,7 @@ class BoardState:
         cloned.traces = list(self.traces)
         cloned.vias = list(self.vias)
         cloned.routed_net_ids = set(self.routed_net_ids)
+        cloned.current_net_id = self.current_net_id
         return cloned
 
     def reset(self):
@@ -42,6 +44,7 @@ class BoardState:
         self.traces.clear()
         self.vias.clear()
         self.routed_net_ids.clear()
+        self.current_net_id = None
         self._render_initial_state()
 
     def get_raster(self) -> torch.Tensor:
@@ -75,6 +78,25 @@ class BoardState:
                 y2 = min(self.height, ko.y + ko.height)
                 occ[y1:y2, x1:x2] = 1.0
                 
+        # 4. Add pads of other nets (pin can't route through other net pads)
+        if self.current_net_id is not None:
+            for pin in self.board.pins.values():
+                if pin.net_id != self.current_net_id:
+                    if pin.layer == layer:
+                        cx, cy = pin.global_x, pin.global_y
+                        y_min = max(0, cy - 3)
+                        y_max = min(self.height - 1, cy + 3)
+                        x_min = max(0, cx - 3)
+                        x_max = min(self.width - 1, cx + 3)
+                        
+                        if pin.pad_shape == 0:  # circular
+                            for y in range(y_min, y_max + 1):
+                                for x in range(x_min, x_max + 1):
+                                    if (x - cx)**2 + (y - cy)**2 <= 3**2:
+                                        occ[y, x] = 1.0
+                        else:  # rectangular / oval
+                            occ[y_min:y_max+1, x_min:x_max+1] = 1.0
+                            
         return np.clip(occ, 0, 1)
 
     def _render_initial_state(self):
@@ -105,6 +127,7 @@ class BoardState:
 
     def set_current_net(self, net_id: int):
         """Update channel 11 with current net source and target markers"""
+        self.current_net_id = net_id
         # Clear channel 11
         self.raster[11].zero_()
         
