@@ -234,9 +234,14 @@ class PPOJEPATrainer:
         self._pin_to_net_idx: Optional[torch.Tensor] = None
         self._pin_to_net_valid: bool = False
 
-        # Set enable_viz=True to allow inline heatmap comparison plots (Jupyter/Colab only).
-        # Disabled by default to avoid deepcopy overhead in the hot rollout path.
-        self.enable_viz: bool = False
+        # Auto-detect Jupyter / Colab: enable inline heatmap plots when running inside a
+        # kernel (interactive), disable in headless script runs to avoid deepcopy overhead.
+        try:
+            from IPython import get_ipython
+            _ip = get_ipython()
+            self.enable_viz: bool = (_ip is not None and hasattr(_ip, 'kernel'))
+        except Exception:
+            self.enable_viz: bool = False
 
         # Metrics history for live plotting in Colab / external hooks
         self.metrics_history = {
@@ -991,16 +996,22 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         self.gamma = t_cfg.get('gamma', 0.997)
         self.lambda_ = t_cfg.get('lambda_', 0.95)
         
-        # Optional torch.compile() for PyTorch 2.0+ GPU acceleration
-        # Compiles static-shape models (vit, jepa, policy, decoder) to avoid dynamic graph compilation hangs with GNN/Fusion.
+        # Optional torch.compile() for PyTorch 2.0+ GPU acceleration.
+        # Only compile jepa and policy — they have fully static shapes (fixed latent dims)
+        # and are called the most (train_ratio x imagination_horizon times per iteration).
+        #
+        # Models intentionally excluded from compilation:
+        #  - vit: interpolate_pos_encoding() calls F.interpolate with dynamic (H,W) per
+        #         curriculum stage → triggers expensive recompilation on stage transitions.
+        #  - decoder: forward() takes env.H, env.W as args → same dynamic shape issue.
+        #  - gnn: PyG HeteroConv has dynamic node/edge counts per board → cannot compile.
+        #  - fusion: cross-attention over dynamic N_nodes → cannot compile.
         self.compile_models = t_cfg.get('compile_models', True)
         if self.compile_models and hasattr(torch, 'compile') and self.device.type == 'cuda':
-            print("Compiling world model, policy, and static encoders/decoders with torch.compile()...")
+            print("Compiling world model and policy with torch.compile() (static-shape models only)...")
             try:
-                self.vit = torch.compile(self.vit)
                 self.jepa = torch.compile(self.jepa)
                 self.policy = torch.compile(self.policy)
-                self.decoder = torch.compile(self.decoder)
             except Exception as e:
                 print(f"torch.compile failed (falling back to uncompiled execution): {e}")
         
