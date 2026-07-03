@@ -126,8 +126,9 @@ class CurriculumManager:
         mean_comp = np.mean(self.completion_history)
         mean_viol = np.mean(self.violation_history)
         
-        comp_thresh = self.progression_cfg.get('completion_threshold', 0.95)
-        viol_thresh = self.progression_cfg.get('drc_violation_threshold', 0.02)
+        stage_cfg = self.current_stage
+        comp_thresh = stage_cfg.get('completion_threshold', self.progression_cfg.get('completion_threshold', 0.95))
+        viol_thresh = stage_cfg.get('drc_violation_threshold', self.progression_cfg.get('drc_violation_threshold', 0.02))
         
         return mean_comp >= comp_thresh and mean_viol <= viol_thresh
 

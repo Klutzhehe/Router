@@ -11,6 +11,7 @@ stages:
   # Stage 1: Single net, single layer — basic pathfinding
   - name: "single_net_single_layer"
     description: "Route 1 net (2 pins) on a single layer with obstacles"
+    drc_violation_threshold: 0.50
     board_generator:
       num_nets: 1
       num_layers: 2
@@ -31,6 +32,7 @@ stages:
   # Stage 2: Differential pairs & length tuning — constraint handling
   - name: "diff_pairs_length_tuning"
     description: "Route 1-3 diff pairs with length matching on single layer"
+    drc_violation_threshold: 0.30
     board_generator:
       num_nets_range: [2, 6]         # 1-3 diff pairs = 2-6 nets
       num_layers: 2
@@ -53,6 +55,7 @@ stages:
   # Stage 3: Multi-net, single layer — net ordering & congestion
   - name: "multi_net_single_layer"
     description: "Route 5-15 nets on a single layer"
+    drc_violation_threshold: 0.20
     board_generator:
       num_nets_range: [5, 15]
       num_layers: 2
@@ -75,6 +78,7 @@ stages:
   # Stage 4: Multi-net, multi-layer — via placement & layer assignment
   - name: "multi_net_multi_layer"
     description: "Route 10-30 nets across 2-4 layers"
+    drc_violation_threshold: 0.10
     board_generator:
       num_nets_range: [10, 30]
       num_layers_range: [2, 4]
@@ -97,6 +101,7 @@ stages:
   # Stage 5: Full design rules
   - name: "full_design_rules"
     description: "All constraints: keep-outs, width rules, impedance, copper pours"
+    drc_violation_threshold: 0.05
     board_generator:
       num_nets_range: [15, 50]
       num_layers_range: [2, 6]
@@ -122,6 +127,7 @@ stages:
   # Stage 6: Real-world boards
   - name: "real_world"
     description: "Route actual KiCad designs with all constraints"
+    drc_violation_threshold: 0.02
     board_generator:
       source: "kicad_import"
       # Uses real board files instead of procedural generation
