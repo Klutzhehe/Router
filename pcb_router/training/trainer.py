@@ -708,6 +708,22 @@ class PPOJEPATrainer:
                 os.remove(temp_path)
             raise e
 
+    def _safe_load(self, module, ckpt_state):
+        cleaned = {}
+        model_keys = set(module.state_dict().keys())
+        for k, v in ckpt_state.items():
+            new_key = k
+            if k.startswith('_orig_mod.') and k not in model_keys:
+                stripped = k[10:] # len('_orig_mod.') is 10
+                if stripped in model_keys:
+                    new_key = stripped
+            elif not k.startswith('_orig_mod.') and k not in model_keys:
+                prepended = '_orig_mod.' + k
+                if prepended in model_keys:
+                    new_key = prepended
+            cleaned[new_key] = v
+        module.load_state_dict(cleaned)
+
     def load_checkpoint(self, path: str):
         if os.path.exists(path):
             # weights_only=False is used because checkpoints contain custom python structures (e.g. curriculum state and numpy multiarray scalars)
@@ -715,12 +731,12 @@ class PPOJEPATrainer:
                 state = torch.load(path, map_location=self.device, weights_only=False)
             except TypeError:
                 state = torch.load(path, map_location=self.device)
-            self.vit.load_state_dict(state['vit'])
-            self.gnn.load_state_dict(state['gnn'])
-            self.fusion.load_state_dict(state['fusion'])
-            self.jepa.load_state_dict(state['jepa'])
-            self.policy.load_state_dict(state['policy'])
-            self.decoder.load_state_dict(state['decoder'])
+            self._safe_load(self.vit, state['vit'])
+            self._safe_load(self.gnn, state['gnn'])
+            self._safe_load(self.fusion, state['fusion'])
+            self._safe_load(self.jepa, state['jepa'])
+            self._safe_load(self.policy, state['policy'])
+            self._safe_load(self.decoder, state['decoder'])
             self.optimizer.load_state_dict(state['optimizer'])
             self.curriculum.load_state(state['curriculum'])
             self.total_timesteps = state['total_timesteps']
@@ -937,12 +953,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 state = torch.load(path, map_location=self.device, weights_only=False)
             except TypeError:
                 state = torch.load(path, map_location=self.device)
-            self.vit.load_state_dict(state['vit'])
-            self.gnn.load_state_dict(state['gnn'])
-            self.fusion.load_state_dict(state['fusion'])
-            self.jepa.load_state_dict(state['jepa'])
-            self.policy.load_state_dict(state['policy'])
-            self.decoder.load_state_dict(state['decoder'])
+            self._safe_load(self.vit, state['vit'])
+            self._safe_load(self.gnn, state['gnn'])
+            self._safe_load(self.fusion, state['fusion'])
+            self._safe_load(self.jepa, state['jepa'])
+            self._safe_load(self.policy, state['policy'])
+            self._safe_load(self.decoder, state['decoder'])
             if 'wm_opt' in state:
                 self.wm_opt.load_state_dict(state['wm_opt'])
             if 'actor_opt' in state:
