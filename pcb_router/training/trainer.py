@@ -710,7 +710,11 @@ class PPOJEPATrainer:
 
     def load_checkpoint(self, path: str):
         if os.path.exists(path):
-            state = torch.load(path, map_location=self.device)
+            # weights_only=False is used because checkpoints contain custom python structures (e.g. curriculum state and numpy multiarray scalars)
+            try:
+                state = torch.load(path, map_location=self.device, weights_only=False)
+            except TypeError:
+                state = torch.load(path, map_location=self.device)
             self.vit.load_state_dict(state['vit'])
             self.gnn.load_state_dict(state['gnn'])
             self.fusion.load_state_dict(state['fusion'])
@@ -1292,9 +1296,13 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                     
                     action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
                     h, z = self.jepa.predict_step(h, z, action_emb)
-                    
-                    unrouted_mask = unrouted_mask.clone()
-                    unrouted_mask.scatter_(1, net_idx.unsqueeze(-1), False)
+
+                    # Out-of-place mask update: mark the chosen net as routed.
+                    # scatter_() is inplace and corrupts autograd version counters when
+                    # the tensor participates in the backward graph — use scatter() instead.
+                    update = torch.zeros_like(unrouted_mask, dtype=torch.bool)
+                    update = update.scatter(1, net_idx.unsqueeze(-1), True)
+                    unrouted_mask = unrouted_mask & ~update
                     
                 bootstrap_value = self.policy.get_value(h, z)
                 

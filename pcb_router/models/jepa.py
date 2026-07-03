@@ -21,11 +21,13 @@ def straight_through_categorical(logits, num_groups, num_classes):
         gumbels = -torch.empty_like(logits).exponential_().log()
         y_soft = F.softmax((logits + gumbels) / 1.0, dim=-1)
         index = y_soft.max(-1, keepdim=True)[1]
-        y_hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+        # Out-of-place scatter: scatter_() would mutate y_soft in-place and corrupt
+        # the autograd version counter; use the functional form instead.
+        y_hard = torch.zeros_like(logits).scatter(-1, index, 1.0)
         sample = y_hard - y_soft.detach() + y_soft
     else:
         index = probs.max(-1, keepdim=True)[1]
-        sample = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+        sample = torch.zeros_like(logits).scatter(-1, index, 1.0)
         
     return sample.reshape(B, -1), probs.reshape(B, -1)
 

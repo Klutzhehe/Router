@@ -9,7 +9,7 @@ from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.data.board_generator import BoardGenerator, BoardConfig
 from pcb_router.visualization.renderer import BoardRenderer
 from pcb_router.visualization.heatmap_viz import HeatmapVisualizer
-from pcb_router.training.trainer import PPOJEPATrainer
+from pcb_router.training.trainer import DreamerJEPATrainer, PPOJEPATrainer
 
 st.set_page_config(layout="wide", page_title="AI PCB Router Dashboard")
 
@@ -40,18 +40,26 @@ selected_ckpt = st.sidebar.selectbox("Select Model Checkpoint", ["Random (Untrai
 # Instantiate models and env
 @st.cache_resource
 def load_trainer(ckpt_name):
-    trainer = PPOJEPATrainer(device='cpu')
-    if ckpt_name != "Random (Untrained)":
-        trainer.load_checkpoint(os.path.join(ckpt_dir, ckpt_name))
-    return trainer
+    ckpt_path = os.path.join(ckpt_dir, ckpt_name) if ckpt_name != "Random (Untrained)" else None
+    try:
+        trainer = DreamerJEPATrainer(device='cpu', load_checkpoint_path=ckpt_path)
+        is_dreamer = True
+    except Exception as e:
+        trainer = PPOJEPATrainer(device='cpu', load_checkpoint_path=ckpt_path)
+        is_dreamer = False
+    return trainer, is_dreamer
 
-trainer = load_trainer(selected_ckpt)
+trainer, is_dreamer = load_trainer(selected_ckpt)
 renderer = BoardRenderer()
 viz = HeatmapVisualizer()
 
 # Generator trigger
 if st.sidebar.button("Generate New Board"):
     st.session_state.board_seed = np.random.randint(10000)
+    if 'h' in st.session_state:
+        del st.session_state.h
+    if 'z' in st.session_state:
+        del st.session_state.z
 if 'board_seed' not in st.session_state:
     st.session_state.board_seed = 42
 
@@ -60,6 +68,12 @@ board_config = BoardGenerator.from_curriculum_stage(selected_stage)
 board_config.seed = st.session_state.board_seed
 env = PCBRoutingEnv(board_config=board_config, reward_weights=selected_stage.get('reward_weights'))
 obs, info = env.reset(seed=st.session_state.board_seed)
+
+# Initialize RSSM state for Dreamer
+if is_dreamer and ('h' not in st.session_state or 'z' not in st.session_state):
+    h, z = trainer.jepa.initial_state(batch_size=1, device=trainer.device)
+    st.session_state.h = h
+    st.session_state.z = z
 
 st.header(f"Curriculum Stage: **{selected_stage_name.replace('_', ' ').title()}**")
 st.write(selected_stage['description'])
@@ -99,33 +113,57 @@ with col2:
             edge_index_dict = {k: v for k, v in info['graph'].edge_index_dict.items()} if hasattr(info['graph'], 'edge_index_dict') else {k: v for k, v in info['graph'].items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
             
             with torch.no_grad():
-                spat_patches, cls_spat = trainer.vit(raster_t)
-                node_embs = trainer.gnn(x_dict, edge_index_dict)
-                f_pads, f_spat = trainer.fusion(node_embs['pad'].unsqueeze(0), spat_patches)
-                
-                # Mean pool pads to net
-                num_nets = len(env.board.nets)
-                net_embs = torch.zeros((1, num_nets, trainer.vit.embed_dim))
-                for n_i, net in enumerate(env.board.nets):
-                    pin_indices = [idx for idx, p in enumerate(env.board.pins.values()) if p.net_id == net.id]
-                    if pin_indices:
-                        net_embs[0, n_i] = f_pads[0, pin_indices].mean(dim=0)
-                        
-                unrouted_mask = torch.zeros((1, num_nets), dtype=torch.bool)
-                for n_i, net in enumerate(env.board.nets):
-                    if net.id not in env.routed_nets:
-                        unrouted_mask[0, n_i] = True
-                        
-                # Policy heatmap latent output
-                heatmap_latent, _, _ = trainer.policy.get_heatmap_latent(
-                    net_embs[0, net_idx].unsqueeze(0), f_spat.mean(dim=1)
-                )
-                
-                # CNN decoder outputs
-                heatmaps_via = trainer.decoder(
-                    heatmap_latent, f_spat,
-                    env.H, env.W, active_layers_mask=layer_mask
-                )
+                if is_dreamer:
+                    context_emb = trainer.jepa.get_context_embedding(raster_t, x_dict, edge_index_dict, use_target=False)
+                    net_embs, umask, fs = trainer._get_net_embeddings_and_mask(raster_t, x_dict, edge_index_dict)
+                    selected_net_emb = net_embs[0, net_idx].unsqueeze(0)
+                    
+                    h = st.session_state.h
+                    z = st.session_state.z
+                    
+                    heatmap_latent, _, _ = trainer.policy.get_heatmap_latent(
+                        selected_net_emb, h, z, deterministic=True
+                    )
+                    heatmaps_via = trainer.decoder(
+                        heatmap_latent, fs,
+                        env.H, env.W, active_layers_mask=layer_mask
+                    )
+                    
+                    action_emb = trainer.jepa.get_action_embedding(
+                        torch.tensor([net_idx], device=trainer.device),
+                        heatmap_latent
+                    )
+                    h, z, _, _ = trainer.jepa.rssm_step(h, z, context_emb, action_emb)
+                    st.session_state.h = h
+                    st.session_state.z = z
+                else:
+                    spat_patches, cls_spat = trainer.vit(raster_t)
+                    node_embs = trainer.gnn(x_dict, edge_index_dict)
+                    f_pads, f_spat = trainer.fusion(node_embs['pad'].unsqueeze(0), spat_patches)
+                    
+                    # Mean pool pads to net
+                    num_nets = len(env.board.nets)
+                    net_embs = torch.zeros((1, num_nets, trainer.vit.embed_dim))
+                    for n_i, net in enumerate(env.board.nets):
+                        pin_indices = [idx for idx, p in enumerate(env.board.pins.values()) if p.net_id == net.id]
+                        if pin_indices:
+                            net_embs[0, n_i] = f_pads[0, pin_indices].mean(dim=0)
+                            
+                    unrouted_mask = torch.zeros((1, num_nets), dtype=torch.bool)
+                    for n_i, net in enumerate(env.board.nets):
+                        if net.id not in env.routed_nets:
+                            unrouted_mask[0, n_i] = True
+                            
+                    # Policy heatmap latent output
+                    heatmap_latent, _, _ = trainer.policy.get_heatmap_latent(
+                        net_embs[0, net_idx].unsqueeze(0), f_spat.mean(dim=1)
+                    )
+                    
+                    # CNN decoder outputs
+                    heatmaps_via = trainer.decoder(
+                        heatmap_latent, f_spat,
+                        env.H, env.W, active_layers_mask=layer_mask
+                    )
                 
             heatmaps_np = heatmaps_via[0, :env.board.num_layers].cpu().numpy()
             via_prob_np = heatmaps_via[0, 8].cpu().numpy()
