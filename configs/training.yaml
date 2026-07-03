@@ -52,9 +52,9 @@ training:
   real_steps_per_iteration: 64
   train_ratio: 100
   replay_buffer_size: 5000
-  batch_size: 64
+  batch_size: 128
   seq_len: 50
-  imagine_batch_size: 512
+  imagine_batch_size: 1024
   imagination_horizon_start: 5
   imagination_horizon_end: 15
   imagination_horizon_ramp_iters: 20000
@@ -75,6 +75,6 @@ training:
   entropy_coef_decay_iters: 50000
 
   use_amp: true
-  compile_models: false
+  compile_models: true
   critic_target_ema: 0.98
 
