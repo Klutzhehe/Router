@@ -933,7 +933,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
 
     def load_checkpoint(self, path: str):
         if os.path.exists(path):
-            state = torch.load(path, map_location=self.device)
+            try:
+                state = torch.load(path, map_location=self.device, weights_only=False)
+            except TypeError:
+                state = torch.load(path, map_location=self.device)
             self.vit.load_state_dict(state['vit'])
             self.gnn.load_state_dict(state['gnn'])
             self.fusion.load_state_dict(state['fusion'])
