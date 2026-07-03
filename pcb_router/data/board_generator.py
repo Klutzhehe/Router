@@ -62,6 +62,7 @@ class BoardConfig:
     matched_group_size: int = 0
     net_classes: List[str] = field(default_factory=lambda: ['signal'])
     seed: Optional[int] = None
+    design_rules: Optional[Dict[str, Any]] = None
 
 @dataclass
 class Board:
@@ -136,7 +137,8 @@ class BoardGenerator:
             num_diff_pairs=resolve_val(board_gen_cfg.get('num_diff_pairs_range'), board_gen_cfg.get('num_diff_pairs', 0)),
             length_matching=board_gen_cfg.get('length_matching', False),
             length_tolerance_mm=board_gen_cfg.get('length_tolerance_mm', 1.0),
-            net_classes=board_gen_cfg.get('net_classes', ['signal'])
+            net_classes=board_gen_cfg.get('net_classes', ['signal']),
+            design_rules=board_gen_cfg.get('design_rules', stage_config.get('design_rules'))
         )
 
     def generate(self, config: BoardConfig) -> Board:
@@ -149,6 +151,14 @@ class BoardGenerator:
             'power': {'width': 0.3, 'clearance': 0.2, 'via_drill': 0.4, 'via_annular': 0.2},
             'high_speed': {'width': 0.12, 'clearance': 0.12, 'via_drill': 0.25, 'via_annular': 0.12}
         }
+        
+        # Override/merge with user custom design rules if specified
+        if config.design_rules is not None:
+            for net_class, rules in config.design_rules.items():
+                if net_class in design_rules:
+                    design_rules[net_class].update(rules)
+                else:
+                    design_rules[net_class] = rules
         
         # 1. Generate components and place them without overlap
         components = []

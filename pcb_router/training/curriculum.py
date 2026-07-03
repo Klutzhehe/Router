@@ -97,7 +97,8 @@ class CurriculumManager:
             num_diff_pairs=num_diff_pairs,
             length_matching=board_gen_cfg.get('length_matching', False),
             length_tolerance_mm=board_gen_cfg.get('length_tolerance_mm', 1.0),
-            net_classes=board_gen_cfg.get('net_classes', ['signal'])
+            net_classes=board_gen_cfg.get('net_classes', ['signal']),
+            design_rules=board_gen_cfg.get('design_rules', stage_cfg.get('design_rules'))
         )
 
     def get_reward_weights(self) -> Dict[str, float]:
