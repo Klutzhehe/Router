@@ -209,8 +209,12 @@ class PPOJEPATrainer:
             self.optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps]
         )
 
-        # 7. Optional torch.compile() for PyTorch 2.0+ GPU acceleration
-        if hasattr(torch, 'compile') and self.device.type == 'cuda':
+        # 7. Optional torch.compile() for PyTorch 2.0+ GPU acceleration.
+        # Guard with type(self) is PPOJEPATrainer so that DreamerJEPATrainer (which calls
+        # super().__init__()) does NOT compile here — it replaces self.jepa/self.policy with
+        # new models afterwards and runs its own compile block. Double-compiling produces a
+        # raw function instead of an OptimizedModule, breaking state_dict().
+        if type(self) is PPOJEPATrainer and hasattr(torch, 'compile') and self.device.type == 'cuda':
             print("Compiling PPO models with torch.compile()...")
             try:
                 self.vit = torch.compile(self.vit)
@@ -797,7 +801,18 @@ class PPOJEPATrainer:
                 os.remove(temp_path)
             raise e
 
+    @staticmethod
+    def _unwrap_compiled(module):
+        """Return the underlying nn.Module even if it has been wrapped by torch.compile().
+        torch.compile stores the original module in ._orig_mod. Without unwrapping,
+        calling state_dict() on a doubly-compiled model raises AttributeError."""
+        while hasattr(module, '_orig_mod'):
+            module = module._orig_mod
+        return module
+
     def _safe_load(self, module, ckpt_state):
+        # Unwrap torch.compile wrapper so state_dict() always works
+        module = self._unwrap_compiled(module)
         cleaned = {}
         model_keys = set(module.state_dict().keys())
         for k, v in ckpt_state.items():
