@@ -112,6 +112,7 @@ class CurriculumManager:
         # Keep history within rolling window length
         if len(self.completion_history) > self.eval_window:
             self.completion_history.pop(0)
+        if len(self.violation_history) > self.eval_window:
             self.violation_history.pop(0)
 
     def should_advance(self) -> bool:
@@ -152,8 +153,12 @@ class CurriculumManager:
     def load_state(self, state: Dict[str, Any]):
         self.current_stage_idx = state.get('current_stage_idx', 0)
         self.episodes_in_stage = state.get('episodes_in_stage', 0)
-        self.completion_history = state.get('completion_history', [])
-        self.violation_history = state.get('violation_history', [])
+        self.completion_history = state.get('completion_history', [])[-self.eval_window:]
+        self.violation_history = state.get('violation_history', [])[-self.eval_window:]
+        
+        # If loading an older checkpoint that doesn't have violation_history
+        if len(self.completion_history) > 0 and len(self.violation_history) == 0:
+            self.violation_history = [0.0] * len(self.completion_history)
 
     def get_progress_summary(self) -> Dict[str, Any]:
         mean_comp = np.mean(self.completion_history) if self.completion_history else 0.0
