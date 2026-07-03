@@ -903,6 +903,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             'wm_opt': self.wm_opt.state_dict(),
             'actor_opt': self.actor_opt.state_dict(),
             'critic_opt': self.critic_opt.state_dict(),
+            'scaler_wm': self.scaler_wm.state_dict(),
+            'scaler_ac': self.scaler_ac.state_dict(),
             'curriculum': self.curriculum.get_state(),
             'total_timesteps': self.total_timesteps
         }
@@ -940,6 +942,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 self.actor_opt.load_state_dict(state['actor_opt'])
             if 'critic_opt' in state:
                 self.critic_opt.load_state_dict(state['critic_opt'])
+            if 'scaler_wm' in state:
+                self.scaler_wm.load_state_dict(state['scaler_wm'])
+            if 'scaler_ac' in state:
+                self.scaler_ac.load_state_dict(state['scaler_ac'])
             self.curriculum.load_state(state['curriculum'])
             self.total_timesteps = state['total_timesteps']
             print(f"Dreamer checkpoint loaded successfully from {path} (Step {self.total_timesteps})")
@@ -1410,7 +1416,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 self.curriculum.advance()
                 self.env.reset()
                 
-            if self.total_timesteps % self.train_cfg.get('training', {}).get('save_interval', 50000) == 0:
+            save_interval = self.train_cfg.get('training', {}).get('save_interval', 50000)
+            if self.total_timesteps % save_interval < self.real_steps_per_iteration:
                 self.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{self.total_timesteps}.pt")
                 
             self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
