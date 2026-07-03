@@ -22,7 +22,6 @@ from pcb_router.training.rewards import RewardCalculator
 class RolloutBuffer:
     def __init__(self):
         self.rasters = []
-        self.graphs = []
         self.layer_masks = []
         
         self.net_actions = []
@@ -44,7 +43,6 @@ class RolloutBuffer:
 
     def clear(self):
         self.rasters.clear()
-        self.graphs.clear()
         self.layer_masks.clear()
         self.net_actions.clear()
         self.heatmap_actions.clear()
@@ -461,9 +459,8 @@ class PPOJEPATrainer:
             
             done = terminated or truncated
             
-            # Store in rollout buffer
-            self.buffer.rasters.append(obs['board_raster'])
-            self.buffer.graphs.append(graph)
+            # Store in rollout buffer (cast raster to float16 to save 50% RAM)
+            self.buffer.rasters.append(obs['board_raster'].astype(np.float16))
             self.buffer.layer_masks.append(obs['layer_mask'])
             self.buffer.net_actions.append(net_idx.item())
             self.buffer.heatmap_actions.append(heatmap_latent.squeeze(0).cpu().numpy())
@@ -535,8 +532,8 @@ class PPOJEPATrainer:
         """Runs PPO update and JEPA representation update"""
         import gc
         
-        # Convert rollout buffer to tensors
-        rasters = torch.tensor(np.array(self.buffer.rasters), dtype=torch.float32).to(self.device) # (T, 13, H, W)
+        # Convert rollout buffer to tensors (keep on CPU as float32 to avoid GPU VRAM peak)
+        rasters = torch.tensor(np.array(self.buffer.rasters), dtype=torch.float32) # (T, 13, H, W) on CPU
         layer_masks = torch.tensor(np.array(self.buffer.layer_masks), dtype=torch.float32).to(self.device) # (T, 8)
         
         net_actions = torch.tensor(self.buffer.net_actions, dtype=torch.long).to(self.device)
@@ -572,14 +569,14 @@ class PPOJEPATrainer:
             
             all_z_curr_list = []
             for idx in range(0, T - 1, chunk_size):
-                chunk = rasters[idx:min(idx + chunk_size, T - 1)]
+                chunk = rasters[idx:min(idx + chunk_size, T - 1)].to(self.device)
                 z_curr, _ = self.vit(chunk)
                 all_z_curr_list.append(z_curr)
             all_z_curr_all = torch.cat(all_z_curr_list, dim=0) if all_z_curr_list else torch.empty((0, self.vit.embed_dim), device=self.device)
             
             all_z_next_target_list = []
             for idx in range(1, T, chunk_size):
-                chunk = rasters[idx:min(idx + chunk_size, T)]
+                chunk = rasters[idx:min(idx + chunk_size, T)].to(self.device)
                 z_next, _ = self.jepa.target_encoder(chunk)
                 all_z_next_target_list.append(z_next)
             all_z_next_target_all = torch.cat(all_z_next_target_list, dim=0) if all_z_next_target_list else torch.empty((0, self.vit.embed_dim), device=self.device)
@@ -598,7 +595,7 @@ class PPOJEPATrainer:
                 if len(indices) < batch_size // 2:
                     continue
                 
-                b_rasters = rasters[indices]
+                b_rasters = rasters[indices].to(self.device)
                 b_net_acts = net_actions[indices]
                 b_heatmap_acts = heatmap_actions[indices]
                 
