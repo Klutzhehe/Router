@@ -159,6 +159,16 @@ class PCBRoutingEnv(gym.Env):
         # Set source/target markers in raster
         self.board_state.set_current_net(net_id)
         
+        # Apply pin exclusion mask: zero out heatmap near other-net pads
+        # so A* never sees those areas as "preferred" routing zones.
+        # Also apply via-in-pad boost so A* can place vias at own pads.
+        for l_idx in range(layer_heatmaps.shape[0]):
+            pin_mask = self.board_state.get_pin_exclusion_mask(l_idx)
+            layer_heatmaps[l_idx] *= pin_mask
+        
+        via_pad_boost = self.board_state.get_via_in_pad_boost()
+        via_prob_map = np.clip(via_prob_map + via_pad_boost, 0.0, 1.0)
+        
         # 1. Find pins for this net
         net_pins = [self.board.pins[pid] for pid in selected_net.pin_ids]
         src_pin = net_pins[0]

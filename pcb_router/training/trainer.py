@@ -1242,7 +1242,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 episode.net_embeddings = episode.net_embeddings_list[0]
                 episode.unrouted_masks = episode.unrouted_masks_list
                 self.replay_buffer.add_episode(episode)
-                completion_rates.append(info.get('completion_rate', 0.0))
+                cr = info.get('completion_rate', 0.0)
+                drc_viol = info.get('drc_violations', 0)
+                num_nets = len(self.env.board.nets)
+                drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
+                self.curriculum.record_episode(cr, drc_rate)
+                completion_rates.append(cr)
                 
         return np.mean(completion_rates) if completion_rates else 0.0
 
@@ -1553,9 +1558,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 'loss_actor': f"{ac_metrics['loss_actor']:.3f}"
             })
             progress_bar.refresh()
-            
-            self.curriculum.completion_history.append(mean_completion)
-            self.curriculum.episodes_in_stage += 1
+            # Note: Curriculum episodes and completion history are updated automatically
+            # inside _phase1_collect_real for every actual episode completed.
             
             if self.curriculum.should_advance():
                 self.curriculum.advance()

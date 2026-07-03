@@ -121,6 +121,96 @@ class BoardState:
                             
         return np.clip(occ, 0, 1)
 
+    def get_pin_exclusion_mask(self, layer: int, extra_margin: int = 2) -> np.ndarray:
+        """Returns a mask where 1.0 = routable, 0.0 = within clearance of another net's pad.
+        
+        Applied to heatmaps BEFORE passing to A* so the decoder learns that areas
+        near other-net pads should never have high routing preference.
+        
+        Args:
+            layer: copper layer index
+            extra_margin: additional cells beyond DRC clearance to discourage routing
+                          near foreign pads (soft margin for heatmap suppression)
+        """
+        mask = np.ones((self.height, self.width), dtype=np.float32)
+        
+        if self.current_net_id is None:
+            return mask
+            
+        # Look up design rules once
+        default_rules = self.board.design_rules.get('default', {})
+        net_rules = {}
+        for net in self.board.nets:
+            net_rules[net.id] = self.board.design_rules.get(
+                net.net_class, default_rules
+            )
+        
+        for pin in self.board.pins.values():
+            if pin.net_id == self.current_net_id:
+                continue  # Skip our own net's pads
+                
+            # Block all layers for through-hole pins (-1), specific layer for SMD
+            if pin.layer != -1 and pin.layer != layer:
+                continue
+                
+            rules = net_rules.get(pin.net_id, default_rules)
+            clearance = rules.get('clearance', 0.15)
+            trace_width = rules.get('width', 0.15)
+            
+            pad_r = 3.0
+            clearance_cells = clearance / self.resolution
+            trace_r_cells = (trace_width / 2.0) / self.resolution
+            # Use a wider exclusion radius than occupancy: pad + clearance + trace + extra margin
+            avoid_r = pad_r + clearance_cells + trace_r_cells + extra_margin
+            
+            cx, cy = pin.global_x, pin.global_y
+            r_ceil = int(avoid_r + 0.99)
+            y_min = max(0, cy - r_ceil)
+            y_max = min(self.height - 1, cy + r_ceil)
+            x_min = max(0, cx - r_ceil)
+            x_max = min(self.width - 1, cx + r_ceil)
+            
+            if pin.pad_shape == 0:  # circular
+                for y in range(y_min, y_max + 1):
+                    for x in range(x_min, x_max + 1):
+                        if (x - cx)**2 + (y - cy)**2 <= avoid_r**2:
+                            mask[y, x] = 0.0
+            else:  # rectangular
+                mask[y_min:y_max+1, x_min:x_max+1] = 0.0
+                
+        return mask
+
+    def get_via_in_pad_boost(self) -> np.ndarray:
+        """Returns a via probability boost map for via-in-pad routing.
+        
+        Marks the current net's own pad locations with 1.0 so A* treats them
+        as excellent via placement sites (enables via-in-pad routing when
+        source and target are on different layers).
+        """
+        boost = np.zeros((self.height, self.width), dtype=np.float32)
+        
+        if self.current_net_id is None:
+            return boost
+            
+        for pin in self.board.pins.values():
+            if pin.net_id == self.current_net_id:
+                cx, cy = pin.global_x, pin.global_y
+                pad_r = 3
+                y_min = max(0, cy - pad_r)
+                y_max = min(self.height - 1, cy + pad_r)
+                x_min = max(0, cx - pad_r)
+                x_max = min(self.width - 1, cx + pad_r)
+                
+                if pin.pad_shape == 0:  # circular
+                    for y in range(y_min, y_max + 1):
+                        for x in range(x_min, x_max + 1):
+                            if (x - cx)**2 + (y - cy)**2 <= pad_r**2:
+                                boost[y, x] = 1.0
+                else:
+                    boost[y_min:y_max+1, x_min:x_max+1] = 1.0
+                    
+        return boost
+
     def _render_initial_state(self):
         # Channel 9: Obstacles and Keep-outs
         for obs in self.board.obstacles:

@@ -268,7 +268,8 @@ class AStarPathfinder:
                 if 0 <= nx < W and 0 <= ny < H:
                     h_val = heatmaps[cl, ny, nx]
                     step_len = math.sqrt(2.0) if is_diag else 1.0
-                    step_cost = step_len * (1.0 + self.heatmap_weight * h_val)
+                    # FIX: match find_path convention — high h_val = preferred = low cost
+                    step_cost = step_len * (1.0 + self.heatmap_weight * (1.0 - h_val))
                     
                     new_dir = (dx, dy, 0)
                     if last_dir != (0, 0, 0) and last_dir != new_dir:
