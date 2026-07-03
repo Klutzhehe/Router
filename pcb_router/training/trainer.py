@@ -992,14 +992,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         self.lambda_ = t_cfg.get('lambda_', 0.95)
         
         # Optional torch.compile() for PyTorch 2.0+ GPU acceleration
-        # Extended to also compile ViT, GNN, Fusion, and Decoder for rollout speed.
+        # Compiles static-shape models (vit, jepa, policy, decoder) to avoid dynamic graph compilation hangs with GNN/Fusion.
         self.compile_models = t_cfg.get('compile_models', True)
         if self.compile_models and hasattr(torch, 'compile') and self.device.type == 'cuda':
-            print("Compiling world model, policy, and encoder/decoder with torch.compile()...")
+            print("Compiling world model, policy, and static encoders/decoders with torch.compile()...")
             try:
                 self.vit = torch.compile(self.vit)
-                self.gnn = torch.compile(self.gnn)
-                self.fusion = torch.compile(self.fusion)
                 self.jepa = torch.compile(self.jepa)
                 self.policy = torch.compile(self.policy)
                 self.decoder = torch.compile(self.decoder)
