@@ -186,7 +186,13 @@ class GraphBuilder:
         """
         Dynamically update features in the HeteroData graph object when a net is routed
         """
-        # If running in mock dict mode, update dict structures
+        # Clone the graph to prevent in-place modifications and sharing mutated states in buffers
+        if hasattr(graph, 'clone'):
+            graph = graph.clone()
+        else:
+            import copy
+            graph = copy.deepcopy(graph)
+
         is_mock = not hasattr(graph, 'edge_index_dict')
         
         # 1. Update pad 'is_source' / 'is_target' to zero if net is routed
@@ -194,6 +200,8 @@ class GraphBuilder:
         pads = list(board.pins.values())
         
         pad_x = graph['pad'].x if not is_mock else graph['pad']['x']
+        # Clone pad_x so indexing modifications do not mutate the original tensor in-place
+        pad_x = pad_x.clone()
         
         for idx, pin in enumerate(pads):
             if pin.net_id == routed_net_id:
@@ -201,6 +209,11 @@ class GraphBuilder:
                 pad_x[idx, 5] = 0.0
                 pad_x[idx, 6] = 0.0
                 
+        if not is_mock:
+            graph['pad'].x = pad_x
+        else:
+            graph['pad']['x'] = pad_x
+            
         # 2. Append new via nodes if present
         if new_vias:
             v_feats = []
@@ -214,13 +227,17 @@ class GraphBuilder:
                 ])
             v_tensor = torch.tensor(v_feats, dtype=torch.float)
             
+            via_x = graph['via'].x if not is_mock else graph['via']['x']
+            via_x = torch.cat((via_x, v_tensor), dim=0)
+            
             if not is_mock:
-                graph['via'].x = torch.cat((graph['via'].x, v_tensor), dim=0)
+                graph['via'].x = via_x
             else:
-                graph['via']['x'] = torch.cat((graph['via']['x'], v_tensor), dim=0)
+                graph['via']['x'] = via_x
                 
             # Note: in a full implementation, we could also reconstruct pad-via connectivity edges here,
             # but for our GNN-encoder v1, updating nodes is sufficient as spatial features of traces
             # are primarily captured by the rasterized board state (ViT channels).
             
         return graph
+
