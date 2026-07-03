@@ -75,6 +75,6 @@ training:
   entropy_coef_decay_iters: 50000
 
   use_amp: true
-  compile_models: true
+  compile_models: false
   critic_target_ema: 0.98
 

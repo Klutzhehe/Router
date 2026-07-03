@@ -212,7 +212,8 @@ class PPOJEPATrainer:
         # super().__init__()) does NOT compile here — it replaces self.jepa/self.policy with
         # new models afterwards and runs its own compile block. Double-compiling produces a
         # raw function instead of an OptimizedModule, breaking state_dict().
-        if type(self) is PPOJEPATrainer and hasattr(torch, 'compile') and self.device.type == 'cuda':
+        compile_cfg = self.train_cfg.get('training', {}).get('compile_models', True)
+        if type(self) is PPOJEPATrainer and compile_cfg and hasattr(torch, 'compile') and self.device.type == 'cuda':
             print("Compiling PPO models with torch.compile()...")
             try:
                 self.vit = torch.compile(self.vit)
