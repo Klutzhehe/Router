@@ -3,7 +3,7 @@ import heapq
 import math
 
 class AStarPathfinder:
-    def __init__(self, direction_change_penalty: float = 5.0, base_via_cost: float = 15.0, heatmap_weight: float = 10.0):
+    def __init__(self, direction_change_penalty: float = 15.0, base_via_cost: float = 15.0, heatmap_weight: float = 10.0):
         self.direction_change_penalty = direction_change_penalty
         self.base_via_cost = base_via_cost
         self.heatmap_weight = heatmap_weight
