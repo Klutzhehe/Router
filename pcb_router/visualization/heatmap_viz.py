@@ -52,12 +52,35 @@ class HeatmapVisualizer:
                     linewidth=1, edgecolor='#4B5563', facecolor='none', alpha=0.5, zorder=5
                 )
                 ax.add_patch(rect)
+            # Get default rules to read clearance
+            default_rules = board.design_rules.get('default', {})
+            net_rules = {}
+            for net in board.nets:
+                net_rules[net.id] = board.design_rules.get(net.net_class, default_rules)
+
             for pin in board.pins.values():
                 circle = patches.Circle(
                     (pin.global_x, pin.global_y), radius=3,
                     facecolor='none', edgecolor='#FFFFFF', linewidth=0.5, alpha=0.8, zorder=6
                 )
                 ax.add_patch(circle)
+                
+                # If this is another net's pad and current net is active, draw clearance boundaries
+                if board_state.current_net_id is not None and pin.net_id != board_state.current_net_id:
+                    rules = net_rules.get(pin.net_id, default_rules)
+                    clearance = rules.get('clearance', 0.15)
+                    trace_width = rules.get('width', 0.15)
+                    pad_r = 3.0
+                    clearance_cells = clearance / board_state.resolution
+                    trace_r_cells = (trace_width / 2.0) / board_state.resolution
+                    avoid_r = pad_r + clearance_cells + trace_r_cells + 2 # extra margin match
+                    
+                    clearance_circle = patches.Circle(
+                        (pin.global_x, pin.global_y), radius=avoid_r,
+                        facecolor='none', edgecolor='#EF4444', linewidth=0.8,
+                        linestyle='--', alpha=0.3, zorder=4
+                    )
+                    ax.add_patch(clearance_circle)
                 
         ax.set_title(title if title else "Cost Heatmap", color=self.text_color, fontsize=14, pad=15)
         ax.set_xticks([])
@@ -192,6 +215,16 @@ class HeatmapVisualizer:
         for seg in state.traces:
             color = self.renderer._get_net_color(seg.net_id)
             ax.plot([seg.start_x, seg.end_x], [seg.start_y, seg.end_y], color=color, linewidth=2)
+        # Vias
+        for via in state.vias:
+            # Draw via annular ring (outer circle)
+            via_r = (via.drill_size / 2.0 + via.annular_ring) / state.resolution
+            annular = patches.Circle((via.x, via.y), radius=via_r, facecolor='#10B981', edgecolor='white', linewidth=0.5, alpha=0.9, zorder=7)
+            # Draw via drill hole (inner circle)
+            drill_r = (via.drill_size / 2.0) / state.resolution
+            drill = patches.Circle((via.x, via.y), radius=drill_r, facecolor=self.bg_color, edgecolor='none', zorder=8)
+            ax.add_patch(annular)
+            ax.add_patch(drill)
         # Pads
         for pin in board.pins.values():
             color = self.renderer._get_net_color(pin.net_id)
