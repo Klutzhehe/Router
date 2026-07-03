@@ -1213,9 +1213,11 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 
                 # Detached RSSM update and Replay Buffer appending
                 with torch.no_grad():
-                    action_tuple = (net_idx_tensor.squeeze(0).cpu(), heatmap_latent.squeeze(0).cpu())
+                    action_tuple = (net_idx_tensor.detach().squeeze(0).cpu(), heatmap_latent.detach().squeeze(0).cpu())
                     action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent.detach())
                     h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
+                    h = h.detach()
+                    z = z.detach()
                     
                     if not hasattr(episode, 'target_context_embeddings'):
                         episode.target_context_embeddings = []
@@ -1224,10 +1226,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                     if not hasattr(episode, 'unrouted_masks_list'):
                         episode.unrouted_masks_list = []
                         
-                    episode.append(context_emb.squeeze(0).cpu(), action_tuple, reward, done)
-                    episode.target_context_embeddings.append(target_context_emb.squeeze(0).cpu())
-                    episode.net_embeddings_list.append(net_embs.squeeze(0).cpu())
-                    episode.unrouted_masks_list.append(unrouted_mask.squeeze(0).cpu())
+                    episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
+                    episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
+                    episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
+                    episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
                 
                 obs = next_obs
                 info = next_info
