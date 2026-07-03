@@ -52,9 +52,9 @@ training:
   real_steps_per_iteration: 64
   train_ratio: 100
   replay_buffer_size: 5000
-  batch_size: 128
+  batch_size: 256
   seq_len: 50
-  imagine_batch_size: 1024
+  imagine_batch_size: 4096
   imagination_horizon_start: 5
   imagination_horizon_end: 15
   imagination_horizon_ramp_iters: 20000
