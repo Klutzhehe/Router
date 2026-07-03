@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import copy
 from tqdm import tqdm
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from pcb_router.models.vit_encoder import ViTEncoder
 from pcb_router.models.gnn_encoder import HeteroGATEncoder
@@ -189,12 +189,51 @@ class PPOJEPATrainer:
             lr=float(self.train_cfg['ppo']['learning_rate']),
             weight_decay=float(self.train_cfg['optimizer']['weight_decay'])
         )
-        
+
+        # 6. LR Scheduler — cosine with linear warmup (wired up from training.yaml lr_schedule)
+        lr_cfg = self.train_cfg.get('lr_schedule', {})
+        warmup_steps = int(lr_cfg.get('warmup_steps', 1000))
+        total_steps = int(self.train_cfg.get('training', {}).get('total_timesteps', 5_000_000))
+        rollout_steps = int(self.train_cfg.get('ppo', {}).get('num_rollout_steps', 64))
+        num_updates = max(total_steps // max(rollout_steps, 1), 1)
+        min_lr = float(lr_cfg.get('min_lr', 1e-6))
+        base_lr = float(self.train_cfg['ppo']['learning_rate'])
+        # Linear warmup phase then cosine decay
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=min_lr / base_lr, end_factor=1.0, total_iters=warmup_steps
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(num_updates - warmup_steps, 1), eta_min=min_lr
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps]
+        )
+
+        # 7. Optional torch.compile() for PyTorch 2.0+ GPU acceleration
+        if hasattr(torch, 'compile') and self.device.type == 'cuda':
+            print("Compiling PPO models with torch.compile()...")
+            try:
+                self.vit = torch.compile(self.vit)
+                self.gnn = torch.compile(self.gnn)
+                self.fusion = torch.compile(self.fusion)
+                self.policy = torch.compile(self.policy)
+                self.decoder = torch.compile(self.decoder)
+            except Exception as e:
+                print(f"torch.compile failed (falling back to uncompiled): {e}")
+
         self.buffer = RolloutBuffer()
         self.total_timesteps = 0
         self.checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else self.train_cfg['checkpoint']['save_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
+
+        # Cache pin→net mapping (built once per episode, invalidated on reset)
+        self._pin_to_net_idx: Optional[torch.Tensor] = None
+        self._pin_to_net_valid: bool = False
+
+        # Set enable_viz=True to allow inline heatmap comparison plots (Jupyter/Colab only).
+        # Disabled by default to avoid deepcopy overhead in the hot rollout path.
+        self.enable_viz: bool = False
+
         # Metrics history for live plotting in Colab / external hooks
         self.metrics_history = {
             'timesteps': [],
@@ -204,32 +243,79 @@ class PPOJEPATrainer:
             'loss_jepa': [],
             'stage': [],
         }
-        
+
         self.last_heatmap = None
         self.last_net_idx = None
-        
+
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
+
+    def _build_pin_to_net_idx(self) -> torch.Tensor:
+        """Build a (num_pads,) int64 tensor mapping each pad index to its net index.
+        Cached per episode; call _invalidate_pin_cache() on env.reset()."""
+        num_nets = len(self.env.board.nets)
+        net_id_to_idx = {net.id: idx for idx, net in enumerate(self.env.board.nets)}
+        pins_list = list(self.env.board.pins.values())
+        pin_to_net = torch.zeros(len(pins_list), dtype=torch.long, device=self.device)
+        for pad_idx, p in enumerate(pins_list):
+            net_idx = net_id_to_idx.get(p.net_id, 0)
+            pin_to_net[pad_idx] = net_idx
+        return pin_to_net
+
+    def _invalidate_pin_cache(self):
+        self._pin_to_net_valid = False
+        self._pin_to_net_idx = None
+
+    def _get_net_embs_vectorized(
+        self,
+        fused_pads: torch.Tensor,  # (1, num_pads, embed_dim)
+        num_nets: int,
+    ) -> torch.Tensor:
+        """Aggregate pad embeddings into per-net embeddings via scatter_add (no Python loop)."""
+        if not self._pin_to_net_valid or self._pin_to_net_idx is None:
+            self._pin_to_net_idx = self._build_pin_to_net_idx()
+            self._pin_to_net_valid = True
+
+        embed_dim = fused_pads.shape[-1]
+        pads = fused_pads[0]  # (num_pads, embed_dim)
+        pin_to_net = self._pin_to_net_idx  # (num_pads,)
+
+        # Accumulate sum of pad embeddings per net
+        net_sum = torch.zeros(num_nets, embed_dim, device=self.device)
+        net_sum.scatter_add_(0, pin_to_net.unsqueeze(1).expand_as(pads), pads)
+
+        # Count pads per net for averaging
+        pad_counts = torch.zeros(num_nets, device=self.device)
+        pad_counts.scatter_add_(0, pin_to_net, torch.ones(len(pin_to_net), device=self.device))
+        pad_counts = pad_counts.clamp(min=1.0)
+
+        net_mean = net_sum / pad_counts.unsqueeze(1)  # (num_nets, embed_dim)
+        return net_mean
 
     def collect_rollouts(self, num_steps: int) -> float:
         import time
         self.buffer.clear()
-        
+
         obs, info = self.env.reset()
+        # Invalidate pin→net cache whenever the board is regenerated
+        self._invalidate_pin_cache()
         done = False
-        
+
         eval_completion_rates = []
-        
+
         # A* success rate tracking (Fix #3)
         astar_connected_count = 0
         astar_attempted_count = 0
-        
+
         step_timings = {
             'obs': [], 'vit': [], 'gnn': [], 'fusion': [],
             'net_emb': [], 'policy': [], 'decoder': [], 'env': [],
             'astar': [], 'post': [], 'drc': [], 'graph': []
         }
-        
+
+        # AMP context: enabled on CUDA for ~30-50% faster attention kernels
+        amp_ctx = torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda'))
+
         for step in range(num_steps):
             t_start = time.perf_counter()
             # Move observation to PyTorch
@@ -243,52 +329,47 @@ class PPOJEPATrainer:
             edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()} if hasattr(graph, 'edge_index_dict') else {k: v.to(self.device) for k, v in graph.items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
             t_obs = time.perf_counter() - t_start
             
-            with torch.no_grad():
+            with torch.no_grad(), amp_ctx:
                 # 1. Spatial encoding
                 t_vit_start = time.perf_counter()
                 spatial_patches, cls_spatial = self.vit(raster_tensor) # (1, N_patches, 384)
                 t_vit = time.perf_counter() - t_vit_start
-                
+
                 # 2. Graph encoding
                 t_gnn_start = time.perf_counter()
                 node_embs = self.gnn(x_dict, edge_index_dict)
                 pad_embs = node_embs['pad'].unsqueeze(0) # add batch dim -> (1, N_pads, 384)
                 t_gnn = time.perf_counter() - t_gnn_start
-                
+
                 # 3. Bidirectional Fusion
                 t_fusion_start = time.perf_counter()
                 fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
                 t_fusion = time.perf_counter() - t_fusion_start
-                
-                # Group pad embeddings to net embeddings by average
+
+                # Group pad embeddings to net embeddings (vectorized scatter_add — no Python loop)
                 t_net_emb_start = time.perf_counter()
                 num_nets = len(self.env.board.nets)
                 max_nets = 100
                 net_embs = torch.zeros((1, max_nets, self.vit.embed_dim), device=self.device)
                 unrouted_mask = torch.zeros((1, max_nets), dtype=torch.bool, device=self.device)
-                
-                temp_net_embs = torch.zeros((num_nets, self.vit.embed_dim), device=self.device)
-                for net_idx, net in enumerate(self.env.board.nets):
-                    # Average pad embeddings belonging to this net
-                    pin_indices = [idx for idx, p in enumerate(self.env.board.pins.values()) if p.net_id == net.id]
-                    if pin_indices:
-                        temp_net_embs[net_idx] = fused_pads[0, pin_indices].mean(dim=0)
-                        
+
+                temp_net_embs = self._get_net_embs_vectorized(fused_pads, num_nets)  # (num_nets, embed_dim)
                 net_embs[0, :num_nets] = temp_net_embs
-                
-                # Create mask for unrouted nets
-                for net_idx, net in enumerate(self.env.board.nets):
-                    if net.id not in self.env.routed_nets:
-                        unrouted_mask[0, net_idx] = True
+
+                # Create mask for unrouted nets (this loop is tiny — O(num_nets) scalars)
+                routed = self.env.routed_nets
+                for ni, net in enumerate(self.env.board.nets):
+                    if net.id not in routed:
+                        unrouted_mask[0, ni] = True
                 t_net_emb = time.perf_counter() - t_net_emb_start
-                        
+
                 # 4. Policy forward
                 t_policy_start = time.perf_counter()
                 net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
                     net_embs, unrouted_mask, fused_spatial, cls_spatial
                 )
                 t_policy = time.perf_counter() - t_policy_start
-                
+
                 # 5. Decode heatmap
                 t_decoder_start = time.perf_counter()
                 heatmaps_via = self.decoder(
@@ -347,26 +428,27 @@ class PPOJEPATrainer:
                       f"      +-- Environment Step: {t_en:.1f}ms [A* Search: {t_as:.1f}ms | Post-Proc: {t_po:.1f}ms | DRC: {t_dr:.1f}ms | GraphUpdate: {t_gr:.1f}ms]")
                 
                 # Render and display comparison dashboard in Jupyter/Colab
-                try:
-                    from pcb_router.visualization.heatmap_viz import HeatmapVisualizer
-                    import matplotlib.pyplot as plt
-                    import IPython.display as ipydisplay
-                    
-                    viz = HeatmapVisualizer(theme_dark=True)
-                    # Select the heatmap slice corresponding to starting pin layer
-                    h_idx = src_pin.layer if (src_pin and src_pin.layer < len(heatmaps_np)) else 0
-                    # Only deepcopy board state when visualization actually runs
-                    board_before = copy.deepcopy(self.env.board_state)
-                    fig = viz.render_routing_comparison(
-                        board_before=board_before,
-                        board_after=copy.deepcopy(self.env.board_state),
-                        heatmap=heatmaps_np[h_idx],
-                        path=next_info.get('path', [])
-                    )
-                    ipydisplay.display(fig)
-                    plt.close(fig)
-                except Exception as e:
-                    pass
+                # Gated by self.enable_viz to avoid expensive deepcopy in headless training.
+                # Set trainer.enable_viz = True before training to re-enable inline plots.
+                if self.enable_viz:
+                    try:
+                        from pcb_router.visualization.heatmap_viz import HeatmapVisualizer
+                        import matplotlib.pyplot as plt
+                        import IPython.display as ipydisplay
+
+                        viz = HeatmapVisualizer(theme_dark=True)
+                        h_idx = src_pin.layer if (src_pin and src_pin.layer < len(heatmaps_np)) else 0
+                        board_before = copy.deepcopy(self.env.board_state)
+                        fig = viz.render_routing_comparison(
+                            board_before=board_before,
+                            board_after=copy.deepcopy(self.env.board_state),
+                            heatmap=heatmaps_np[h_idx],
+                            path=next_info.get('path', [])
+                        )
+                        ipydisplay.display(fig)
+                        plt.close(fig)
+                    except Exception:
+                        pass
             
             done = terminated or truncated
             
@@ -393,6 +475,8 @@ class PPOJEPATrainer:
                 self.curriculum.record_episode(next_info['completion_rate'], next_info['drc_violations'] / len(self.env.board.nets))
                 eval_completion_rates.append(next_info['completion_rate'])
                 obs, info = self.env.reset()
+                # New board generated on reset — invalidate cached pin→net mapping
+                self._invalidate_pin_cache()
             else:
                 obs = next_obs
                 info = next_info
@@ -589,15 +673,18 @@ class PPOJEPATrainer:
                     self.train_cfg['ppo']['max_grad_norm']
                 )
                 self.optimizer.step()
-                
+
                 # Update EMA target encoder weights
                 self.jepa.update_target_weights(self.vit)
-                
+
                 policy_loss_epoch += loss_policy.item()
                 value_loss_epoch += loss_val.item()
                 jepa_loss_epoch += loss_jepa.item()
                 num_updates += 1
-        
+
+        # Step LR scheduler once per update cycle
+        self.scheduler.step()
+
         # Free pre-computed JEPA pairs and flush GPU cache
         gc.collect()
         if torch.cuda.is_available():
@@ -665,9 +752,11 @@ class PPOJEPATrainer:
             # 5. Checkpoint
             if self.total_timesteps % self.train_cfg['training']['save_interval'] == 0:
                 self.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{self.total_timesteps}.pt")
-                
-            # 6. Visual Checkpoint (Every Rollout Update)
-            self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
+
+            # 6. Visual Checkpoint (gated by visual_save_interval to avoid saving every iteration)
+            visual_interval = self.train_cfg.get('training', {}).get('visual_save_interval', 5000)
+            if self.total_timesteps % visual_interval < rollout_steps:
+                self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
             
             # 7. Optional external callback (for Colab live viz)
             if on_update is not None:
@@ -888,12 +977,17 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         self.lambda_ = t_cfg.get('lambda_', 0.95)
         
         # Optional torch.compile() for PyTorch 2.0+ GPU acceleration
+        # Extended to also compile ViT, GNN, Fusion, and Decoder for rollout speed.
         self.compile_models = t_cfg.get('compile_models', True)
         if self.compile_models and hasattr(torch, 'compile') and self.device.type == 'cuda':
-            print("Compiling world model and policy with torch.compile()...")
+            print("Compiling world model, policy, and encoder/decoder with torch.compile()...")
             try:
+                self.vit = torch.compile(self.vit)
+                self.gnn = torch.compile(self.gnn)
+                self.fusion = torch.compile(self.fusion)
                 self.jepa = torch.compile(self.jepa)
                 self.policy = torch.compile(self.policy)
+                self.decoder = torch.compile(self.decoder)
             except Exception as e:
                 print(f"torch.compile failed (falling back to uncompiled execution): {e}")
         
@@ -1446,8 +1540,11 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             save_interval = self.train_cfg.get('training', {}).get('save_interval', 50000)
             if self.total_timesteps % save_interval < self.real_steps_per_iteration:
                 self.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{self.total_timesteps}.pt")
-                
-            self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
+
+            # Visual checkpoint gated by visual_save_interval (not every iteration)
+            visual_interval = self.train_cfg.get('training', {}).get('visual_save_interval', 5000)
+            if self.total_timesteps % visual_interval < self.real_steps_per_iteration:
+                self.save_visual_checkpoint(f"{self.checkpoint_dir}/visuals/step_{self.total_timesteps}.png")
             
             if on_update is not None:
                 on_update(self, {

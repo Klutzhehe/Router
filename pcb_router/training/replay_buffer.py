@@ -1,5 +1,6 @@
 import random
-from typing import List, Dict, Tuple, Any
+import collections
+from typing import List, Dict, Deque, Tuple, Any
 import torch
 
 class Episode:
@@ -27,9 +28,9 @@ class ReplayBuffer:
         self.schema_version = "1.0.0"
 
         # Rolling cache of (h_t, z_t) latents computed during world model training.
-        # Stored as a list of dicts: {'h': tensor, 'z': tensor}
-        self.latent_cache: List[Dict[str, torch.Tensor]] = []
+        # Use a deque with maxlen for O(1) eviction instead of list.pop(0) which is O(n).
         self.latent_cache_capacity = 10000
+        self.latent_cache: Deque[Dict[str, torch.Tensor]] = collections.deque(maxlen=self.latent_cache_capacity)
 
     def add_episode(self, episode: Episode):
         if episode.length < self.min_episode_len:
@@ -51,10 +52,8 @@ class ReplayBuffer:
         z_flat = z.reshape(-1, z.shape[-1]).detach().cpu()
         
         for i in range(h_flat.shape[0]):
+            # deque(maxlen=...) automatically discards the oldest item when full
             self.latent_cache.append({'h': h_flat[i], 'z': z_flat[i]})
-            if len(self.latent_cache) > self.latent_cache_capacity:
-                # Discard oldest
-                self.latent_cache.pop(0)
 
     def sample_sequences(self, batch_size: int, seq_len: int) -> Dict[str, torch.Tensor]:
         """

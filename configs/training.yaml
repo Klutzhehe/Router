@@ -7,8 +7,8 @@ ppo:
   value_loss_coef: 0.5
   entropy_coef: 0.01
   max_grad_norm: 0.5
-  num_epochs: 4                # PPO update epochs per batch
-  batch_size: 16               # reduced from 64; large batches OOM during sequential update loop
+  num_epochs: 3                # PPO update epochs per batch (reduced from 4; same total updates with larger batch)
+  batch_size: 32               # increased from 16; better GPU utilization
   num_rollout_steps: 64        # reduced from 128; fewer board deepcopies accumulate in buffer
   num_envs: 4                  # parallel environments
 
@@ -36,6 +36,7 @@ training:
   eval_interval: 10_000        # evaluate every N timesteps
   save_interval: 50_000        # save checkpoint every N timesteps
   log_interval: 1_000          # log metrics every N timesteps
+  visual_save_interval: 5_000  # save PNG visual checkpoint every N timesteps (not every iteration)
   seed: 42
 
 # Checkpointing (for Colab session recovery)
