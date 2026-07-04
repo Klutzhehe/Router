@@ -352,6 +352,7 @@ def main():
     )
     
     print("\nStarting BC pretraining loop...")
+    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
         policy.train()
         if args.unfreeze_encoders:
@@ -382,43 +383,46 @@ def main():
             valid_masks = batch['valid_mask'].to(device)
             steps_remainings = batch['steps_remaining'].to(device)
             
-            # Run ViT on the entire batch at once
-            if not args.unfreeze_encoders:
-                with torch.no_grad():
+            with torch.cuda.amp.autocast():
+                # Run ViT on the entire batch at once
+                if not args.unfreeze_encoders:
+                    with torch.no_grad():
+                        spatial_patches, _ = vit(rasters)
+                else:
                     spatial_patches, _ = vit(rasters)
-            else:
-                spatial_patches, _ = vit(rasters)
+                    
+                # Combine individual graphs into a single batched graph
+                batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+                pad_batch = batched_graph['pad'].batch
                 
-            # Combine individual graphs into a single batched graph
-            batched_graph = Batch.from_data_list(batch['graphs']).to(device)
-            pad_batch = batched_graph['pad'].batch
-            
-            # Forward GNN and dense collate pads in a single batched call
-            if not args.unfreeze_encoders:
-                with torch.no_grad():
+                # Forward GNN and dense collate pads in a single batched call
+                if not args.unfreeze_encoders:
+                    with torch.no_grad():
+                        node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
+                        pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
+                        fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
+                else:
                     node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
                     pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
                     fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
-            else:
-                node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
-                pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
-                fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
-            
-            # Forward policy
-            logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
-            
-            # Action masking
-            masked_logits = logits.masked_fill(~valid_masks, -1e4)
-            
-            loss_action = criterion_action(masked_logits, actions)
-            loss_val = criterion_value(value.squeeze(-1), steps_remainings)
-            
-            loss = loss_action + 0.001 * loss_val
-            
+                
+                # Forward policy
+                logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
+                
+                # Action masking
+                masked_logits = logits.masked_fill(~valid_masks, -1e4)
+                
+                loss_action = criterion_action(masked_logits, actions)
+                loss_val = criterion_value(value.squeeze(-1), steps_remainings)
+                
+                loss = loss_action + 0.001 * loss_val
+                
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)  # gradient clipping
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             train_loss += loss.item() * rasters.size(0)
             preds = masked_logits.argmax(dim=-1)
@@ -448,24 +452,25 @@ def main():
                 valid_masks = batch['valid_mask'].to(device)
                 steps_remainings = batch['steps_remaining'].to(device)
                 
-                # Run ViT on the entire batch at once
-                spatial_patches, _ = vit(rasters)
-                
-                # Combine graphs into a single batched graph
-                batched_graph = Batch.from_data_list(batch['graphs']).to(device)
-                pad_batch = batched_graph['pad'].batch
-                
-                # Single batched forward pass for GNN and Fusion
-                node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
-                pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
-                fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
-                
-                logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
-                masked_logits = logits.masked_fill(~valid_masks, -1e4)
-                
-                loss_action = criterion_action(masked_logits, actions)
-                loss_val = criterion_value(value.squeeze(-1), steps_remainings)
-                loss = loss_action + 0.001 * loss_val
+                with torch.cuda.amp.autocast():
+                    # Run ViT on the entire batch at once
+                    spatial_patches, _ = vit(rasters)
+                    
+                    # Combine graphs into a single batched graph
+                    batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+                    pad_batch = batched_graph['pad'].batch
+                    
+                    # Single batched forward pass for GNN and Fusion
+                    node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
+                    pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
+                    fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
+                    
+                    logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
+                    masked_logits = logits.masked_fill(~valid_masks, -1e4)
+                    
+                    loss_action = criterion_action(masked_logits, actions)
+                    loss_val = criterion_value(value.squeeze(-1), steps_remainings)
+                    loss = loss_action + 0.001 * loss_val
                 
                 val_loss += loss.item() * rasters.size(0)
                 preds = masked_logits.argmax(dim=-1)
