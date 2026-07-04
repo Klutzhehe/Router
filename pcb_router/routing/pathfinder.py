@@ -116,7 +116,7 @@ class AStarPathfinder:
             pad_layers = max(N_layers, 8)
             pad_H = max(H, 512)
             pad_W = max(W, 512)
-            self._visited_buf = np.full((pad_layers, pad_H, pad_W, 11), np.inf, dtype=np.float32)
+            self._visited_buf = np.full((pad_layers, pad_H, pad_W, 11), np.inf, dtype=np.float64)
             self._parent_x_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int16)
             self._parent_y_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int16)
             self._parent_l_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int8)
@@ -170,7 +170,7 @@ class AStarPathfinder:
                 path.reverse()
                 return path, g
                 
-            if visited[cl, cy, cx, last_dir_idx] <= g:
+            if visited[cl, cy, cx, last_dir_idx] < g:
                 continue
             visited[cl, cy, cx, last_dir_idx] = g
             
