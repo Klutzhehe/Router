@@ -538,6 +538,35 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
         board_pil, heat_pil, via_pil, status = render_step_image(s, step, int(layer_idx))
         return status, board_pil, heat_pil, via_pil, render_history_grid(s), gr.update()
 
+    def handle_live_poll(stage_name, seed, layer_idx, last_step):
+        current_timesteps = getattr(trainer, 'total_timesteps', 0)
+        if current_timesteps == last_step:
+            # Skip updating to prevent flicker/loading when no training progress has been made
+            return [gr.skip()] * 6 + [last_step]
+            
+        s = _get_or_make_session(stage_name, int(seed))
+        s.reset()
+        
+        last_step_dict = None
+        while not s.done:
+            res = s.step_one_net()
+            if res is not None:
+                last_step_dict = res
+            else:
+                break
+                
+        hist_pil = render_history_grid(s)
+        progress_text = f"{s.routed_count} / {s.total_nets} nets routed (Step {current_timesteps:,})"
+        
+        if last_step_dict is None:
+            board_pil, heat_pil, via_pil = None, None, None
+            status = f"🎲 Board reset, ready. Step {current_timesteps:,}."
+        else:
+            board_pil, heat_pil, via_pil, status = render_step_image(s, last_step_dict, int(layer_idx))
+            status = f"### 📡 Live Training Update (Step {current_timesteps:,})\n\n" + status
+            
+        return status, board_pil, heat_pil, via_pil, hist_pil, progress_text, current_timesteps
+
     # ── Gradio Blocks UI ──────────────────────────────────────────────────────
     with gr.Blocks(
         title="JEPA PCB Router — Step Visualizer",
@@ -552,6 +581,9 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
         .label-wrap span { color: #94A3B8; }
         """
     ) as demo:
+
+        last_rendered_step = gr.State(value=-1)
+        timer = gr.Timer(value=3, active=False)
 
         gr.Markdown("""
         # ⚡ JEPA PCB Router — Step-by-Step Routing Visualizer
@@ -573,6 +605,11 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
                 layer_dd   = gr.Dropdown([0, 1, 2, 3], value=0, label="Heatmap Layer to Show")
                 progress   = gr.Textbox(value="0 / ? nets routed", label="Progress",
                                          interactive=False)
+                
+                live_monitor = gr.Checkbox(
+                    label="📡 Live Training Monitor (Auto-refresh on training progress)", 
+                    value=False
+                )
 
                 with gr.Row():
                     btn_new  = gr.Button("🔄 New Board",     variant="secondary")
@@ -606,6 +643,19 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
         btn_view.click(handle_view_step,
                        inputs=[stage_dd, seed_num, layer_dd, step_view_num],
                        outputs=outputs)
+
+        # Live monitor timer toggle & tick
+        live_monitor.change(
+            lambda active: gr.Timer(active=active), 
+            inputs=[live_monitor], 
+            outputs=[timer]
+        )
+        
+        timer.tick(
+            handle_live_poll,
+            inputs=[stage_dd, seed_num, layer_dd, last_rendered_step],
+            outputs=outputs + [last_rendered_step]
+        )
 
     return demo
 
