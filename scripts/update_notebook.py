@@ -91,7 +91,7 @@ new_init_source = [
     "\n",
     "# ── Clear Python import cache to force reloading from disk ─────\n",
     "for key in list(sys.modules.keys()):\n",
-    "    if key == \"pcb_router\" or key.startswith(\"pcb_router.\"):\n",
+    "    if key in [\"pcb_router\", \"scripts\"] or key.startswith(\"pcb_router.\") or key.startswith(\"scripts.\"):\n",
     "        del sys.modules[key]\n",
     "\n",
     "sys.path.insert(0, CONFIG[\"REPO_DIR\"])\n",
