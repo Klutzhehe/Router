@@ -142,12 +142,13 @@ def evaluate_closed_loop(env, policy, vit, gnn, fusion, device, num_episodes=5):
                 steps = 0
                 while not net_done and steps < max_steps:
                     steps += 1
-                    # Get observations
-                    raster_tensor = torch.tensor(env._get_obs()['board_raster'], dtype=torch.float32).unsqueeze(0).to(device)
-                    layer_mask = torch.tensor(env._get_obs()['layer_mask'], dtype=torch.float32).unsqueeze(0).to(device)
-                    cursor_norm = torch.tensor(env._get_obs()['cursor_pos'], dtype=torch.float32).unsqueeze(0).to(device)
-                    target_norm = torch.tensor(env._get_obs()['target_pos'], dtype=torch.float32).unsqueeze(0).to(device)
-                    moves_frac = torch.tensor(env._get_obs()['moves_remaining_frac'], dtype=torch.float32).unsqueeze(0).to(device)
+                    # Get observations once per step
+                    obs_dict = env._get_obs()
+                    raster_tensor = torch.tensor(obs_dict['board_raster'], dtype=torch.float32).unsqueeze(0).to(device)
+                    layer_mask = torch.tensor(obs_dict['layer_mask'], dtype=torch.float32).unsqueeze(0).to(device)
+                    cursor_norm = torch.tensor(obs_dict['cursor_pos'], dtype=torch.float32).unsqueeze(0).to(device)
+                    target_norm = torch.tensor(obs_dict['target_pos'], dtype=torch.float32).unsqueeze(0).to(device)
+                    moves_frac = torch.tensor(obs_dict['moves_remaining_frac'], dtype=torch.float32).unsqueeze(0).to(device)
                     
                     graph = env.graph
                     x_dict = {k: v.to(device) for k, v in graph.x_dict.items()}
@@ -231,8 +232,16 @@ def main():
     train_dataset = BCDataset(train_transitions)
     val_dataset = BCDataset(val_transitions)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    # num_workers=4: data loading runs in parallel background threads, freeing GPU
+    # pin_memory=True: enables faster CPU→GPU tensor transfers
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
+    )
     
     print(f"Training set: {len(train_dataset)} steps, Validation set: {len(val_dataset)} steps")
     
@@ -436,13 +445,17 @@ def main():
         val_loss /= len(val_dataset)
         val_acc /= len(val_dataset)
         
-        # Closed-loop evaluation
-        comp_rate, mean_drc = evaluate_closed_loop(eval_env, policy, vit, gnn, fusion, device, num_episodes=5)
+        # Closed-loop evaluation — expensive, run every 10 epochs only
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            comp_rate, mean_drc = evaluate_closed_loop(eval_env, policy, vit, gnn, fusion, device, num_episodes=5)
+        else:
+            comp_rate, mean_drc = float('nan'), float('nan')
         
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
-        print(f"Epoch {epoch+1:02d} | LR: {current_lr:.2e} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Eval Rollout Comp Rate: {comp_rate*100:.1f}% | DRC Violations: {mean_drc:.2f}")
+        eval_str = f"{comp_rate*100:.1f}% | DRC: {mean_drc:.2f}" if not math.isnan(comp_rate) else "-- (skipped)"
+        print(f"Epoch {epoch+1:02d} | LR: {current_lr:.2e} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Eval Rollout: {eval_str}")
         
         # Free memory cache and clean GPU memory
         import gc
