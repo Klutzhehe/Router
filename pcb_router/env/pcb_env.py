@@ -658,3 +658,56 @@ class PCBRoutingEnv(gym.Env):
         import matplotlib.pyplot as plt
         plt.close(fig)
         return rgb_img
+
+    def validate_final_board(self) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Hard correctness gate to verify the final board routing in production.
+        Checks:
+        1. All nets must be fully routed/connected.
+        2. Zero DRC (clearance/boundary) violations must exist.
+        
+        Returns:
+            Tuple (is_valid, report):
+                - is_valid: True if board passes all gates, else False.
+                - report: Dictionary detailing unrouted nets and any DRC violations.
+        """
+        if self.board is None or self.board_state is None:
+            return False, {"error": "No board loaded"}
+
+        # 1. Check connectivity
+        total_nets = len(self.board.nets)
+        routed_nets_count = len(self.routed_nets)
+        all_connected = (routed_nets_count == total_nets)
+        unrouted_nets = [net.id for net in self.board.nets if net.id not in self.routed_nets]
+
+        # 2. Run fresh, full DRC check
+        drc_checker = DRCChecker(self.board.design_rules, self.resolution_mm())
+        all_violations = drc_checker.check_all(
+            self.board_state, self.board_state.traces, self.board_state.vias, self.board
+        )
+        
+        # Update cache
+        self.drc_violations = all_violations
+        
+        # 3. Determine validity
+        is_valid = all_connected and (len(all_violations) == 0)
+        
+        report = {
+            "is_valid": is_valid,
+            "total_nets": total_nets,
+            "routed_nets_count": routed_nets_count,
+            "unrouted_nets": unrouted_nets,
+            "drc_violations_count": len(all_violations),
+            "drc_violations": [
+                {
+                    "type": v.type,
+                    "severity": v.severity,
+                    "position": (v.x, v.y, v.layer),
+                    "description": v.description,
+                    "net_id_a": v.net_id_a,
+                    "net_id_b": v.net_id_b
+                } for v in all_violations
+            ]
+        }
+        
+        return is_valid, report

@@ -1,19 +1,20 @@
 # PCB Router — AI-Powered PCB Routing
 
-An AI agent that learns to route PCB traces using a hybrid **PPO reinforcement learning** policy guided by a **Spatial JEPA world model** for self-supervised representation learning. It integrates a 3D A* Pathfinder, a Meander length-matching module, and an interactive Streamlit visualization dashboard.
+An AI agent that learns to route PCB traces using a **DreamerV3 recurrent model-based reinforcement learning** framework. It integrates a recurrent world model (RSSM combining GNN-based netlist embeddings and ViT spatial features), an actor-critic policy (with both 3D A* heatmap decoders and autoregressive step-by-step routing), a Meander length-matching module, and an interactive Streamlit visualization dashboard.
 
 ---
 
 ## 🚀 Key Highlights & Features
 
 1. **Hybrid GNN + ViT Architecture**: Combines spatial 2D grid layouts of copper layers/obstacles (processed via Vision Transformer) with netlist/graph connectivity profiles (processed via Heterogeneous GAT) through Cross-Attention Fusion.
-2. **Self-Supervised Representation (Spatial JEPA)**: Trains a ViT predictor to forecast spatial feature layouts using a predictor block and exponential moving average (EMA) target encoder to build a robust world model of the board state.
+2. **Model-Based Reinforcement Learning (DreamerV3)**: Integrates a Recurrent State Space Model (RSSM) to learn a robust representation of the board state. The policy (actor) and value function (critic) are trained entirely on imagined latent rollouts inside the world model, dramatically reducing training sample complexity.
 3. **Advanced Routing Modules**:
    - **A* Pathfinder (`pathfinder.py`)**: Performs multi-layer, 8-directional path planning using dynamic spatial cost heatmaps predicted by the neural policy.
+   - **Autoregressive Step Router**: An alternative routing mode where the policy directly predicts trace steps cell-by-cell in the environment grid.
    - **Meander Inserter (`meander.py`)**: Adjusts trace lengths via serpentine meandering to meet impedance and timing matching tolerances.
    - **Trace Generator (`trace_generator.py`)**: Constructs physical trace segment and pad geometries.
 4. **Interactive Dashboard**: Streamlit interface (`dashboard/app.py`) for step-by-step routing inspection, checkpoint loading, curriculum exploration, and real-time design rule metrics.
-5. **Curriculum-Based Stage Progression**: Implements 6 training stages, advancing from simple single-net routing to congested multi-net boards and real-world KiCad design imports.
+5. **Curriculum-Based Stage Progression**: Implements curriculum training stages, advancing from simple single-net routing to congested multi-net boards and real-world KiCad design imports.
 
 ---
 
@@ -21,36 +22,23 @@ An AI agent that learns to route PCB traces using a hybrid **PPO reinforcement l
 
 ```mermaid
 graph TD
-    %% Inputs
-    BoardRaster[Board Raster 13ch] --> ViTEnc[ViT-Small Encoder]
-    GraphPads[Graph: Pads, Vias, Nets] --> GATEnc[Hetero-GAT Encoder]
-
-    %% Fusion
-    ViTEnc --> Fusion[Cross-Attention Fusion]
-    GATEnc --> Fusion
-
-    %% Outputs & Policy
-    Fusion --> net_embs[Net Embeddings]
-    Fusion --> spat_fused[Fused Spatial Patches]
+    %% Inputs & World Model
+    Obs[Observation: 13ch Raster + Graph Netlist] --> WorldModel[RSSM World Model: ViT + GNN + Fusion]
+    Action[Action: Net Selection + Heatmap Latent / Route Step] --> WorldModel
+    WorldModel --> |State h_t, z_t| ImagTrajectories[Imagined Latent Trajectories]
     
-    net_embs --> Policy[PPO Policy Net]
-    spat_fused --> Policy
-    
-    Policy --> |Net Selection| SelectedNet[Select Net to Route]
-    Policy --> |Heatmap Latent| HeatmapDec[CNN Heatmap Decoder]
-    
-    %% Decoding & Routing
-    HeatmapDec --> |Active Layer Heatmaps + Via Prob Map| AStar[A* Pathfinder]
-    SelectedNet --> AStar
+    %% Policy & Imagination Training
+    ImagTrajectories --> ActorCritic[DreamerV3 Actor-Critic Policy]
+    ActorCritic --> |Imagined Actions| ImagTrajectories
     
     %% Execution
-    AStar --> TraceGen[Trace Generator]
-    TraceGen --> Meander[Meander Inserter]
-    Meander --> EnvUpdate[Gym Env Update & DRC Check]
-
-    %% JEPA feedback loop
-    ViTEnc --> |Online ViT| JEPA[Spatial JEPA Predictor]
-    JEPA --> |Predict z_t+1| EMAViT[EMA Target Encoder]
+    Obs --> RealPolicy[Trained Policy]
+    RealPolicy --> |Selected Net & Heatmap| Pathfinder[3D A* Pathfinder]
+    RealPolicy --> |Step-by-Step Path| AutoregressiveRoute[Autoregressive Step Router]
+    
+    Pathfinder --> TraceGen[Trace Generator & Meander Inserter]
+    AutoregressiveRoute --> TraceGen
+    TraceGen --> EnvUpdate[DRC Clearance & Connectivity Gate]
 ```
 
 ---
@@ -138,9 +126,9 @@ python notebooks/03_training.py --checkpoint-dir checkpoints
 Alternatively, run training dynamically in Python:
 
 ```python
-from pcb_router.training.trainer import PPOJEPATrainer
+from pcb_router.training.trainer import DreamerJEPATrainer
 
-trainer = PPOJEPATrainer(
+trainer = DreamerJEPATrainer(
     config_path='configs/training.yaml',
     model_config_path='configs/model.yaml',
     curriculum_config_path='configs/curriculum.yaml'
@@ -169,9 +157,10 @@ Inside the dashboard, you can:
 Key tuning parameters in `configs/`:
 
 ### `configs/training.yaml`
-- `ppo.batch_size`: Batch size for gradient steps (default: `16` to prevent OOM).
-- `ppo.num_rollout_steps`: Steps per environment before updating weights (default: `64`).
-- `jepa_loss.prediction_weight`: Balance between JEPA self-supervised training and the RL objective.
+- `training.batch_size`: Batch size for historical trajectory updates (default: `256`).
+- `training.imagine_batch_size`: Batch size for latent imagination rollouts (default: `4096`).
+- `training.routing_mode`: Mode of layout routing (`"astar_guided"` or `"autoregressive"`).
+- `training.imagination_horizon_end`: Horizon limit for unrolling imagined states (default: `15`).
 
 ### `configs/model.yaml`
 - `vit.max_grid_size`: Maximum layout dimension size (default: `256`).
@@ -181,6 +170,15 @@ Key tuning parameters in `configs/`:
 ### `configs/curriculum.yaml`
 - `progression.completion_threshold`: Minimal completion rate to advance to next stage (default: `0.95`).
 - `progression.drc_violation_threshold`: Maximum DRC violations percentage (default: `0.02`).
+
+---
+
+## 🛡️ Production Verification Gate (Hard Correctness Backstop)
+
+To ensure that routed boards meet strict commercial fabrication standards independent of reinforcement learning reward shaping:
+1. Every board routed by the step policy gets checked at the end of the routing run.
+2. We run the public method `validate_final_board()` in [pcb_env.py](file:///c:/Users/Game%20Making/Documents/Hackathon/Router/pcb_router/env/pcb_env.py) to perform a full design rule evaluation (`DRCChecker.check_all()`) and verify netlist connectivity.
+3. The board is only exported if there are zero DRC violations and all nets are fully connected. Otherwise, the layout is rejected and flagged for review.
 
 ---
 
@@ -199,7 +197,9 @@ Key tuning parameters in `configs/`:
 State checkpoints are saved under the directory specified in `configs/training.yaml` (default: `checkpoints/`). To resume from a checkpoint:
 
 ```python
-trainer = PPOJEPATrainer(
+from pcb_router.training.trainer import DreamerJEPATrainer
+
+trainer = DreamerJEPATrainer(
     checkpoint_dir='checkpoints/',
     load_checkpoint_path='checkpoints/model_checkpoint_epoch_X.pt'
 )

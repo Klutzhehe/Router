@@ -78,10 +78,13 @@ class RewardCalculator:
                 - 'direction_changed': bool
                 - 'is_via': bool
         """
-        # Direction change penalty and via cost matching pathfinder.py
-        direction_change_penalty = 15.0
-        base_via_cost = 15.0
-        invalid_move_penalty = 15.0  # matches via/direction penalty size
+        # Direction change penalty and via cost for RL step decisions.
+        # NOTE: Unlike pathfinder.py's static A* search costs (where 15.0 acts as a tie-breaker),
+        # these values act as dense step rewards. They are scaled relative to dist_delta (+/-1.0)
+        # to prevent via/turn avoidance from overpowering the progress signal.
+        direction_change_penalty = 0.2
+        base_via_cost = 0.5
+        invalid_move_penalty = 1.0  # matches step size order of magnitude
         
         r = 0.0
         

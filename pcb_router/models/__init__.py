@@ -2,7 +2,7 @@
 from .vit_encoder import ViTEncoder
 from .gnn_encoder import HeteroGATEncoder
 from .fusion import CrossAttentionFusion
-from .jepa import SpatialJEPA, JEPAWorldModel
-from .policy import PPOPolicy, DreamerActorCritic
+from .jepa import JEPAWorldModel
+from .policy import DreamerActorCritic
 from .heatmap_decoder import HeatmapDecoder
 from .route_step_policy import RouteStepPolicy

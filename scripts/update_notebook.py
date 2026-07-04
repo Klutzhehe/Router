@@ -97,9 +97,9 @@ new_init_source = [
     "sys.path.insert(0, CONFIG[\"REPO_DIR\"])\n",
     "os.chdir(CONFIG[\"REPO_DIR\"])\n",
     "\n",
-    "from pcb_router.training.trainer import PPOJEPATrainer, DreamerJEPATrainer\n",
+    "from pcb_router.training.trainer import DreamerJEPATrainer\n",
     "\n",
-    "# Initialize the new DreamerJEPATrainer by default\n",
+    "# Initialize the DreamerJEPATrainer\n",
     "trainer = DreamerJEPATrainer(\n",
     "    config_path=\"configs/training.yaml\",\n",
     "    model_config_path=\"configs/model.yaml\",\n",
@@ -109,33 +109,23 @@ new_init_source = [
     "    load_checkpoint_path=CONFIG[\"LOAD_CHECKPOINT\"],\n",
     ")\n",
     "\n",
-    "# Apply CONFIG overrides dynamically depending on trainer type\n",
-    "if isinstance(trainer, DreamerJEPATrainer):\n",
-    "    trainer.real_steps_per_iteration = CONFIG.get(\"REAL_STEPS_PER_ITERATION\", 64)\n",
-    "    trainer.train_ratio = CONFIG.get(\"TRAIN_RATIO\", 100)\n",
-    "    trainer.replay_buffer.capacity_episodes = CONFIG.get(\"REPLAY_BUFFER_SIZE\", 5000)\n",
-    "    trainer.imagine_batch_size = CONFIG.get(\"IMAGINE_BATCH_SIZE\", 512)\n",
-    "    trainer.imagination_horizon_start = CONFIG.get(\"IMAGINATION_HORIZON_START\", 5)\n",
-    "    trainer.imagination_horizon_end = CONFIG.get(\"IMAGINATION_HORIZON_END\", 15)\n",
-    "    trainer.gamma = CONFIG.get(\"GAMMA\", 0.997)\n",
-    "    trainer.lambda_ = CONFIG.get(\"LAMBDA\", 0.95)\n",
-    "    trainer.compile_models = CONFIG.get(\"COMPILE_MODELS\", True)\n",
-    "    \n",
-    "    for pg in trainer.wm_opt.param_groups:\n",
-    "        pg[\"lr\"] = CONFIG.get(\"WORLD_MODEL_LR\", 3e-4)\n",
-    "    for pg in trainer.actor_opt.param_groups:\n",
-    "        pg[\"lr\"] = CONFIG.get(\"ACTOR_LR\", 8e-5)\n",
-    "    for pg in trainer.critic_opt.param_groups:\n",
-    "        pg[\"lr\"] = CONFIG.get(\"CRITIC_LR\", 8e-5)\n",
-    "else:\n",
-    "    trainer.train_cfg[\"ppo\"][\"batch_size\"]         = CONFIG.get(\"BATCH_SIZE\", 16)\n",
-    "    trainer.train_cfg[\"ppo\"][\"num_rollout_steps\"]  = CONFIG.get(\"NUM_ROLLOUT_STEPS\", 64)\n",
-    "    trainer.train_cfg[\"ppo\"][\"num_epochs\"]         = CONFIG.get(\"NUM_EPOCHS\", 4)\n",
-    "    trainer.train_cfg[\"ppo\"][\"learning_rate\"]      = CONFIG.get(\"LEARNING_RATE\", 3e-4)\n",
-    "    trainer.train_cfg[\"ppo\"][\"gamma\"]              = CONFIG.get(\"GAMMA\", 0.99)\n",
-    "    trainer.train_cfg[\"ppo\"][\"gae_lambda\"]         = CONFIG.get(\"GAE_LAMBDA\", 0.95)\n",
-    "    for pg in trainer.optimizer.param_groups:\n",
-    "        pg[\"lr\"] = CONFIG.get(\"LEARNING_RATE\", 3e-4)\n",
+    "# Apply CONFIG overrides dynamically\n",
+    "trainer.real_steps_per_iteration = CONFIG.get(\"REAL_STEPS_PER_ITERATION\", 64)\n",
+    "trainer.train_ratio = CONFIG.get(\"TRAIN_RATIO\", 100)\n",
+    "trainer.replay_buffer.capacity_episodes = CONFIG.get(\"REPLAY_BUFFER_SIZE\", 5000)\n",
+    "trainer.imagine_batch_size = CONFIG.get(\"IMAGINE_BATCH_SIZE\", 512)\n",
+    "trainer.imagination_horizon_start = CONFIG.get(\"IMAGINATION_HORIZON_START\", 5)\n",
+    "trainer.imagination_horizon_end = CONFIG.get(\"IMAGINATION_HORIZON_END\", 15)\n",
+    "trainer.gamma = CONFIG.get(\"GAMMA\", 0.997)\n",
+    "trainer.lambda_ = CONFIG.get(\"LAMBDA\", 0.95)\n",
+    "trainer.compile_models = CONFIG.get(\"COMPILE_MODELS\", True)\n",
+    "\n",
+    "for pg in trainer.wm_opt.param_groups:\n",
+    "    pg[\"lr\"] = CONFIG.get(\"WORLD_MODEL_LR\", 3e-4)\n",
+    "for pg in trainer.actor_opt.param_groups:\n",
+    "    pg[\"lr\"] = CONFIG.get(\"ACTOR_LR\", 8e-5)\n",
+    "for pg in trainer.critic_opt.param_groups:\n",
+    "    pg[\"lr\"] = CONFIG.get(\"CRITIC_LR\", 8e-5)\n",
     "\n",
     "trainer.train_cfg[\"training\"][\"save_interval\"] = CONFIG[\"SAVE_INTERVAL\"]\n",
     "\n",
@@ -154,6 +144,7 @@ new_init_source = [
     "print(f\"  Resuming from:    {CONFIG['LOAD_CHECKPOINT'] or 'scratch'}\")\n",
     "print(f\"  Timesteps so far: {trainer.total_timesteps:,}\")\n"
 ]
+
 nb["cells"][4]["source"] = new_init_source
 
 # Cell 5 (Training Cell)
@@ -381,28 +372,19 @@ if nb["cells"][5]["source"][-1] == "\n":
 
 # Cell 6 (Evaluation Cell)
 eval_source_str = "".join(nb["cells"][6]["source"])
-target_eval_import = "    from pcb_router.training.trainer import PPOJEPATrainer"
-replacement_eval_import = "    from pcb_router.training.trainer import PPOJEPATrainer, DreamerJEPATrainer"
+target_eval_import = "    from pcb_router.training.trainer import DreamerJEPATrainer"
+replacement_eval_import = "    from pcb_router.training.trainer import DreamerJEPATrainer"
 
 target_eval_instantiation = """    eval_trainer = PPOJEPATrainer(
         checkpoint_dir=ckpt_dir,
         load_checkpoint_path=EVAL_CHECKPOINT
     )"""
 
-replacement_eval_instantiation = """    # Load using DreamerJEPATrainer or fallback
-    try:
-        eval_trainer = DreamerJEPATrainer(
-            checkpoint_dir=ckpt_dir,
-            load_checkpoint_path=EVAL_CHECKPOINT
-        )
-        is_dreamer = True
-    except Exception as e:
-        print(f"Dreamer load failed, falling back to PPO: {e}")
-        eval_trainer = PPOJEPATrainer(
-            checkpoint_dir=ckpt_dir,
-            load_checkpoint_path=EVAL_CHECKPOINT
-        )
-        is_dreamer = False"""
+replacement_eval_instantiation = """    eval_trainer = DreamerJEPATrainer(
+        checkpoint_dir=ckpt_dir,
+        load_checkpoint_path=EVAL_CHECKPOINT
+    )
+    is_dreamer = True"""
 
 target_eval_loop = """    print("\\nRunning evaluation episode...")
     while not done and step < 200:
@@ -426,9 +408,8 @@ target_eval_loop = """    print("\\nRunning evaluation episode...")
             net_idx, hlat, _, _, _ = eval_trainer.policy(net_embs, umask, fs, cls, deterministic=True)
             hv = eval_trainer.decoder(hlat, fs, eval_trainer.env.H, eval_trainer.env.W, active_layers_mask=layer_mask)"""
 
-replacement_eval_loop = """    if is_dreamer:
-        h, z = eval_trainer.jepa.initial_state(batch_size=1, device=eval_trainer.device)
-        num_nets = len(eval_trainer.env.board.nets)
+replacement_eval_loop = """    h, z = eval_trainer.jepa.initial_state(batch_size=1, device=eval_trainer.device)
+    num_nets = len(eval_trainer.env.board.nets)
         
     print("\\nRunning evaluation episode...")
     while not done and step < 200:
@@ -439,29 +420,15 @@ replacement_eval_loop = """    if is_dreamer:
         edge_index_dict = {k: v.to(eval_trainer.device) for k, v in graph.edge_index_dict.items()} if hasattr(graph, "edge_index_dict") else {}
 
         with torch.no_grad():
-            if is_dreamer:
-                context_emb = eval_trainer.jepa.get_context_embedding(raster, x_dict, edge_index_dict, use_target=False)
-                net_embs, umask, fs = eval_trainer._get_net_embeddings_and_mask(raster, x_dict, edge_index_dict)
-                
-                net_idx, heatmap_latent, _, _ = eval_trainer.policy.act(net_embs, umask, h, z, explore=False)
-                
-                action_emb = eval_trainer.jepa.get_action_embedding(net_idx, heatmap_latent)
-                h, z, _, _ = eval_trainer.jepa.rssm_step(h, z, context_emb, action_emb)
-                
-                hv = eval_trainer.decoder(heatmap_latent, fs, eval_trainer.env.H, eval_trainer.env.W, active_layers_mask=layer_mask)
-            else:
-                sp, cls = eval_trainer.vit(raster)
-                ne       = eval_trainer.gnn(x_dict, edge_index_dict)
-                fp, fs   = eval_trainer.fusion(ne["pad"].unsqueeze(0), sp)
-                num_nets  = len(eval_trainer.env.board.nets)
-                net_embs  = torch.zeros((1, 100, eval_trainer.vit.embed_dim), device=eval_trainer.device)
-                umask     = torch.zeros((1, 100), dtype=torch.bool, device=eval_trainer.device)
-                for ni, net in enumerate(eval_trainer.env.board.nets):
-                    pidx = [pi for pi, p in enumerate(eval_trainer.env.board.pins.values()) if p.net_id == net.id]
-                    if pidx: net_embs[0, ni] = fp[0, pidx].mean(0)
-                    if net.id not in eval_trainer.env.routed_nets: umask[0, ni] = True
-                net_idx, hlat, _, _, _ = eval_trainer.policy(net_embs, umask, fs, cls, deterministic=True)
-                hv = eval_trainer.decoder(hlat, fs, eval_trainer.env.H, eval_trainer.env.W, active_layers_mask=layer_mask)"""
+            context_emb = eval_trainer.jepa.get_context_embedding(raster, x_dict, edge_index_dict, use_target=False)
+            net_embs, umask, fs = eval_trainer._get_net_embeddings_and_mask(raster, x_dict, edge_index_dict)
+            
+            net_idx, heatmap_latent, _, _ = eval_trainer.policy.act(net_embs, umask, h, z, explore=False)
+            
+            action_emb = eval_trainer.jepa.get_action_embedding(net_idx, heatmap_latent)
+            h, z, _, _ = eval_trainer.jepa.rssm_step(h, z, context_emb, action_emb)
+            
+            hv = eval_trainer.decoder(heatmap_latent, fs, eval_trainer.env.H, eval_trainer.env.W, active_layers_mask=layer_mask)"""
 
 # Apply evaluation updates
 if target_eval_import in eval_source_str:

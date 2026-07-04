@@ -8,7 +8,7 @@ import yaml
 from pcb_router.models.vit_encoder import ViTEncoder
 from pcb_router.models.gnn_encoder import HeteroGATEncoder
 from pcb_router.models.fusion import CrossAttentionFusion
-from pcb_router.models.policy import PPOPolicy
+from pcb_router.models.policy import DreamerActorCritic
 from pcb_router.models.heatmap_decoder import HeatmapDecoder
 from pcb_router.data.board_generator import BoardGenerator, BoardConfig
 from pcb_router.data.graph_builder import GraphBuilder
@@ -42,7 +42,7 @@ fusion = CrossAttentionFusion(
     num_heads=model_cfg['fusion']['num_heads']
 ).to(device)
 
-policy = PPOPolicy(
+policy = DreamerActorCritic(
     embed_dim=model_cfg['vit']['embed_dim']
 ).to(device)
 
@@ -103,9 +103,11 @@ for net_idx, net in enumerate(board.nets):
         
 unrouted_mask = torch.ones((B, num_nets), dtype=torch.bool, device=device)
 
-# 4. Forward Policy
+# 4. Forward Policy (Requires dummy latent states h and z)
+h = torch.zeros(B, 512, device=device)
+z = torch.zeros(B, 1024, device=device)
 net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = policy(
-    net_embs, unrouted_mask, f_spat, cls_spatial
+    net_embs, unrouted_mask, h, z
 )
 print(f"Selected net action index: {net_idx.item()}")
 print(f"Heatmap latent action shape: {heatmap_latent.shape} (B, latent_dim)")

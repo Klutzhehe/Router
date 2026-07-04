@@ -12,7 +12,7 @@ from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.data.board_generator import BoardGenerator, BoardConfig
 from pcb_router.visualization.renderer import BoardRenderer
 from pcb_router.visualization.heatmap_viz import HeatmapVisualizer
-from pcb_router.training.trainer import DreamerJEPATrainer, PPOJEPATrainer
+from pcb_router.training.trainer import DreamerJEPATrainer
 
 # ─────────────────────────────────────────────────────────
 #  Page config
@@ -174,14 +174,11 @@ show_all_nets_heatmap = st.sidebar.checkbox("Show All-Nets Heatmap Overview", va
 @st.cache_resource
 def load_trainer(ckpt_name):
     ckpt_path = os.path.join(ckpt_dir, ckpt_name) if ckpt_name != "Random (Untrained)" else None
-    try:
-        trainer = DreamerJEPATrainer(device='cpu', load_checkpoint_path=ckpt_path)
-        return trainer, True
-    except Exception:
-        trainer = PPOJEPATrainer(device='cpu', load_checkpoint_path=ckpt_path)
-        return trainer, False
+    trainer = DreamerJEPATrainer(device='cpu', load_checkpoint_path=ckpt_path)
+    return trainer
 
-trainer, is_dreamer = load_trainer(selected_ckpt)
+trainer = load_trainer(selected_ckpt)
+is_dreamer = True
 renderer   = BoardRenderer(theme_dark=True)
 hmap_viz   = HeatmapVisualizer(theme_dark=True)
 

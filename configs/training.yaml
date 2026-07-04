@@ -1,34 +1,3 @@
-# PPO Hyperparameters
-ppo:
-  learning_rate: 3.0e-4
-  gamma: 0.99                  # discount factor
-  gae_lambda: 0.95             # GAE lambda
-  clip_epsilon: 0.2            # PPO clipping
-  value_loss_coef: 0.5
-  entropy_coef: 0.01
-  max_grad_norm: 0.5
-  num_epochs: 3                # PPO update epochs per batch (reduced from 4; same total updates with larger batch)
-  batch_size: 32               # increased from 16; better GPU utilization
-  num_rollout_steps: 64        # reduced from 128; fewer board deepcopies accumulate in buffer
-  num_envs: 4                  # parallel environments
-
-# JEPA Loss Weights
-jepa_loss:
-  prediction_weight: 0.01      # lambda_1: JEPA prediction loss weight (reduced from 1.0 — at scale 1.0 JEPA ~43 dwarfs policy ~0.04, killing PPO signal)
-  vicreg_weight: 0.1           # lambda_2: VICReg regularization weight
-
-# Optimizer
-optimizer:
-  type: adamw
-  weight_decay: 0.01
-  betas: [0.9, 0.999]
-  eps: 1.0e-8
-
-# Learning Rate Schedule
-lr_schedule:
-  type: cosine
-  warmup_steps: 1000
-  min_lr: 1.0e-6
 
 # Training & DreamerV3 training hyperparameters
 training:
