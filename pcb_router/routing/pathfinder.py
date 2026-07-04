@@ -3,7 +3,7 @@ import heapq
 import math
 
 class AStarPathfinder:
-    def __init__(self, direction_change_penalty: float = 15.0, base_via_cost: float = 15.0, heatmap_weight: float = 10.0):
+    def __init__(self, direction_change_penalty: float = 15.0, base_via_cost: float = 15.0, heatmap_weight: float = 10.0, debug: bool = False):
         self.direction_change_penalty = direction_change_penalty
         self.base_via_cost = base_via_cost
         self.heatmap_weight = heatmap_weight
@@ -18,6 +18,7 @@ class AStarPathfinder:
         self._parent_y_buf = None
         self._parent_l_buf = None
         self._parent_dir_buf = None
+        self.debug = debug
 
     def _heuristic(self, p1, p2):
         """3D heuristic: 2D distance + layer transition cost estimation"""
@@ -147,12 +148,39 @@ class AStarPathfinder:
             heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, 0))
         
         iterations = 0
+        if self.debug:
+            min_h_seen = min(self._heuristic((sx, sy, l if sl == -1 else sl), target) for l in active_layers)
+            total_pushes = len(pq)
+            total_pops = 0
+            first_pops = []
+            last_pops = []
         
         while pq and iterations < max_iterations:
             iterations += 1
             f, g, curr, last_dir_idx = heapq.heappop(pq)
             cx, cy, cl = curr
             
+            if self.debug:
+                total_pops += 1
+                if last_dir_idx == 0:
+                    last_dir = (0, 0, 0)
+                elif 1 <= last_dir_idx <= 8:
+                    dx, dy, _ = self.moves[last_dir_idx - 1]
+                    last_dir = (dx, dy, 0)
+                else:
+                    dl = -1 if last_dir_idx == 9 else 1
+                    last_dir = (0, 0, dl)
+                state_info = (f"{f:.2f}", f"{g:.2f}", curr, last_dir)
+                if len(first_pops) < 15:
+                    first_pops.append(state_info)
+                else:
+                    last_pops.append(state_info)
+                    if len(last_pops) > 15:
+                        last_pops.pop(0)
+                h_curr = self._heuristic(curr, target)
+                if h_curr < min_h_seen:
+                    min_h_seen = h_curr
+
             # Target reached check
             is_reached = (cx == tx and cy == ty) if tl == -1 else (curr == target)
             if is_reached:
@@ -202,6 +230,8 @@ class AStarPathfinder:
                         parent_dir[cl, ny, nx, new_dir_idx] = last_dir_idx
                         next_f = next_g + self._heuristic(next_pos, target)
                         heapq.heappush(pq, (next_f, next_g, next_pos, new_dir_idx))
+                        if self.debug:
+                            total_pushes += 1
             
             # 2. Check Layer Transitions (vias)
             for dl_idx, dl in enumerate([-1, 1]):
@@ -230,8 +260,37 @@ class AStarPathfinder:
                         parent_dir[nl, cy, cx, new_dir_idx] = last_dir_idx
                         next_f = next_g + self._heuristic(next_pos, target)
                         heapq.heappush(pq, (next_f, next_g, next_pos, new_dir_idx))
-                        
+                        if self.debug:
+                            total_pushes += 1
 
+        if self.debug:
+            print(f"[A* DEBUG] Failed to find path from {source} to {target} after {iterations} iterations.")
+            print(f"  Board size: {W}x{H}, Active layers: {active_layers}")
+            print(f"  Total pushes: {total_pushes}, Total pops: {total_pops}, PQ size at end: {len(pq)}")
+            print(f"  Start heuristic: {self._heuristic(source, target):.2f}, Min heuristic seen: {min_h_seen:.2f}")
+            print(f"  First 15 popped states (f, g, pos, dir): {first_pops}")
+            print(f"  Last 15 popped states (f, g, pos, dir): {last_pops}")
+            if board_state is not None:
+                for l in active_layers:
+                    occ_map = temp_obstacle_maps.get(l)
+                    if occ_map is not None:
+                        src_blocked = occ_map[sy, sx]
+                        tgt_blocked = occ_map[ty, tx]
+                        print(f"  Layer {l}: source blocked={src_blocked}, target blocked={tgt_blocked}")
+                        
+                        # Print 5x5 neighborhood occupancy around source
+                        y_min, y_max = max(0, sy - 2), min(H - 1, sy + 2)
+                        x_min, x_max = max(0, sx - 2), min(W - 1, sx + 2)
+                        neighborhood_src = occ_map[y_min:y_max+1, x_min:x_max+1].astype(int)
+                        print(f"  Layer {l} source neighborhood (5x5, center is source):\n{neighborhood_src}")
+                        
+                        # Print 5x5 neighborhood occupancy around target
+                        y_min, y_max = max(0, ty - 2), min(H - 1, ty + 2)
+                        x_min, x_max = max(0, tx - 2), min(W - 1, tx + 2)
+                        neighborhood_tgt = occ_map[y_min:y_max+1, x_min:x_max+1].astype(int)
+                        print(f"  Layer {l} target neighborhood (5x5, center is target):\n{neighborhood_tgt}")
+            else:
+                print("  board_state is None!")
 
         return None, float('inf')
 
