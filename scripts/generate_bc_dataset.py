@@ -70,9 +70,10 @@ def generate_dataset():
         
         seed = 42
         while successful_episodes < episodes_per_stage:
+            print(f"\n  [Seed {seed}] Generating environment...", end="", flush=True)
             obs, info = env.reset(seed=seed)
+            print(" generated successfully.", flush=True)
             
-            # Run A* on each net sequentially, and capture path + incremental states
             episode_board = env.board
             episode_nets = list(env.board.nets)
             
@@ -112,6 +113,7 @@ def generate_dataset():
                 curr_source = source_pos
                 all_routed_path = [curr_source]
                 
+                print(f"    [Net {net_idx}] Routing A* from {source_pos} to targets...", end="", flush=True)
                 astar_success = True
                 for target_pos in target_positions:
                     path, cost = env.pathfinder.find_path(
@@ -128,11 +130,13 @@ def generate_dataset():
                         break
                         
                 if not astar_success:
+                    print(" failed (no A* path found).", flush=True)
                     episode_success = False
                     break
+                else:
+                    print(f" success (path length: {len(all_routed_path)} cells).", flush=True)
                     
                 # Keep a clean copy of the board state before starting this net
-                # to exclude current net's own partial traces from validity checks
                 clean_board_state = temp_board_state.clone()
                 
                 # Walk consecutive path cells and capture transitions
@@ -231,6 +235,7 @@ def generate_dataset():
                 )
                 
             if episode_success:
+                print("    Running deterministic reconstruction check...", end="", flush=True)
                 val_env = PCBRoutingEnv(
                     board_config=curriculum.get_board_config(),
                     curriculum_stage=curriculum.current_stage,
@@ -261,11 +266,12 @@ def generate_dataset():
                         break
                         
                 if val_success and len(val_env.routed_nets) == len(episode_nets):
+                    print(" PASSED.", flush=True)
                     dataset_episodes.append(episode_transitions)
                     successful_episodes += 1
                     pbar.update(1)
                 else:
-                    print("Warning: validation reconstruction failed, skipping this episode.")
+                    print(" FAILED (skipping episode).", flush=True)
             seed += 1
                     
         pbar.close()
@@ -274,7 +280,7 @@ def generate_dataset():
         with open(shard_path, "wb") as f:
             pickle.dump(dataset_episodes, f)
         total_transitions = sum(len(ep) for ep in dataset_episodes)
-        print(f"Saved {len(dataset_episodes)} episodes ({total_transitions} transitions) to {shard_path}")
+        print(f"Saved {len(dataset_episodes)} episodes ({total_transitions} transitions) to {shard_path}\n")
         
 if __name__ == '__main__':
     generate_dataset()
