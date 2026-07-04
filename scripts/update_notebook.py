@@ -237,8 +237,8 @@ if CONFIG.get("LAUNCH_GRADIO_DURING_TRAINING", False):
         cur_cfg = {"stages": trainer.curriculum.stages}
         print("\\n[Gradio] Launching live step-by-step routing visualizer...")
         demo = build_gradio_app(trainer, is_dreamer, cur_cfg)
-        # share=True creates a public URL. prevent_thread_warnings prevents warnings in Colab background threads.
-        demo.launch(share=True, prevent_thread_warnings=True)
+        # share=True creates a public URL.
+        demo.launch(share=True)
         print("[Gradio] Live server is running! Open the public URL in a new tab to route boards interactively with active weights.\\n")
     except Exception as e:
         print(f"\\n[Gradio] Warning: Failed to launch live visualizer: {e}\\n")
