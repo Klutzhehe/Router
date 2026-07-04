@@ -73,6 +73,7 @@ new_config_source = [
     "    \"WANDB_PROJECT\":  \"pcb-router\",\n",
     "    \"WANDB_RUN_NAME\": None,\n",
     "    \"COMPILE_MODELS\": True,\n",
+    "    \"LAUNCH_GRADIO_DURING_TRAINING\": False,\n",
     "}\n",
     "\n",
     "print(\"Config loaded:\")\n",
@@ -221,6 +222,35 @@ else:
     ipydisplay.display(fig)
     plt.close(fig)"""
     training_source_str = training_source_str.replace(target_on_update_end_alt, replacement_on_update_end)
+
+target_training_start = 'print(f"Starting training for {CONFIG[\'TOTAL_TIMESTEPS\']:,} timesteps...")'
+replacement_training_start = """# ── Optional live Gradio server during training ───────────────────
+if CONFIG.get("LAUNCH_GRADIO_DURING_TRAINING", False):
+    try:
+        import gradio
+    except ImportError:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gradio"], check=True)
+    try:
+        from scripts.visualize_routing_gradio import build_gradio_app
+        is_dreamer = hasattr(trainer, 'jepa')
+        cur_cfg = {"stages": trainer.curriculum.stages}
+        print("\\n[Gradio] Launching live step-by-step routing visualizer...")
+        demo = build_gradio_app(trainer, is_dreamer, cur_cfg)
+        # share=True creates a public URL. prevent_thread_warnings prevents warnings in Colab background threads.
+        demo.launch(share=True, prevent_thread_warnings=True)
+        print("[Gradio] Live server is running! Open the public URL in a new tab to route boards interactively with active weights.\\n")
+    except Exception as e:
+        print(f"\\n[Gradio] Warning: Failed to launch live visualizer: {e}\\n")
+
+print(f"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...")"""
+
+if target_training_start in training_source_str:
+    training_source_str = training_source_str.replace(target_training_start, replacement_training_start)
+else:
+    # Try alt format single quotes
+    target_training_start_alt = "print(f\\\"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...\\\")"
+    training_source_str = training_source_str.replace(target_training_start_alt, replacement_training_start)
 
 # Split back into lines
 nb["cells"][5]["source"] = [line + "\n" for line in training_source_str.split("\n")]
