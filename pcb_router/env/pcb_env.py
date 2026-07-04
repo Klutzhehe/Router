@@ -120,10 +120,11 @@ class PCBRoutingEnv(gym.Env):
         
         # Get pins
         net_pins = [self.board.pins[pid] for pid in selected_net.pin_ids]
-        source_pos = (net_pins[0].global_x, net_pins[0].global_y, net_pins[0].layer)
+        src_layer = net_pins[0].layer if net_pins[0].layer != -1 else 0
+        source_pos = (net_pins[0].global_x, net_pins[0].global_y, src_layer)
         
         self.cursor_pos = source_pos
-        self.remaining_targets = [(p.global_x, p.global_y, p.layer) for p in net_pins[1:]]
+        self.remaining_targets = [(p.global_x, p.global_y, p.layer if p.layer != -1 else 0) for p in net_pins[1:]]
         self.target_pos = self.remaining_targets.pop(0)
         
         self.current_net_index = net_index

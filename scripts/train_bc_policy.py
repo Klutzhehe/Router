@@ -47,8 +47,21 @@ class BCDataset(Dataset):
         }
 
 def collate_fn(batch):
-    # Standard batching, but handle PyG graph collation manually
-    rasters = torch.stack([x['raster'] for x in batch])
+    # Find max H and W in this batch
+    max_h = max(x['raster'].shape[1] for x in batch)
+    max_w = max(x['raster'].shape[2] for x in batch)
+    
+    padded_rasters = []
+    for x in batch:
+        r = x['raster']
+        h, w = r.shape[1], r.shape[2]
+        pad_h = max_h - h
+        pad_w = max_w - w
+        if pad_h > 0 or pad_w > 0:
+            r = F.pad(r, (0, pad_w, 0, pad_h), mode='constant', value=0.0)
+        padded_rasters.append(r)
+        
+    rasters = torch.stack(padded_rasters)
     layer_masks = torch.stack([x['layer_mask'] for x in batch])
     cursor_poses = torch.stack([x['cursor_pos'] for x in batch])
     target_poses = torch.stack([x['target_pos'] for x in batch])
@@ -57,9 +70,6 @@ def collate_fn(batch):
     valid_masks = torch.stack([x['valid_mask'] for x in batch])
     steps_remainings = torch.stack([x['steps_remaining'] for x in batch])
     
-    # Since PyG graph is constant for all steps within the same net/board,
-    # and we run batched encoders, we can just grab the graphs individually.
-    # To keep code simple, we will return list of graph dicts.
     graphs = [x['graph'] for x in batch]
     
     return {

@@ -106,8 +106,8 @@ def generate_dataset():
                 # Run A* to find path
                 net_pins = [env.board.pins[pid] for pid in net.pin_ids]
                 src_pin = net_pins[0]
-                source_pos = (src_pin.global_x, src_pin.global_y, src_pin.layer)
-                target_positions = [(p.global_x, p.global_y, p.layer) for p in net_pins[1:]]
+                source_pos = (src_pin.global_x, src_pin.global_y, src_pin.layer if src_pin.layer != -1 else 0)
+                target_positions = [(p.global_x, p.global_y, p.layer if p.layer != -1 else 0) for p in net_pins[1:]]
                 
                 curr_source = source_pos
                 all_routed_path = [curr_source]
