@@ -72,6 +72,29 @@ class AStarPathfinder:
                 occ = board_state.get_occupancy(l)  # (H, W) float, 1.0 = occupied
                 obstacle_maps[l] = occ >= self.obstacle_threshold
 
+        # Compute via clearance offsets
+        via_clearance_offsets = []
+        if board_state is not None:
+            rules = board_state.board.design_rules.get('default', {})
+            via_drill = rules.get('via_drill', 0.3)
+            via_annular = rules.get('via_annular', 0.15)
+            clearance = rules.get('clearance', 0.15)
+            # Via total radius (drill + 2 * annular_ring) / 2
+            via_radius = (via_drill + 2 * via_annular) / 2.0
+            # Total clearance boundary from via center
+            required_clearance = via_radius + clearance
+            
+            # Convert to grid units (resolution = 0.1mm)
+            res = getattr(board_state, 'resolution', 0.1)
+            radius_cells = int(math.ceil(required_clearance / res))
+            
+            for dx in range(-radius_cells, radius_cells + 1):
+                for dy in range(-radius_cells, radius_cells + 1):
+                    if dx*dx + dy*dy <= radius_cells*radius_cells:
+                        via_clearance_offsets.append((dx, dy))
+        else:
+            via_clearance_offsets = [(0, 0)]
+
         # Priority Queue: stores tuples of (f_score, g_score, (x, y, layer), last_direction)
         pq = []
         if sl == -1:
@@ -166,6 +189,21 @@ class AStarPathfinder:
             for dl in [-1, 1]:
                 nl = cl + dl
                 if nl in active_layers_set:
+                    # Check via clearance on both current layer (cl) and target layer (nl)
+                    via_valid = True
+                    for dx, dy in via_clearance_offsets:
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < W and 0 <= ny < H:
+                            if (cl in obstacle_maps and obstacle_maps[cl][ny, nx] and (nx, ny) not in exempt) or \
+                               (nl in obstacle_maps and obstacle_maps[nl][ny, nx] and (nx, ny) not in exempt):
+                                via_valid = False
+                                break
+                        else:
+                            via_valid = False
+                            break
+                    if not via_valid:
+                        continue
+                        
                     # Via cost: base cost + penalty for low via probability
                     v_prob = via_prob[cy, cx]
                     via_cost = self.base_via_cost + (1.0 - v_prob) * self.base_via_cost
