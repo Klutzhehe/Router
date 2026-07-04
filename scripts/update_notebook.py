@@ -252,6 +252,127 @@ else:
     target_training_start_alt = "print(f\\\"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...\\\")"
     training_source_str = training_source_str.replace(target_training_start_alt, replacement_training_start)
 
+# ── Dynamic replacement for the right board state panel ──────────────────
+try_start_idx = training_source_str.find("    # \\u2500\\u2500 Board state panel")
+if try_start_idx == -1:
+    try_start_idx = training_source_str.find("    # ── Board state panel")
+
+end_idx = training_source_str.find("    clear_output(wait=True)")
+
+if try_start_idx != -1 and end_idx != -1:
+    new_render_code = """    # ── Board state panel (Fully routed board + Layer heatmaps) ──
+    try:
+        state = trainer.env.board_state
+        board = trainer.env.board
+        num_layers = board.num_layers
+        import matplotlib.patches as mpatches
+        
+        # Grid layout for the right side: Row 0 is the fully routed board, Row 1 is the layer heatmaps
+        sub_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 2, subplot_spec=gs[:, 2:], hspace=0.35, wspace=0.25
+        )
+        
+        # 1. Draw the Fully Routed Board (taking the entire Row 0)
+        ax_board = fig.add_subplot(sub_gs[0, :])
+        ax_board.set_facecolor(PANEL)
+        ax_board.set_title("Fully Routed Board (All Layers & Vias)", color=WHITE, fontsize=10, pad=6)
+        ax_board.set_xticks([]); ax_board.set_yticks([])
+        for spine in ax_board.spines.values():
+            spine.set_color(BORDER)
+            
+        # Draw obstacles
+        for obs in board.obstacles:
+            ax_board.add_patch(mpatches.Rectangle(
+                (obs.x, obs.y), obs.width, obs.height,
+                fc="#EF4444", alpha=0.15, lw=0, hatch='//'))
+                
+        # Draw keepout zones
+        for ko in board.keep_out_zones:
+            ax_board.add_patch(mpatches.Rectangle(
+                (ko.x, ko.y), ko.width, ko.height,
+                ec="#F59E0B", fc="none", lw=1.0, alpha=0.5, linestyle="--"))
+                
+        # Draw components
+        for comp in board.components:
+            ax_board.add_patch(mpatches.Rectangle(
+                (comp.x, comp.y), comp.width, comp.height,
+                fc="#1e2040", ec="#4B5563", lw=1.0, alpha=0.7))
+            ax_board.text(comp.x + comp.width/2, comp.y + comp.height/2, comp.name,
+                          color="#9CA3AF", fontsize=7, ha='center', va='center')
+                          
+        # Draw traces
+        net_colors = ["#3B82F6","#10B981","#EC4899","#8B5CF6","#06B6D4",
+                      "#F59E0B","#14B8A6","#6366F1","#A855F7","#F43F5E"]
+        layer_colors = ['#F43F5E', '#06B6D4', '#8B5CF6', '#F59E0B', '#10B981', '#EC4899']
+        for seg in state.traces:
+            c = layer_colors[seg.layer % len(layer_colors)]
+            lw = max(1.2, seg.width / state.resolution)
+            ax_board.plot([seg.start_x, seg.end_x], [seg.start_y, seg.end_y],
+                          color=c, linewidth=lw, alpha=0.9, solid_capstyle="round")
+                          
+        # Draw vias
+        for via in state.vias:
+            ax_board.add_patch(mpatches.Circle(
+                (via.x, via.y), radius=3.5,
+                fc="#EAB308", ec=WHITE, lw=0.8, alpha=0.9, zorder=5))
+            ax_board.add_patch(mpatches.Circle(
+                (via.x, via.y), radius=1.2,
+                fc=BG, zorder=6))
+                
+        # Draw pins
+        for pin in board.pins.values():
+            c = net_colors[pin.net_id % len(net_colors)]
+            ax_board.add_patch(mpatches.Circle(
+                (pin.global_x, pin.global_y), radius=2.5,
+                fc=c, ec=WHITE, lw=0.6, alpha=0.95, zorder=8))
+                
+        ax_board.set_xlim(0, board.width)
+        ax_board.set_ylim(0, board.height)
+        ax_board.set_aspect("equal")
+        
+        # 2. Draw Layer Heatmaps (in Row 1)
+        for l in range(min(2, num_layers)):
+            ax_hm = fig.add_subplot(sub_gs[1, l])
+            ax_hm.set_facecolor(PANEL)
+            ax_hm.set_title(f"Layer {l} Heatmap (AI Cost)", color=layer_colors[l % len(layer_colors)], fontsize=9, pad=4)
+            ax_hm.set_xticks([]); ax_hm.set_yticks([])
+            for spine in ax_hm.spines.values():
+                spine.set_color(BORDER)
+                
+            if hasattr(trainer, 'last_heatmap') and trainer.last_heatmap is not None:
+                ax_hm.imshow(
+                    trainer.last_heatmap[l],
+                    cmap='magma', origin='lower',
+                    extent=(0, board.width, 0, board.height),
+                    alpha=0.85
+                )
+            else:
+                ax_hm.text(0.5, 0.5, "No Heatmap Yet", color="#888",
+                           transform=ax_hm.transAxes, ha="center", va="center")
+                           
+            # Overlay active pins on heatmap for reference
+            for pin in board.pins.values():
+                if pin.layer == l:
+                    c = net_colors[pin.net_id % len(net_colors)]
+                    ax_hm.add_patch(mpatches.Circle(
+                        (pin.global_x, pin.global_y), radius=2.0,
+                        fc=c, ec=WHITE, lw=0.5, alpha=0.9))
+                        
+            ax_hm.set_xlim(0, board.width)
+            ax_hm.set_ylim(0, board.height)
+            ax_hm.set_aspect("equal")
+    except Exception as e:
+        ax_err = fig.add_subplot(gs[:, 2:])
+        ax_err.set_facecolor(PANEL)
+        ax_err.text(0.5, 0.5, f"Board render error:\\n{e}",
+                     transform=ax_err.transAxes, color=WHITE,
+                     ha="center", va="center", fontsize=9)
+                     
+"""
+    training_source_str = training_source_str[:try_start_idx] + new_render_code + training_source_str[end_idx:]
+else:
+    print("Warning: Could not locate board rendering panel for replacement in training cell!")
+
 # Split back into lines
 nb["cells"][5]["source"] = [line + "\n" for line in training_source_str.split("\n")]
 # remove trailing newline duplicate from split
