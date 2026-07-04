@@ -52,7 +52,8 @@ def generate_dataset():
             continue
             
         import glob
-        existing_eps = glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl")
+        import gzip
+        existing_eps = glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl.gz") + glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl")
         if len(existing_eps) >= episodes_per_stage:
             print(f"Dataset for {stage_name} already generated ({len(existing_eps)} episodes). Skipping...")
             continue
@@ -77,13 +78,15 @@ def generate_dataset():
             routing_mode='autoregressive'
         )
         
-        successful_episodes = len(glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl"))
+        successful_episodes = len(existing_eps)
         pbar = tqdm(total=episodes_per_stage, initial=successful_episodes, desc=f"Stage {stage_name}")
         
         seed = 42
         while successful_episodes < episodes_per_stage:
-            ep_shard_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl"
-            if os.path.exists(ep_shard_path) and os.path.getsize(ep_shard_path) > 0:
+            ep_shard_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl.gz"
+            fallback_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl"
+            if (os.path.exists(ep_shard_path) and os.path.getsize(ep_shard_path) > 0) or \
+               (os.path.exists(fallback_path) and os.path.getsize(fallback_path) > 0):
                 seed += 1
                 continue
                 
@@ -217,9 +220,9 @@ def generate_dataset():
                     moves_remaining_frac = np.array([max(0.0, (max_moves - step_idx) / max_moves)], dtype=np.float32)
                     
                     transition = {
-                        'raster': net_start_board_state.get_raster().clone().numpy(),
+                        'raster': net_start_board_state.get_raster().clone().numpy().astype(np.bool_),
                         'graph': env.graph,
-                        'layer_mask': net_start_board_state.active_layers_mask.clone().numpy(),
+                        'layer_mask': net_start_board_state.active_layers_mask.clone().numpy().astype(np.bool_),
                         'cursor_pos': cursor_norm,
                         'target_pos': target_norm,
                         'moves_remaining_frac': moves_remaining_frac,
@@ -280,7 +283,7 @@ def generate_dataset():
                     print(" PASSED.", flush=True)
                     
                     # Save immediately to disk, freeing memory!
-                    with open(ep_shard_path, "wb") as f:
+                    with gzip.open(ep_shard_path, "wb") as f:
                         pickle.dump([episode_transitions], f)
                         
                     successful_episodes += 1

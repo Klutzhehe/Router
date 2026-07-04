@@ -192,7 +192,7 @@ def main():
     
     # 1. Load dataset shards
     all_episodes = []
-    shard_paths = glob.glob("data/bc_dataset/*.pkl")
+    shard_paths = glob.glob("data/bc_dataset/*.pkl.gz") + glob.glob("data/bc_dataset/*.pkl")
     if not shard_paths:
         raise FileNotFoundError("No dataset shards found in data/bc_dataset/. Run scripts/generate_bc_dataset.py first.")
         
@@ -201,7 +201,9 @@ def main():
             print(f"Skipping empty dataset shard: {p}")
             continue
         try:
-            with open(p, "rb") as f:
+            import gzip
+            open_func = gzip.open if p.endswith('.gz') else open
+            with open_func(p, "rb") as f:
                 stage_episodes = pickle.load(f)
         except (EOFError, pickle.UnpicklingError) as e:
             print(f"Warning: Failed to load corrupted dataset shard {p}: {e}. Skipping...")
