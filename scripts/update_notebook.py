@@ -579,6 +579,50 @@ else:
         nb["cells"].append(viz_cell)
         print("Appended new step-by-step routing visualizer cell to the end")
 
+# Find or insert the BC pretraining cell dynamically
+bc_cell_idx = None
+init_trainer_idx = None
+
+for idx, cell in enumerate(nb["cells"]):
+    cell_src = "".join(cell.get("source", []))
+    if "CELL 4b — OPTIONAL: BEHAVIOR CLONING" in cell_src:
+        bc_cell_idx = idx
+        break
+    if "CELL 5 — INITIALIZE TRAINER" in cell_src:
+        init_trainer_idx = idx
+
+bc_cell_source = [
+    "# ================================================================\n",
+    "#  CELL 4b — OPTIONAL: BEHAVIOR CLONING (BC) PRETRAINING\n",
+    "#  Generates expert trajectories using A* and pretrains the\n",
+    "#  RouteStepPolicy before running RL fine-tuning.\n",
+    "# ================================================================\n",
+    "\n",
+    "# 1. Generate the dataset for stages s00-s06\n",
+    "!python -u scripts/generate_bc_dataset.py\n",
+    "\n",
+    "# 2. Run supervised BC pretraining on the policy\n",
+    "!python -u scripts/train_bc_policy.py --epochs 20 --batch_size 128\n"
+]
+
+if bc_cell_idx is not None:
+    nb["cells"][bc_cell_idx]["source"] = bc_cell_source
+    print(f"Updated existing BC pretraining cell at index {bc_cell_idx}")
+else:
+    bc_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": bc_cell_source,
+    }
+    if init_trainer_idx is not None:
+        nb["cells"].insert(init_trainer_idx, bc_cell)
+        print(f"Inserted new BC pretraining cell at index {init_trainer_idx}")
+    else:
+        nb["cells"].append(bc_cell)
+        print("Appended new BC pretraining cell to the end")
+
 # Save notebook back to file
 with open(notebook_path, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1)

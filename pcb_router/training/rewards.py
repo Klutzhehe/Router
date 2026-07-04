@@ -67,3 +67,37 @@ class RewardCalculator:
             r += w['all_complete_bonus']
             
         return float(r)
+
+    def calculate_step(self, step_info: dict) -> float:
+        """
+        Calculate step-level reward for per-cell routing decisions.
+        Args:
+            step_info: Dict containing:
+                - 'dist_delta': float (dist_prev - dist_curr)
+                - 'invalid_move': bool
+                - 'direction_changed': bool
+                - 'is_via': bool
+        """
+        # Direction change penalty and via cost matching pathfinder.py
+        direction_change_penalty = 15.0
+        base_via_cost = 15.0
+        invalid_move_penalty = 15.0  # matches via/direction penalty size
+        
+        r = 0.0
+        
+        # 1. Distance progress (positive is good, negative is bad)
+        r += step_info.get('dist_delta', 0.0)
+        
+        # 2. Invalid move penalty
+        if step_info.get('invalid_move', False):
+            r -= invalid_move_penalty
+            
+        # 3. Direction change penalty
+        if step_info.get('direction_changed', False):
+            r -= direction_change_penalty
+            
+        # 4. Via cost
+        if step_info.get('is_via', False):
+            r -= base_via_cost
+            
+        return float(r)

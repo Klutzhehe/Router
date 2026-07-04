@@ -5,3 +5,4 @@ from .fusion import CrossAttentionFusion
 from .jepa import SpatialJEPA, JEPAWorldModel
 from .policy import PPOPolicy, DreamerActorCritic
 from .heatmap_decoder import HeatmapDecoder
+from .route_step_policy import RouteStepPolicy

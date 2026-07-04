@@ -18,6 +18,7 @@ from pcb_router.models.heatmap_decoder import HeatmapDecoder
 from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.training.curriculum import CurriculumManager
 from pcb_router.training.rewards import RewardCalculator
+from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 
 class RolloutBuffer:
     def __init__(self):
@@ -940,6 +941,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         )
         
         jepa_cfg = self.model_cfg.get('jepa', {})
+        self.routing_mode = self.train_cfg.get('training', {}).get('routing_mode', 'astar_guided')
+        self.env.routing_mode = self.routing_mode
         self.jepa = JEPAWorldModel(
             vit_encoder=self.vit,
             gnn_encoder=self.gnn,
@@ -976,14 +979,21 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             weight_decay=weight_decay
         )
         
-        actor_params = (
-            list(self.policy.state_proj.parameters()) +
-            list(self.policy.net_scorer.parameters()) +
-            list(self.policy.heatmap_mlp.parameters()) +
-            list(self.policy.heatmap_mean.parameters()) +
-            list(self.decoder.parameters()) +
-            [self.policy.heatmap_log_std]
-        )
+        if self.routing_mode == 'autoregressive':
+            actor_params = (
+                list(self.policy.state_proj.parameters()) +
+                list(self.policy.net_scorer.parameters()) +
+                list(self.policy.step_policy.parameters())
+            )
+        else:
+            actor_params = (
+                list(self.policy.state_proj.parameters()) +
+                list(self.policy.net_scorer.parameters()) +
+                list(self.policy.heatmap_mlp.parameters()) +
+                list(self.policy.heatmap_mean.parameters()) +
+                list(self.decoder.parameters()) +
+                [self.policy.heatmap_log_std]
+            )
         self.actor_opt = torch.optim.AdamW(actor_params, lr=actor_lr)
         self.critic_opt = torch.optim.AdamW(self.policy.value_head.parameters(), lr=critic_lr)
         
@@ -1044,6 +1054,23 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
+        elif self.routing_mode == 'autoregressive':
+            bc_path = os.path.join(self.checkpoint_dir, "bc_pretrained_policy.pt")
+            if os.path.exists(bc_path):
+                print(f"Starting fresh training run. Loading pretrained BC policy weights from {bc_path}...")
+                try:
+                    ckpt = torch.load(bc_path, map_location=self.device)
+                    policy_state = ckpt.get('policy', ckpt)
+                    self.policy.step_policy.load_state_dict(policy_state)
+                    print("Pretrained BC weights successfully loaded! ✓")
+                except Exception as e:
+                    print(f"Warning: Failed to load pretrained BC weights: {e}")
+            else:
+                raise FileNotFoundError(
+                    f"Pretrained BC policy checkpoint not found at: {bc_path}\n"
+                    "In autoregressive routing mode, you MUST run CELL 4b successfully first to pretrain the step policy.\n"
+                    "Starting RL training from random initialization is blocked to prevent wasting training time."
+                )
 
     def save_checkpoint(self, path: str):
         state = {
@@ -1236,58 +1263,234 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                         loss_dec = (bce_loss * weight_mask).mean()
                     
                     self.actor_opt.zero_grad(set_to_none=True)
-                    self.wm_opt.zero_grad(set_to_none=True)
-                    
-                    self.scaler_ac.scale(loss_dec).backward()
-                    
-                    self.scaler_ac.step(self.actor_opt)
-                    self.scaler_ac.step(self.wm_opt)  # Backprop to vit/gnn/fusion
-                    self.scaler_ac.update()
+        if self.routing_mode == 'astar_guided':
+            while steps_collected < num_steps:
+                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
+                episode = Episode()
+                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
                 
-                # Detached RSSM update and Replay Buffer appending
-                with torch.no_grad():
-                    action_tuple = (net_idx_tensor.detach().squeeze(0).cpu(), heatmap_latent.detach().squeeze(0).cpu())
-                    action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent.detach())
-                    h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
-                    h = h.detach()
-                    z = z.detach()
+                done = False
+                while not done and steps_collected < num_steps:
+                    raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                    graph = info['graph']
+                    x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
+                    edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
                     
-                    if not hasattr(episode, 'target_context_embeddings'):
-                        episode.target_context_embeddings = []
-                    if not hasattr(episode, 'net_embeddings_list'):
-                        episode.net_embeddings_list = []
-                    if not hasattr(episode, 'unrouted_masks_list'):
-                        episode.unrouted_masks_list = []
+                    with torch.no_grad():
+                        spatial_patches, cls_spatial = self.vit(raster_tensor)
+                        node_embs = self.gnn(x_dict, edge_index_dict)
+                        pad_embs = node_embs['pad'].unsqueeze(0)
+                        fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
                         
-                    episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
-                    episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
-                    episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
-                    episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
+                        global_spatial = cls_spatial
+                        global_graph = fused_pads.mean(dim=1)
+                        context_emb = torch.cat([global_spatial, global_graph], dim=-1)
+                        context_emb = F.layer_norm(context_emb, (context_emb.shape[-1],))
+                        
+                    net_embs, unrouted_mask, _ = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
+                    
+                    with torch.no_grad():
+                        net_idx_tensor, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy.act(
+                            net_embs, unrouted_mask, h, z, explore=explore
+                        )
+                        
+                    with torch.no_grad():
+                        heatmaps = self.heatmap_decoder(heatmap_latent)
+                        heatmaps_np = heatmaps.cpu().squeeze(0).numpy()
+                        via_prob_map = torch.sigmoid(heatmaps[:, -1]).cpu().squeeze(0).numpy()
+                        
+                    next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
+                        net_idx_tensor.item(), heatmaps_np, via_prob_map
+                    )
+                    
+                    done = terminated or truncated
+                    
+                    with torch.no_grad():
+                        next_raster = torch.tensor(next_obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                        next_graph = next_info['graph']
+                        next_x_dict = {k: v.to(self.device) for k, v in next_graph.x_dict.items()}
+                        next_edge_index_dict = {k: v.to(self.device) for k, v in next_graph.edge_index_dict.items()}
+                        
+                        next_sp, next_cls = self.vit(next_raster)
+                        next_node = self.gnn(next_x_dict, next_edge_index_dict)
+                        next_pad = next_node['pad'].unsqueeze(0)
+                        next_fused_pads, _ = self.fusion(next_pad, next_sp)
+                        
+                        next_global_spatial = next_cls
+                        next_global_graph = next_fused_pads.mean(dim=1)
+                        target_context_emb = torch.cat([next_global_spatial, next_global_graph], dim=-1)
+                        target_context_emb = F.layer_norm(target_context_emb, (target_context_emb.shape[-1],))
+                        
+                    with torch.no_grad():
+                        action_tuple = (net_idx_tensor.detach().squeeze(0).cpu(), heatmap_latent.detach().squeeze(0).cpu())
+                        action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent.detach())
+                        h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
+                        h = h.detach()
+                        z = z.detach()
+                        
+                        if not hasattr(episode, 'target_context_embeddings'):
+                            episode.target_context_embeddings = []
+                        if not hasattr(episode, 'net_embeddings_list'):
+                            episode.net_embeddings_list = []
+                        if not hasattr(episode, 'unrouted_masks_list'):
+                            episode.unrouted_masks_list = []
+                            
+                        episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
+                        episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
+                        episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
+                        episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
+                        
+                    obs = next_obs
+                    info = next_info
+                    steps_collected += 1
+                    self.total_timesteps += 1
+                    if steps_collected % 5 == 0 or steps_collected == num_steps:
+                        print(f"  Collected {steps_collected}/{num_steps} steps...")
+                        
+                if episode.length > 0:
+                    episode.net_embeddings = episode.net_embeddings_list[0]
+                    episode.unrouted_masks = episode.unrouted_masks_list
+                    self.replay_buffer.add_episode(episode)
+                    cr = info.get('completion_rate', 0.0)
+                    drc_viol = info.get('drc_violations', 0)
+                    num_nets = len(self.env.board.nets)
+                    drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
+                    self.curriculum.record_episode(cr, drc_rate)
+                    completion_rates.append(cr)
+                    
+                    self.last_completed_board_state = copy.deepcopy(self.env.board_state)
+                    self.last_completed_board = copy.deepcopy(self.env.board)
+                    
+            return np.mean(completion_rates) if completion_rates else 0.0
+        else:
+            # Autoregressive mode
+            while steps_collected < num_steps:
+                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
+                episode = Episode()
+                episode.cropped_spatials = []
+                episode.cursor_poses = []
+                episode.target_poses = []
+                episode.moves_remaining_fracs = []
                 
-                obs = next_obs
-                info = next_info
-                steps_collected += 1
-                self.total_timesteps += 1
-                if steps_collected % 5 == 0 or steps_collected == num_steps:
-                    print(f"  Collected {steps_collected}/{num_steps} steps...")
+                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
                 
-            if episode.length > 0:
-                episode.net_embeddings = episode.net_embeddings_list[0]
-                episode.unrouted_masks = episode.unrouted_masks_list
-                self.replay_buffer.add_episode(episode)
-                cr = info.get('completion_rate', 0.0)
-                drc_viol = info.get('drc_violations', 0)
-                num_nets = len(self.env.board.nets)
-                drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
-                self.curriculum.record_episode(cr, drc_rate)
-                completion_rates.append(cr)
-                
-                # Cache completed board state for visualization
-                import copy
-                self.last_completed_board_state = copy.deepcopy(self.env.board_state)
-                self.last_completed_board = copy.deepcopy(self.env.board)
-                
-        return np.mean(completion_rates) if completion_rates else 0.0
+                for net_idx in range(len(self.env.board.nets)):
+                    if steps_collected >= num_steps:
+                        break
+                        
+                    raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                    graph = info['graph']
+                    x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
+                    edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
+                    
+                    with torch.no_grad():
+                        net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
+                        net_idx_tensor, _, _ = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
+                        
+                    self.env.start_routing_net(net_idx_tensor.item())
+                    
+                    net_done = False
+                    while not net_done and steps_collected < num_steps:
+                        curr_obs = self.env._get_obs()
+                        curr_info = self.env._get_info()
+                        
+                        r_tensor = torch.tensor(curr_obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                        cursor_norm = torch.tensor(curr_obs['cursor_pos'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                        target_norm = torch.tensor(curr_obs['target_pos'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                        moves_frac = torch.tensor(curr_obs['moves_remaining_frac'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                        
+                        graph_t = curr_info['graph']
+                        x_dict_t = {k: v.to(self.device) for k, v in graph_t.x_dict.items()}
+                        edge_index_dict_t = {k: v.to(self.device) for k, v in graph_t.edge_index_dict.items()}
+                        
+                        with torch.no_grad():
+                            spatial_patches, cls_spatial = self.vit(r_tensor)
+                            node_embs = self.gnn(x_dict_t, edge_index_dict_t)
+                            pad_embs = node_embs['pad'].unsqueeze(0)
+                            fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
+                            
+                            logits, value = self.policy.forward_step(fused_spatial, cursor_norm, target_norm, moves_frac)
+                            
+                            v_mask = torch.tensor(get_valid_mask(self.env), dtype=torch.bool, device=self.device).unsqueeze(0)
+                            masked_logits = logits.masked_fill(~v_mask, -1e4)
+                            
+                            if not explore:
+                                action = masked_logits.argmax(dim=-1).item()
+                            else:
+                                probs = F.softmax(masked_logits, dim=-1)
+                                dist = torch.distributions.Categorical(probs)
+                                action = dist.sample().item()
+                                
+                        cursor_prev = self.env.cursor_pos
+                        next_obs, reward, terminated, truncated, next_info = self.env.step({'action_id': action})
+                        cursor_curr = self.env.cursor_pos
+                        
+                        net_done = (self.env.current_net_index is None)
+                        done = terminated or truncated
+                        
+                        dx = cursor_curr[0] - cursor_prev[0]
+                        dy = cursor_curr[1] - cursor_prev[1]
+                        dl = cursor_curr[2] - cursor_prev[2]
+                        cursor_delta = np.array([dx, dy, dl], dtype=np.float32)
+                        
+                        with torch.no_grad():
+                            action_onehot = F.one_hot(torch.tensor([action], device=self.device), num_classes=10).float()
+                            cursor_delta_tensor = torch.tensor(cursor_delta, dtype=torch.float32, device=self.device).unsqueeze(0)
+                            
+                            action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta_tensor)
+                            
+                            global_spatial = cls_spatial
+                            global_graph = fused_pads.mean(dim=1)
+                            context_emb = torch.cat([global_spatial, global_graph], dim=-1)
+                            context_emb = F.layer_norm(context_emb, (context_emb.shape[-1],))
+                            
+                            h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
+                            h = h.detach()
+                            z = z.detach()
+                            
+                            cropped_spatial = self.policy.step_policy.crop_spatial(fused_spatial, cursor_norm)
+                            
+                            if not hasattr(episode, 'target_context_embeddings'):
+                                episode.target_context_embeddings = []
+                            if not hasattr(episode, 'net_embeddings_list'):
+                                episode.net_embeddings_list = []
+                            if not hasattr(episode, 'unrouted_masks_list'):
+                                episode.unrouted_masks_list = []
+                                
+                            action_tuple = (torch.tensor(action, dtype=torch.long).cpu(), cursor_delta_tensor.detach().squeeze(0).cpu())
+                            
+                            episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
+                            episode.target_context_embeddings.append(context_emb.detach().squeeze(0).cpu())
+                            episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
+                            episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
+                            
+                            episode.cropped_spatials.append(cropped_spatial.detach().squeeze(0).cpu())
+                            episode.cursor_poses.append(cursor_norm.detach().squeeze(0).cpu())
+                            episode.target_poses.append(target_norm.detach().squeeze(0).cpu())
+                            episode.moves_remaining_fracs.append(moves_frac.detach().squeeze(0).cpu())
+                            
+                        obs = next_obs
+                        info = next_info
+                        steps_collected += 1
+                        self.total_timesteps += 1
+                        if steps_collected % 50 == 0 or steps_collected == num_steps:
+                            print(f"  Collected {steps_collected}/{num_steps} steps...")
+                            
+                if episode.length > 0:
+                    episode.net_embeddings = episode.net_embeddings_list[0]
+                    episode.unrouted_masks = episode.unrouted_masks_list
+                    self.replay_buffer.add_episode(episode)
+                    cr = info.get('completion_rate', 0.0)
+                    drc_viol = info.get('drc_violations', 0)
+                    num_nets = len(self.env.board.nets)
+                    drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
+                    self.curriculum.record_episode(cr, drc_rate)
+                    completion_rates.append(cr)
+                    
+                    self.last_completed_board_state = copy.deepcopy(self.env.board_state)
+                    self.last_completed_board = copy.deepcopy(self.env.board)
+                    
+            return np.mean(completion_rates) if completion_rates else 0.0
 
     def _phase2_train_world_model(self):
         self.jepa.train()
@@ -1307,6 +1510,11 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         b_rew = []
         b_cont = []
         b_mask = []
+        
+        b_crop = []
+        b_cursor = []
+        b_target = []
+        b_moves = []
         
         for ep in sampled_episodes:
             if ep.length >= seq_len:
@@ -1342,6 +1550,23 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             b_cont.append(cont_tensor)
             b_mask.append(mask_tensor)
             
+            if self.routing_mode == 'autoregressive':
+                crop_tensor = ep.cropped_spatials_tensor[start:end]
+                cursor_tensor = ep.cursor_poses_tensor[start:end]
+                target_tensor = ep.target_poses_tensor[start:end]
+                moves_tensor = ep.moves_remaining_fracs_tensor[start:end]
+                
+                if pad_len > 0:
+                    crop_tensor = torch.cat([crop_tensor, torch.zeros(pad_len, crop_tensor.shape[-1], dtype=crop_tensor.dtype, device=crop_tensor.device)], dim=0)
+                    cursor_tensor = torch.cat([cursor_tensor, torch.zeros(pad_len, cursor_tensor.shape[-1], dtype=cursor_tensor.dtype, device=cursor_tensor.device)], dim=0)
+                    target_tensor = torch.cat([target_tensor, torch.zeros(pad_len, target_tensor.shape[-1], dtype=target_tensor.dtype, device=target_tensor.device)], dim=0)
+                    moves_tensor = torch.cat([moves_tensor, torch.zeros(pad_len, moves_tensor.shape[-1], dtype=moves_tensor.dtype, device=moves_tensor.device)], dim=0)
+                    
+                b_crop.append(crop_tensor)
+                b_cursor.append(cursor_tensor)
+                b_target.append(target_tensor)
+                b_moves.append(moves_tensor)
+            
         batch = {
             'context_embeddings': torch.stack(b_ctx).to(self.device),
             'target_context_embeddings': torch.stack(b_tgt_ctx).to(self.device),
@@ -1351,7 +1576,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             'continues': torch.stack(b_cont).to(self.device),
             'masks': torch.stack(b_mask).to(self.device)
         }
-        
+        if self.routing_mode == 'autoregressive':
+            batch['cropped_spatials'] = torch.stack(b_crop).to(self.device)
+            batch['cursor_poses'] = torch.stack(b_cursor).to(self.device)
+            batch['target_poses'] = torch.stack(b_target).to(self.device)
+            batch['moves_remaining_fracs'] = torch.stack(b_moves).to(self.device)
+            
         grad_clip = self.train_cfg.get('training', {}).get('wm_grad_clip', 100.0)
         
         with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -1379,7 +1609,11 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             h, z = self.jepa.initial_state(B_b, self.device)
             flat_net = batch['net_actions'].reshape(-1)
             flat_heat = batch['heatmap_actions'].reshape(-1, batch['heatmap_actions'].shape[-1])
-            action_embs = self.jepa.get_action_embedding(flat_net, flat_heat).reshape(B_b, T_b, -1)
+            if flat_heat.shape[-1] == 3:
+                move_action_onehot = F.one_hot(flat_net.long(), num_classes=10).float()
+                action_embs = self.jepa.get_action_embedding_move(move_action_onehot, flat_heat).reshape(B_b, T_b, -1)
+            else:
+                action_embs = self.jepa.get_action_embedding(flat_net, flat_heat).reshape(B_b, T_b, -1)
             
             all_h, all_z = [], []
             for t in range(T_b - 1):
@@ -1445,35 +1679,109 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             
             current_horizon = self._current_imagination_horizon()
             
+            if self.routing_mode == 'autoregressive':
+                cropped_sp_list = []
+                cursor_pos_list = []
+                target_pos_list = []
+                moves_frac_list = []
+                
+                for ep in sampled_episodes:
+                    idx = random.randint(0, max(0, ep.length - 1))
+                    end_idx = min(idx + current_horizon, ep.length)
+                    pad_len = current_horizon - (end_idx - idx)
+                    
+                    c_sp = ep.cropped_spatials_tensor[idx:end_idx]
+                    c_pos = ep.cursor_poses_tensor[idx:end_idx]
+                    t_pos = ep.target_poses_tensor[idx:end_idx]
+                    m_frac = ep.moves_remaining_fracs_tensor[idx:end_idx]
+                    
+                    if pad_len > 0:
+                        c_sp = torch.cat([c_sp, torch.zeros(pad_len, c_sp.shape[-1], dtype=c_sp.dtype)], dim=0)
+                        c_pos = torch.cat([c_pos, torch.zeros(pad_len, c_pos.shape[-1], dtype=c_pos.dtype)], dim=0)
+                        t_pos = torch.cat([t_pos, torch.zeros(pad_len, t_pos.shape[-1], dtype=t_pos.dtype)], dim=0)
+                        m_frac = torch.cat([m_frac, torch.zeros(pad_len, m_frac.shape[-1], dtype=m_frac.dtype)], dim=0)
+                        
+                    cropped_sp_list.append(c_sp)
+                    cursor_pos_list.append(c_pos)
+                    target_pos_list.append(t_pos)
+                    moves_frac_list.append(m_frac)
+                    
+                cropped_spatials = torch.stack(cropped_sp_list).transpose(0, 1).to(self.device)
+                cursor_poses = torch.stack(cursor_pos_list).transpose(0, 1).to(self.device)
+                target_poses = torch.stack(target_pos_list).transpose(0, 1).to(self.device)
+                moves_remaining_fracs = torch.stack(moves_frac_list).transpose(0, 1).to(self.device)
+            
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 for t in range(current_horizon):
-                    net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
-                        net_embeddings, unrouted_mask, h, z, deterministic=False
-                    )
-                    
-                    pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                    pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                    pred_continue = torch.sigmoid(pred_continue_logits)
-                    
-                    traj_h.append(h)
-                    traj_z.append(z)
-                    traj_actions_net.append(net_idx)
-                    traj_actions_heat.append(heatmap_latent)
-                    traj_rewards.append(pred_reward)
-                    traj_continues.append(pred_continue)
-                    traj_values.append(value)
-                    traj_log_probs_net.append(log_prob_net)
-                    traj_log_probs_heat.append(log_prob_heatmap)
-                    
-                    action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
-                    h, z = self.jepa.predict_step(h, z, action_emb)
-
-                    # Out-of-place mask update: mark the chosen net as routed.
-                    # scatter_() is inplace and corrupts autograd version counters when
-                    # the tensor participates in the backward graph — use scatter() instead.
-                    update = torch.zeros_like(unrouted_mask, dtype=torch.bool)
-                    update = update.scatter(1, net_idx.unsqueeze(-1), True)
-                    unrouted_mask = unrouted_mask & ~update
+                    if self.routing_mode == 'autoregressive':
+                        logits, value = self.policy.forward_step_cropped(
+                            cropped_spatials[t], cursor_poses[t], target_poses[t], moves_remaining_fracs[t]
+                        )
+                        
+                        probs = F.softmax(logits, dim=-1)
+                        dist = torch.distributions.Categorical(probs)
+                        action_id = dist.sample()
+                        log_prob = dist.log_prob(action_id)
+                        
+                        pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                        pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                        pred_continue = torch.sigmoid(pred_continue_logits)
+                        
+                        traj_h.append(h)
+                        traj_z.append(z)
+                        traj_actions_net.append(action_id)
+                        traj_rewards.append(pred_reward)
+                        traj_continues.append(pred_continue)
+                        traj_values.append(value)
+                        traj_log_probs_net.append(log_prob)
+                        
+                        device = action_id.device
+                        moves_delta = torch.tensor([
+                            [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+                            [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]
+                        ], device=device)
+                        
+                        B_size = action_id.shape[0]
+                        cursor_delta = torch.zeros((B_size, 3), device=device)
+                        
+                        mask_grid = (action_id < 8)
+                        if mask_grid.any():
+                            cursor_delta[mask_grid] = moves_delta[action_id[mask_grid]]
+                        mask_up = (action_id == 8)
+                        if mask_up.any():
+                            cursor_delta[mask_up, 2] = -1.0
+                        mask_down = (action_id == 9)
+                        if mask_down.any():
+                            cursor_delta[mask_down, 2] = 1.0
+                            
+                        action_onehot = F.one_hot(action_id, num_classes=10).float()
+                        action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
+                        h, z = self.jepa.predict_step(h, z, action_emb)
+                    else:
+                        net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
+                            net_embeddings, unrouted_mask, h, z, deterministic=False
+                        )
+                        
+                        pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                        pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                        pred_continue = torch.sigmoid(pred_continue_logits)
+                        
+                        traj_h.append(h)
+                        traj_z.append(z)
+                        traj_actions_net.append(net_idx)
+                        traj_actions_heat.append(heatmap_latent)
+                        traj_rewards.append(pred_reward)
+                        traj_continues.append(pred_continue)
+                        traj_values.append(value)
+                        traj_log_probs_net.append(log_prob_net)
+                        traj_log_probs_heat.append(log_prob_heatmap)
+                        
+                        action_emb = self.jepa.get_action_embedding(net_idx, heatmap_latent)
+                        h, z = self.jepa.predict_step(h, z, action_emb)
+                        
+                        update = torch.zeros_like(unrouted_mask, dtype=torch.bool)
+                        update = update.scatter(1, net_idx.unsqueeze(-1), True)
+                        unrouted_mask = unrouted_mask & ~update
                     
                 bootstrap_value = self.policy.get_value(h, z)
                 
@@ -1483,7 +1791,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 traj_continues = torch.stack(traj_continues, dim=0)
                 traj_values = torch.stack(traj_values, dim=0)
                 traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
-                traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
+                if self.routing_mode != 'autoregressive':
+                    traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
                 
                 lambda_returns = compute_lambda_returns(
                     rewards=traj_rewards,
@@ -1502,7 +1811,10 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 critic_loss = F.mse_loss(traj_values, targets)
                 advantages = (targets - traj_values).detach()
-                loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
+                if self.routing_mode == 'autoregressive':
+                    loss_policy = -traj_log_probs_net * advantages
+                else:
+                    loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
                 loss_policy = loss_policy.mean()
                 total_loss = loss_policy + critic_loss
             

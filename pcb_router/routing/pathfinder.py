@@ -1,6 +1,7 @@
 import numpy as np
 import heapq
 import math
+from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 
 class AStarPathfinder:
     def __init__(self, direction_change_penalty: float = 15.0, base_via_cost: float = 15.0, heatmap_weight: float = 10.0, debug: bool = False):
@@ -52,61 +53,12 @@ class AStarPathfinder:
 
         exempt = {(sx, sy), (tx, ty)}
 
-        # Pre-build obstacle maps per layer (cells that are blocked to traversal).
-        # Source and target cells are always passable regardless of occupancy.
-        temp_obstacle_maps = {}
-        for l in active_layers:
-            if board_state is not None:
-                occ = board_state.get_occupancy(l)  # (H, W) float, 1.0 = occupied
-                t_map = (occ >= self.obstacle_threshold).copy()
-                for ex_x, ex_y in exempt:
-                    t_map[ex_y, ex_x] = False
-                temp_obstacle_maps[l] = t_map
-            else:
-                temp_obstacle_maps[l] = np.zeros((H, W), dtype=bool)
-
-        # Compute via clearance offsets
-        via_clearance_offsets = []
-        if board_state is not None:
-            rules = board_state.board.design_rules.get('default', {})
-            via_drill = rules.get('via_drill', 0.3)
-            via_annular = rules.get('via_annular', 0.15)
-            clearance = rules.get('clearance', 0.15)
-            # Via total radius (drill + 2 * annular_ring) / 2
-            via_radius = (via_drill + 2 * via_annular) / 2.0
-            # Total clearance boundary from via center
-            required_clearance = via_radius + clearance
-            
-            # Convert to grid units (resolution = 0.1mm)
-            res = getattr(board_state, 'resolution', 0.1)
-            radius_cells = int(math.ceil(required_clearance / res))
-            
-            for dx in range(-radius_cells, radius_cells + 1):
-                for dy in range(-radius_cells, radius_cells + 1):
-                    if dx*dx + dy*dy <= radius_cells*radius_cells:
-                        via_clearance_offsets.append((dx, dy))
-        else:
-            via_clearance_offsets = [(0, 0)]
-
-        # Precompute via blockage per layer using NumPy shift-based dilation
-        via_blocked = {}
-        for l in active_layers:
-            obs = temp_obstacle_maps[l]
-            blocked = np.zeros_like(obs)
-            for dx, dy in via_clearance_offsets:
-                shifted = np.ones_like(obs)
-                y_start_dst = max(0, -dy)
-                y_end_dst = min(H, H - dy)
-                y_start_src = max(0, dy)
-                y_end_src = min(H, H + dy)
-                x_start_dst = max(0, -dx)
-                x_end_dst = min(W, W - dx)
-                x_start_src = max(0, dx)
-                x_end_src = min(W, W + dx)
-                if y_start_dst < y_end_dst and x_start_dst < x_end_dst:
-                    shifted[y_start_dst:y_end_dst, x_start_dst:x_end_dst] = obs[y_start_src:y_end_src, x_start_src:x_end_src]
-                blocked |= shifted
-            via_blocked[l] = blocked
+        temp_obstacle_maps = build_obstacle_maps(
+            board_state, active_layers, exempt, shape=(H, W), obstacle_threshold=self.obstacle_threshold
+        )
+        via_blocked = build_via_blocked_maps(
+            board_state, temp_obstacle_maps, active_layers, shape=(H, W)
+        )
 
         # Allocate or reuse 4D visited and parent arrays
         if (self._visited_buf is None or 

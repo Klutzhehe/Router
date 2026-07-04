@@ -277,6 +277,44 @@ class BoardState:
         if trace_segments:
             self.routed_net_ids.add(trace_segments[0].net_id)
 
+    def rasterize_partial_move(self, x1, y1, l1, x2, y2, l2, net_class='default'):
+        """Render a single partial step segment/via incrementally into raster.
+        Does NOT append to self.traces or self.vias to avoid duplicates/failed route pollution.
+        """
+        # Look up default rules for width and via dimensions
+        rules = self.board.design_rules.get(net_class, self.board.design_rules.get('default', {}))
+        
+        if l1 == l2:
+            # Same layer trace segment
+            trace_width = rules.get('width', 0.15)
+            # Create temporary TraceSegment
+            seg = TraceSegment(
+                start_x=x1, start_y=y1,
+                end_x=x2, end_y=y2,
+                layer=l1, width=trace_width,
+                net_id=self.current_net_id
+            )
+            # Rasterize trace into its layer and channel 10
+            self._rasterize_trace(seg, channel=l1, val=1.0)
+            self._rasterize_trace(seg, channel=10, val=1.0)
+        else:
+            # Layer transition (via)
+            via_drill = rules.get('via_drill', 0.3)
+            via_annular = rules.get('via_annular', 0.15)
+            # Create temporary Via
+            via = Via(
+                x=x1, y=y1,
+                from_layer=l1, to_layer=l2,
+                drill_size=via_drill,
+                annular_ring=via_annular,
+                net_id=self.current_net_id
+            )
+            # Rasterize via on all traversed layers and channel 10
+            r = int(round((via.drill_size / 2.0 + via.annular_ring) / self.resolution))
+            for layer in range(min(l1, l2), max(l1, l2) + 1):
+                self._rasterize_circle(via.x, via.y, radius=r, channel=layer, val=1.0)
+                self._rasterize_circle(via.x, via.y, radius=r, channel=10, val=1.0)
+
     def get_congestion_map(self) -> np.ndarray:
         """Estimated congestion based on straight paths of unrouted nets"""
         congestion = np.zeros((self.height, self.width), dtype=np.float32)

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
+from pcb_router.models.route_step_policy import RouteStepPolicy
 
 class PPOPolicy(nn.Module):
     def __init__(
@@ -194,6 +195,9 @@ class DreamerActorCritic(nn.Module):
             nn.ReLU()
         )
         
+        # Step-by-step routing policy
+        self.step_policy = RouteStepPolicy(embed_dim=embed_dim)
+        
         self.net_scorer = nn.Sequential(
             nn.Linear(embed_dim * 2, net_selector_dim),
             nn.Tanh(),
@@ -287,6 +291,12 @@ class DreamerActorCritic(nn.Module):
         value = self.get_value(h, z)
         
         return net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value
+
+    def forward_step(self, fused_spatial, cursor_pos, target_pos, moves_remaining_frac):
+        return self.step_policy(fused_spatial, cursor_pos, target_pos, moves_remaining_frac)
+
+    def forward_step_cropped(self, cropped_spatial, cursor_pos, target_pos, moves_remaining_frac):
+        return self.step_policy.forward_cropped(cropped_spatial, cursor_pos, target_pos, moves_remaining_frac)
 
     def act(self, net_embeddings, unrouted_mask, h, z, explore=True):
         with torch.no_grad():

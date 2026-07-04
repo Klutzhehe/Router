@@ -43,7 +43,8 @@ training:
   train_ratio: 100
   replay_buffer_size: 5000
   batch_size: 256              # increased from 128 for higher VRAM usage and faster training
-  seq_len: 50
+  seq_len: 200
+  routing_mode: "autoregressive"
   imagine_batch_size: 4096     # increased from 2048 for higher VRAM usage and faster training
   imagination_horizon_start: 5
   imagination_horizon_end: 15

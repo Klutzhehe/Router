@@ -52,6 +52,16 @@ class Episode:
             if isinstance(self.unrouted_masks, list):
                 self.unrouted_masks = torch.stack(self.unrouted_masks).squeeze(1).cpu()
 
+        # Handle autoregressive step features
+        if hasattr(self, 'cropped_spatials') and self.cropped_spatials:
+            self.cropped_spatials_tensor = torch.stack(self.cropped_spatials).cpu()
+        if hasattr(self, 'cursor_poses') and self.cursor_poses:
+            self.cursor_poses_tensor = torch.stack(self.cursor_poses).cpu()
+        if hasattr(self, 'target_poses') and self.target_poses:
+            self.target_poses_tensor = torch.stack(self.target_poses).cpu()
+        if hasattr(self, 'moves_remaining_fracs') and self.moves_remaining_fracs:
+            self.moves_remaining_fracs_tensor = torch.stack(self.moves_remaining_fracs).cpu()
+
         # Clear lists to reclaim memory
         self.context_embeddings = []
         self.actions = []
@@ -63,6 +73,14 @@ class Episode:
             self.net_embeddings_list = []
         if hasattr(self, 'unrouted_masks_list'):
             self.unrouted_masks_list = []
+        if hasattr(self, 'cropped_spatials'):
+            self.cropped_spatials = []
+        if hasattr(self, 'cursor_poses'):
+            self.cursor_poses = []
+        if hasattr(self, 'target_poses'):
+            self.target_poses = []
+        if hasattr(self, 'moves_remaining_fracs'):
+            self.moves_remaining_fracs = []
         self._finalized = True
 
 

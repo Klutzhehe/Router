@@ -189,6 +189,12 @@ class JEPAWorldModel(nn.Module):
             nn.Linear(256, 256)
         )
         self.action_dim = 256
+        self.action_proj_move = nn.Sequential(
+            nn.Linear(10 + 3, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 256)
+        )
 
         # Recurrent cell (GRU)
         self.gru = nn.GRUCell(self.z_dim + self.action_dim, deterministic_size)
@@ -261,6 +267,10 @@ class JEPAWorldModel(nn.Module):
         net_emb = self.net_embedding(net_idx)
         act_concat = torch.cat([net_emb, heatmap_latent], dim=-1)
         return self.action_proj(act_concat)
+
+    def get_action_embedding_move(self, move_action_onehot: torch.Tensor, cursor_delta: torch.Tensor) -> torch.Tensor:
+        act_concat = torch.cat([move_action_onehot, cursor_delta], dim=-1)
+        return self.action_proj_move(act_concat)
 
     def get_context_embedding(self, raster: torch.Tensor, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor], use_target: bool = False) -> torch.Tensor:
         vit = self.target_vit if use_target else self.online_vit
@@ -335,7 +345,11 @@ class JEPAWorldModel(nn.Module):
 
         flat_net_actions = net_actions.reshape(-1)
         flat_heatmap_actions = heatmap_actions.reshape(-1, heatmap_actions.shape[-1])
-        action_embs = self.get_action_embedding(flat_net_actions, flat_heatmap_actions).reshape(B, T, -1)
+        if heatmap_actions.shape[-1] == 3:
+            move_action_onehot = F.one_hot(flat_net_actions.long(), num_classes=10).float()
+            action_embs = self.get_action_embedding_move(move_action_onehot, flat_heatmap_actions).reshape(B, T, -1)
+        else:
+            action_embs = self.get_action_embedding(flat_net_actions, flat_heatmap_actions).reshape(B, T, -1)
 
         target_context_embs = batch.get('target_context_embeddings', context_embs)
         for t in range(T - 1):

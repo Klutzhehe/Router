@@ -129,7 +129,8 @@ class CurriculumManager:
             self.violation_history.pop(0)
 
     def should_advance(self) -> bool:
-        min_episodes = self.progression_cfg.get('min_episodes', 500)
+        stage_cfg = self.current_stage
+        min_episodes = stage_cfg.get('min_episodes', self.progression_cfg.get('min_episodes', 500))
         if self.episodes_in_stage < min_episodes:
             return False
             
@@ -139,7 +140,6 @@ class CurriculumManager:
         mean_comp = np.mean(self.completion_history)
         mean_viol = np.mean(self.violation_history)
         
-        stage_cfg = self.current_stage
         comp_thresh = stage_cfg.get('completion_threshold', self.progression_cfg.get('completion_threshold', 0.95))
         viol_thresh = stage_cfg.get('drc_violation_threshold', self.progression_cfg.get('drc_violation_threshold', 0.02))
         
