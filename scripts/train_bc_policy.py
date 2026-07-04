@@ -462,17 +462,54 @@ def main():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            
+        # Save checkpoints
+        os.makedirs("checkpoints", exist_ok=True)
         
-    # Save pretrained policy checkpoint
-    os.makedirs("checkpoints", exist_ok=True)
-    save_path = "checkpoints/bc_pretrained_policy.pt"
-    torch.save({
-        'policy': policy.state_dict(),
-        'vit': vit.state_dict(),
-        'gnn': gnn.state_dict(),
-        'fusion': fusion.state_dict()
-    }, save_path)
-    print(f"Pretraining complete. Saved weights to {save_path}")
+        # Save latest checkpoint
+        latest_path = "checkpoints/bc_policy_latest.pt"
+        torch.save({
+            'epoch': epoch,
+            'policy': policy.state_dict(),
+            'vit': vit.state_dict(),
+            'gnn': gnn.state_dict(),
+            'fusion': fusion.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'val_acc': val_acc
+        }, latest_path)
+        
+        # Save best checkpoint
+        if 'best_val_acc' not in locals() or val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_path = "checkpoints/bc_policy_best.pt"
+            torch.save({
+                'epoch': epoch,
+                'policy': policy.state_dict(),
+                'vit': vit.state_dict(),
+                'gnn': gnn.state_dict(),
+                'fusion': fusion.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'val_acc': val_acc
+            }, best_path)
+            print(f"  --> Saved new best checkpoint to {best_path} (Val Acc: {val_acc*100:.2f}%)")
+        
+    # Also save the final one to the expected path for Dreamer
+    final_path = "checkpoints/bc_pretrained_policy.pt"
+    import shutil
+    if os.path.exists("checkpoints/bc_policy_best.pt"):
+        shutil.copy("checkpoints/bc_policy_best.pt", final_path)
+        print(f"Pretraining complete. Copied best weights to {final_path}")
+    else:
+        # Fallback if best doesn't exist for some reason
+        torch.save({
+            'policy': policy.state_dict(),
+            'vit': vit.state_dict(),
+            'gnn': gnn.state_dict(),
+            'fusion': fusion.state_dict()
+        }, final_path)
+        print(f"Pretraining complete. Saved final weights to {final_path}")
 
 if __name__ == '__main__':
     main()
