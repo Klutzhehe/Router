@@ -352,7 +352,7 @@ def main():
     )
     
     print("\nStarting BC pretraining loop...")
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     for epoch in range(start_epoch, args.epochs):
         policy.train()
         if args.unfreeze_encoders:
@@ -373,7 +373,7 @@ def main():
             for p in list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters()):
                 assert p.grad is None, "Gradients are flowing into frozen encoders!"
                 
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1:02d} Train"):
             rasters = batch['raster'].to(device)
             layer_masks = batch['layer_mask'].to(device)
             cursor_poses = batch['cursor_pos'].to(device)
@@ -383,7 +383,7 @@ def main():
             valid_masks = batch['valid_mask'].to(device)
             steps_remainings = batch['steps_remaining'].to(device)
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 # Run ViT on the entire batch at once
                 if not args.unfreeze_encoders:
                     with torch.no_grad():
@@ -443,7 +443,7 @@ def main():
         val_steps_count = 0
         
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1:02d} Val  ", leave=False):
                 rasters = batch['raster'].to(device)
                 cursor_poses = batch['cursor_pos'].to(device)
                 target_poses = batch['target_pos'].to(device)
@@ -452,7 +452,7 @@ def main():
                 valid_masks = batch['valid_mask'].to(device)
                 steps_remainings = batch['steps_remaining'].to(device)
                 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     # Run ViT on the entire batch at once
                     spatial_patches, _ = vit(rasters)
                     
