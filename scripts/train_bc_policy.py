@@ -282,14 +282,7 @@ def main():
     
     policy = RouteStepPolicy(embed_dim=vit_cfg['embed_dim']).to(device)
     
-    # Optional load checkpoint
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"Loading checkpoint weights from {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        vit.load_state_dict(ckpt.get('vit', ckpt))
-        gnn.load_state_dict(ckpt.get('gnn', ckpt))
-        fusion.load_state_dict(ckpt.get('fusion', ckpt))
-        
+
     # Freezing logic
     if not args.unfreeze_encoders:
         print("Freezing encoder (ViT, GNN, Fusion) parameters...")
@@ -312,6 +305,35 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine decay
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
+    start_epoch = 0
+    best_val_acc = 0.0
+    
+    # Optional load checkpoint for resume
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"Loading checkpoint weights from {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        if 'vit' in ckpt:
+            vit.load_state_dict(ckpt['vit'])
+        if 'gnn' in ckpt:
+            gnn.load_state_dict(ckpt['gnn'])
+        if 'fusion' in ckpt:
+            fusion.load_state_dict(ckpt['fusion'])
+        if 'policy' in ckpt:
+            policy.load_state_dict(ckpt['policy'])
+        if 'optimizer' in ckpt and args.unfreeze_encoders:
+            # Only load optimizer if we aren't changing freezing logic mid-run
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                if 'scheduler' in ckpt:
+                    scheduler.load_state_dict(ckpt['scheduler'])
+            except Exception as e:
+                print(f"Warning: Could not load optimizer/scheduler state (likely param group mismatch): {e}")
+        
+        start_epoch = ckpt.get('epoch', -1) + 1
+        best_val_acc = ckpt.get('val_acc', 0.0)
+        print(f"Resuming from epoch {start_epoch} (Best Val Acc: {best_val_acc*100:.2f}%)")
+
+    
     criterion_action = nn.CrossEntropyLoss()
     criterion_value = nn.MSELoss()
     
@@ -327,7 +349,7 @@ def main():
     )
     
     print("\nStarting BC pretraining loop...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         policy.train()
         if args.unfreeze_encoders:
             vit.train()
