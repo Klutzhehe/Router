@@ -1218,7 +1218,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                     with torch.cuda.amp.autocast(enabled=self.use_amp):
                         # Use weighted BCE to handle the massive class imbalance of sparse path pixels
                         # Cast to float32 to prevent underflow or NaN issues with BCE in float16
-                        bce_loss = F.binary_cross_entropy(pred_selected.to(torch.float32), target_heatmap.to(torch.float32), reduction='none')
+                        with torch.cuda.amp.autocast(enabled=False):
+                            bce_loss = F.binary_cross_entropy(pred_selected.float(), target_heatmap.float(), reduction='none')
                         weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
                         loss_dec = (bce_loss * weight_mask).mean()
                     
