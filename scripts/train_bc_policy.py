@@ -163,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--unfreeze_encoders', action='store_true', default=False)
     parser.add_argument('--checkpoint', type=str, default=None)
     args = parser.parse_args()
@@ -351,7 +351,7 @@ def main():
             loss_action = criterion_action(masked_logits, actions)
             loss_val = criterion_value(value.squeeze(-1), steps_remainings)
             
-            loss = loss_action + 0.1 * loss_val
+            loss = loss_action + 0.001 * loss_val
             
             optimizer.zero_grad()
             loss.backward()
@@ -399,7 +399,7 @@ def main():
                 
                 loss_action = criterion_action(masked_logits, actions)
                 loss_val = criterion_value(value.squeeze(-1), steps_remainings)
-                loss = loss_action + 0.1 * loss_val
+                loss = loss_action + 0.001 * loss_val
                 
                 val_loss += loss.item() * rasters.size(0)
                 preds = masked_logits.argmax(dim=-1)
