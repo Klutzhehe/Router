@@ -182,15 +182,26 @@ def main():
         raise FileNotFoundError("No dataset shards found in data/bc_dataset/. Run scripts/generate_bc_dataset.py first.")
         
     for p in shard_paths:
-        with open(p, "rb") as f:
-            stage_episodes = pickle.load(f)
-            # Add steps_remaining labels
-            for ep in stage_episodes:
-                L = len(ep)
-                for i, step in enumerate(ep):
-                    step['steps_remaining'] = L - 1 - i
-            all_episodes.extend(stage_episodes)
-            print(f"Loaded {len(stage_episodes)} episodes from {p}")
+        if os.path.getsize(p) == 0:
+            print(f"Skipping empty dataset shard: {p}")
+            continue
+        try:
+            with open(p, "rb") as f:
+                stage_episodes = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError) as e:
+            print(f"Warning: Failed to load corrupted dataset shard {p}: {e}. Skipping...")
+            continue
+            
+        # Add steps_remaining labels
+        for ep in stage_episodes:
+            L = len(ep)
+            for i, step in enumerate(ep):
+                step['steps_remaining'] = L - 1 - i
+        all_episodes.extend(stage_episodes)
+        print(f"Loaded {len(stage_episodes)} episodes from {p}")
+        
+    if not all_episodes:
+        raise ValueError("No valid episodes could be loaded from dataset shards! Ensure scripts/generate_bc_dataset.py completes successfully.")
             
     # 2. Train/val split by episode
     random.seed(42)
