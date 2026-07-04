@@ -249,21 +249,24 @@ class RoutingSession:
         net     = unrouted[0]
         net_idx = next(i for i, n in enumerate(env.board.nets) if n.id == net.id)
 
-        raster_t   = torch.tensor(self.obs['board_raster'], dtype=torch.float32).unsqueeze(0)
-        layer_mask = torch.tensor(self.obs['layer_mask'],   dtype=torch.float32).unsqueeze(0)
+        raster_t   = torch.tensor(self.obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.trainer.device)
+        layer_mask = torch.tensor(self.obs['layer_mask'],   dtype=torch.float32).unsqueeze(0).to(self.trainer.device)
 
         graph = self.info['graph']
         if hasattr(graph, 'x_dict'):
-            x_dict          = {k: v for k, v in graph.x_dict.items()}
-            edge_index_dict = {k: v for k, v in graph.edge_index_dict.items()}
+            x_dict          = {k: v.to(self.trainer.device) for k, v in graph.x_dict.items()}
+            edge_index_dict = {k: v.to(self.trainer.device) for k, v in graph.edge_index_dict.items()}
         else:
-            x_dict          = {k: v['x'] for k, v in graph.items() if isinstance(v, dict) and 'x' in v}
-            edge_index_dict = {k: v for k, v in graph.items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
+            x_dict          = {k: v['x'].to(self.trainer.device) for k, v in graph.items() if isinstance(v, dict) and 'x' in v}
+            edge_index_dict = {k: v.to(self.trainer.device) for k, v in graph.items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
 
         board_before = env.board_state.clone()
         board_before.set_current_net(net.id)
 
-        with torch.no_grad():
+        # Autocast on cuda devices
+        amp_ctx = torch.autocast(device_type=self.trainer.device.type, enabled=(self.trainer.device.type == 'cuda'))
+
+        with torch.no_grad(), amp_ctx:
             if self.is_dreamer:
                 ctx = self.trainer.jepa.get_context_embedding(raster_t, x_dict, edge_index_dict, use_target=False)
                 ne, _, fs = self.trainer._get_net_embeddings_and_mask(raster_t, x_dict, edge_index_dict)
@@ -278,7 +281,7 @@ class RoutingSession:
                 ne2   = self.trainer.gnn(x_dict, edge_index_dict)
                 fp, fs = self.trainer.fusion(ne2['pad'].unsqueeze(0), sp)
                 nN    = len(env.board.nets)
-                nEmbs = torch.zeros((1, nN, self.trainer.vit.embed_dim))
+                nEmbs = torch.zeros((1, nN, self.trainer.vit.embed_dim), device=self.trainer.device)
                 for ni, n in enumerate(env.board.nets):
                     pi = [i for i, p in enumerate(env.board.pins.values()) if p.net_id == n.id]
                     if pi:
