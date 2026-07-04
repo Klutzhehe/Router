@@ -51,16 +51,16 @@ def generate_dataset():
             print(f"Skipping {stage_name} (not found in curriculum)")
             continue
             
-        shard_path = f"data/bc_dataset/{stage_name}.pkl"
-        if os.path.exists(shard_path) and os.path.getsize(shard_path) > 0:
-            print(f"Dataset shard {shard_path} already exists. Skipping stage {stage_name}...")
+        import glob
+        existing_eps = glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl")
+        if len(existing_eps) >= episodes_per_stage:
+            print(f"Dataset for {stage_name} already generated ({len(existing_eps)} episodes). Skipping...")
             continue
             
         stage_idx = stage_idx_map[stage_name]
         curriculum.current_stage_idx = stage_idx
         
         print(f"\n--- Generating BC Dataset for Curriculum Stage: {stage_name} ---")
-        dataset_episodes = []
         
         # Use PCBRoutingEnv in astar_guided mode to run A* expert
         env = PCBRoutingEnv(
@@ -77,11 +77,16 @@ def generate_dataset():
             routing_mode='autoregressive'
         )
         
-        successful_episodes = 0
-        pbar = tqdm(total=episodes_per_stage, desc=f"Stage {stage_name}")
+        successful_episodes = len(glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl"))
+        pbar = tqdm(total=episodes_per_stage, initial=successful_episodes, desc=f"Stage {stage_name}")
         
         seed = 42
         while successful_episodes < episodes_per_stage:
+            ep_shard_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl"
+            if os.path.exists(ep_shard_path) and os.path.getsize(ep_shard_path) > 0:
+                seed += 1
+                continue
+                
             print(f"\n  [Seed {seed}] Generating environment...", end="", flush=True)
             obs, info = env.reset(seed=seed)
             print(" generated successfully.", flush=True)
@@ -273,7 +278,11 @@ def generate_dataset():
                         
                 if val_success and len(val_env.routed_nets) == len(episode_nets):
                     print(" PASSED.", flush=True)
-                    dataset_episodes.append(episode_transitions)
+                    
+                    # Save immediately to disk, freeing memory!
+                    with open(ep_shard_path, "wb") as f:
+                        pickle.dump([episode_transitions], f)
+                        
                     successful_episodes += 1
                     pbar.update(1)
                 else:
@@ -281,13 +290,7 @@ def generate_dataset():
             seed += 1
                     
         pbar.close()
-        
-        shard_path = f"data/bc_dataset/{stage_name}.pkl"
-        print(f"Serializing and saving dataset shard to {shard_path} (this can take a moment due to dense numpy arrays and PyG graphs)...", flush=True)
-        with open(shard_path, "wb") as f:
-            pickle.dump(dataset_episodes, f)
-        total_transitions = sum(len(ep) for ep in dataset_episodes)
-        print(f"Saved {len(dataset_episodes)} episodes ({total_transitions} transitions) to {shard_path}\n")
+        print(f"Finished generating stage {stage_name}.\n")
         
 if __name__ == '__main__':
     generate_dataset()
