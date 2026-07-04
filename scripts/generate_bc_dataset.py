@@ -64,6 +64,13 @@ def generate_dataset():
             reward_weights=curriculum.get_reward_weights(),
             routing_mode='astar_guided'
         )
+        # Instantiate validation environment once per stage
+        val_env = PCBRoutingEnv(
+            board_config=curriculum.get_board_config(),
+            curriculum_stage=curriculum.current_stage,
+            reward_weights=curriculum.get_reward_weights(),
+            routing_mode='autoregressive'
+        )
         
         successful_episodes = 0
         pbar = tqdm(total=episodes_per_stage, desc=f"Stage {stage_name}")
@@ -236,12 +243,6 @@ def generate_dataset():
                 
             if episode_success:
                 print("    Running deterministic reconstruction check...", end="", flush=True)
-                val_env = PCBRoutingEnv(
-                    board_config=curriculum.get_board_config(),
-                    curriculum_stage=curriculum.current_stage,
-                    reward_weights=curriculum.get_reward_weights(),
-                    routing_mode='autoregressive'
-                )
                 val_env.set_board(episode_board)
                 
                 t_idx = 0
