@@ -138,7 +138,10 @@ def evaluate_closed_loop(env, policy, vit, gnn, fusion, device, num_episodes=5):
                 env.start_routing_net(net_idx)
                 
                 net_done = False
-                while not net_done:
+                max_steps = env.W * env.H * 2  # generous cap: 2x board cells
+                steps = 0
+                while not net_done and steps < max_steps:
+                    steps += 1
                     # Get observations
                     raster_tensor = torch.tensor(env._get_obs()['board_raster'], dtype=torch.float32).unsqueeze(0).to(device)
                     layer_mask = torch.tensor(env._get_obs()['layer_mask'], dtype=torch.float32).unsqueeze(0).to(device)
@@ -176,7 +179,7 @@ def evaluate_closed_loop(env, policy, vit, gnn, fusion, device, num_episodes=5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--unfreeze_encoders', action='store_true', default=False)
