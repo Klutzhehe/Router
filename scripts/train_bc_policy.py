@@ -20,28 +20,58 @@ from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.training.curriculum import CurriculumManager
 from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 
-class BCDataset(Dataset):
-    def __init__(self, transitions):
-        self.transitions = transitions
+from torch.utils.data import IterableDataset
 
-    def __len__(self):
-        return len(self.transitions)
+class BCIterableDataset(IterableDataset):
+    def __init__(self, file_paths, shuffle=False):
+        self.file_paths = file_paths
+        self.shuffle = shuffle
 
-    def __getitem__(self, idx):
-        t = self.transitions[idx]
-        
-        return {
-            'raster': torch.tensor(t['raster'], dtype=torch.float32),
-            'layer_mask': torch.tensor(t['layer_mask'], dtype=torch.float32),
-            'cursor_pos': torch.tensor(t['cursor_pos'], dtype=torch.float32),
-            'target_pos': torch.tensor(t['target_pos'], dtype=torch.float32),
-            'moves_remaining_frac': torch.tensor(t['moves_remaining_frac'], dtype=torch.float32),
-            'action': torch.tensor(t['action'], dtype=torch.long),
-            'valid_mask': torch.tensor(t['valid_mask'], dtype=torch.bool),
-            'steps_remaining': torch.tensor(t.get('steps_remaining', 0.0), dtype=torch.float32),
-            'graph': t['graph'],
-            'orig_size': torch.tensor(t['raster'].shape[1:], dtype=torch.float32)
-        }
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            paths = list(self.file_paths)
+        else:
+            per_worker = int(math.ceil(len(self.file_paths) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            paths = self.file_paths[worker_id * per_worker : (worker_id + 1) * per_worker]
+            
+        import random
+        if self.shuffle:
+            random.shuffle(paths)
+            
+        for p in paths:
+            import gzip, pickle
+            open_func = gzip.open if p.endswith('.gz') else open
+            try:
+                with open_func(p, "rb") as f:
+                    episodes = pickle.load(f)
+            except Exception:
+                continue
+                
+            transitions = []
+            for ep in episodes:
+                L = len(ep)
+                for i, step in enumerate(ep):
+                    step['steps_remaining'] = float(L - 1 - i)
+                    transitions.append(step)
+                    
+            if self.shuffle:
+                random.shuffle(transitions)
+                
+            for t in transitions:
+                yield {
+                    'raster': torch.tensor(t['raster'], dtype=torch.float32),
+                    'layer_mask': torch.tensor(t['layer_mask'], dtype=torch.float32),
+                    'cursor_pos': torch.tensor(t['cursor_pos'], dtype=torch.float32),
+                    'target_pos': torch.tensor(t['target_pos'], dtype=torch.float32),
+                    'moves_remaining_frac': torch.tensor(t['moves_remaining_frac'], dtype=torch.float32),
+                    'action': torch.tensor(t['action'], dtype=torch.long),
+                    'valid_mask': torch.tensor(t['valid_mask'], dtype=torch.bool),
+                    'steps_remaining': torch.tensor(t['steps_remaining'], dtype=torch.float32),
+                    'graph': t['graph'],
+                    'orig_size': torch.tensor(t['raster'].shape[1:], dtype=torch.float32)
+                }
 
 def collate_fn(batch):
     # Find max H and W in this batch
@@ -191,62 +221,53 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # 1. Load dataset shards
-    all_episodes = []
+    # 1. Gather all file paths
     shard_paths = glob.glob(os.path.join(args.data_dir, "*.pkl.gz")) + glob.glob(os.path.join(args.data_dir, "*.pkl"))
     if not shard_paths:
         raise FileNotFoundError(f"No dataset shards found in {args.data_dir}/. Run scripts/generate_bc_dataset.py first.")
         
-    for p in shard_paths:
-        if os.path.getsize(p) == 0:
-            print(f"Skipping empty dataset shard: {p}")
-            continue
-        try:
-            import gzip
-            open_func = gzip.open if p.endswith('.gz') else open
-            with open_func(p, "rb") as f:
-                stage_episodes = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError) as e:
-            print(f"Warning: Failed to load corrupted dataset shard {p}: {e}. Skipping...")
-            continue
-            
-        # Add steps_remaining labels
-        for ep in stage_episodes:
-            L = len(ep)
-            for i, step in enumerate(ep):
-                step['steps_remaining'] = L - 1 - i
-        all_episodes.extend(stage_episodes)
-        print(f"Loaded {len(stage_episodes)} episodes from {p}")
-        
-    if not all_episodes:
-        raise ValueError("No valid episodes could be loaded from dataset shards! Ensure scripts/generate_bc_dataset.py completes successfully.")
-            
-    # 2. Train/val split by episode
+    # 2. Train/val split by file
     random.seed(42)
-    random.shuffle(all_episodes)
-    split_idx = int(len(all_episodes) * 0.8)
-    train_episodes = all_episodes[:split_idx]
-    val_episodes = all_episodes[split_idx:]
+    random.shuffle(shard_paths)
+    split_idx = int(len(shard_paths) * 0.8)
+    train_paths = shard_paths[:split_idx]
+    val_paths = shard_paths[split_idx:]
     
-    # Flatten episodes to transition datasets
-    train_transitions = [step for ep in train_episodes for step in ep]
-    val_transitions = [step for ep in val_episodes for step in ep]
+    # Quickly count transitions to compute accurate loss averages
+    def count_transitions(paths):
+        count = 0
+        import gzip, pickle
+        for p in paths:
+            try:
+                open_func = gzip.open if p.endswith('.gz') else open
+                with open_func(p, "rb") as f:
+                    ep = pickle.load(f)
+                count += sum(len(e) for e in ep)
+            except Exception:
+                pass
+        return count
+        
+    print("Counting dataset sizes (this takes a moment but prevents memory crashes)...")
+    train_len = count_transitions(train_paths)
+    val_len = count_transitions(val_paths)
+    if train_len == 0 or val_len == 0:
+        raise ValueError("Failed to load valid episodes! Ensure the dataset is not empty.")
     
-    train_dataset = BCDataset(train_transitions)
-    val_dataset = BCDataset(val_transitions)
+    print(f"Training set: {train_len} steps, Validation set: {val_len} steps")
+    
+    train_dataset = BCIterableDataset(train_paths, shuffle=True)
+    val_dataset = BCIterableDataset(val_paths, shuffle=False)
     
     # num_workers=4: data loading runs in parallel background threads, freeing GPU
     # pin_memory=True: enables faster CPU→GPU tensor transfers
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
+        train_dataset, batch_size=args.batch_size,
         collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
+        val_dataset, batch_size=args.batch_size,
         collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
-    
-    print(f"Training set: {len(train_dataset)} steps, Validation set: {len(val_dataset)} steps")
     
     # 3. Init encoders and policy
     # We load default model config to setup encoders
@@ -423,8 +444,8 @@ def main():
             preds = masked_logits.argmax(dim=-1)
             train_acc += (preds == actions).sum().item()
             
-        train_loss /= len(train_dataset)
-        train_acc /= len(train_dataset)
+        train_loss /= train_len
+        train_acc /= train_len
         
         # Validation pass
         policy.eval()
@@ -467,8 +488,8 @@ def main():
                 preds = masked_logits.argmax(dim=-1)
                 val_acc += (preds == actions).sum().item()
                 
-        val_loss /= len(val_dataset)
-        val_acc /= len(val_dataset)
+        val_loss /= val_len
+        val_acc /= val_len
         
         # Closed-loop evaluation — expensive, run every 10 epochs only
         if (epoch + 1) % 10 == 0 or epoch == 0:
