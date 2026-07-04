@@ -283,6 +283,7 @@ def generate_dataset():
         pbar.close()
         
         shard_path = f"data/bc_dataset/{stage_name}.pkl"
+        print(f"Serializing and saving dataset shard to {shard_path} (this can take a moment due to dense numpy arrays and PyG graphs)...", flush=True)
         with open(shard_path, "wb") as f:
             pickle.dump(dataset_episodes, f)
         total_transitions = sum(len(ep) for ep in dataset_episodes)
