@@ -991,6 +991,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         self.scaler_ac = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         self.replay_buffer = ReplayBuffer(capacity_episodes=t_cfg.get('replay_buffer_size', 5000))
+        self.replay_buffer.latent_cache_capacity = t_cfg.get('latent_cache_capacity', 10000)
         
         self.imagination_horizon_start = t_cfg.get('imagination_horizon_start', 5)
         self.imagination_horizon_end = t_cfg.get('imagination_horizon_end', 15)
@@ -1155,33 +1156,34 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
                 layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
                 
-                # 1. Forward pass WITH gradients enabled for supervised path training
-                context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
-                target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
-                net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
-                
-                # Run policy forward to select net and sample heatmap_latent (differentiable rsample)
-                net_idx_tensor, log_prob_net, ent_net = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
-                
-                selected_net_emb = net_embs[0, net_idx_tensor.item()].unsqueeze(0)
-                state = torch.cat([h, z], dim=-1)
-                x_feat = torch.cat([selected_net_emb, state], dim=-1)
-                h_feat = self.policy.heatmap_mlp(x_feat)
-                mean = self.policy.heatmap_mean(h_feat)
-                log_std = torch.clamp(self.policy.heatmap_log_std, min=-20.0, max=2.0).expand_as(mean)
-                std = torch.exp(log_std)
-                
-                dist = torch.distributions.Normal(mean, std)
-                if not explore:
-                    heatmap_latent = mean
-                else:
-                    heatmap_latent = dist.rsample()  # Differentiable path!
-                
-                # Decode heatmap using current fused_spatial
-                heatmaps_via = self.decoder(
-                    heatmap_latent, fused_spatial,
-                    self.env.H, self.env.W, active_layers_mask=layer_mask
-                )
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    # 1. Forward pass WITH gradients enabled for supervised path training
+                    context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
+                    target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
+                    net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
+                    
+                    # Run policy forward to select net and sample heatmap_latent (differentiable rsample)
+                    net_idx_tensor, log_prob_net, ent_net = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
+                    
+                    selected_net_emb = net_embs[0, net_idx_tensor.item()].unsqueeze(0)
+                    state = torch.cat([h, z], dim=-1)
+                    x_feat = torch.cat([selected_net_emb, state], dim=-1)
+                    h_feat = self.policy.heatmap_mlp(x_feat)
+                    mean = self.policy.heatmap_mean(h_feat)
+                    log_std = torch.clamp(self.policy.heatmap_log_std, min=-20.0, max=2.0).expand_as(mean)
+                    std = torch.exp(log_std)
+                    
+                    dist = torch.distributions.Normal(mean, std)
+                    if not explore:
+                        heatmap_latent = mean
+                    else:
+                        heatmap_latent = dist.rsample()  # Differentiable path!
+                    
+                    # Decode heatmap using current fused_spatial
+                    heatmaps_via = self.decoder(
+                        heatmap_latent, fused_spatial,
+                        self.env.H, self.env.W, active_layers_mask=layer_mask
+                    )
                 
                 # Step the environment using detached numpy arrays
                 heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].detach().cpu().numpy()
@@ -1213,10 +1215,12 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                     pred_via = heatmaps_via[0, 8:9]
                     pred_selected = torch.cat([pred_layers, pred_via], dim=0)
                     
-                    # Use weighted BCE to handle the massive class imbalance of sparse path pixels
-                    bce_loss = F.binary_cross_entropy(pred_selected, target_heatmap, reduction='none')
-                    weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
-                    loss_dec = (bce_loss * weight_mask).mean()
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        # Use weighted BCE to handle the massive class imbalance of sparse path pixels
+                        # Cast to float32 to prevent underflow or NaN issues with BCE in float16
+                        bce_loss = F.binary_cross_entropy(pred_selected.to(torch.float32), target_heatmap.to(torch.float32), reduction='none')
+                        weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
+                        loss_dec = (bce_loss * weight_mask).mean()
                     
                     self.actor_opt.zero_grad(set_to_none=True)
                     self.wm_opt.zero_grad(set_to_none=True)
@@ -1299,32 +1303,23 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 start = 0
                 end = ep.length
             
-            ctx_slice = ep.context_embeddings[start:end]
-            tgt_slice = getattr(ep, 'target_context_embeddings', ep.context_embeddings)[start:end]
-            act_slice = ep.actions[start:end]
-            rew_slice = ep.rewards[start:end]
-            done_slice = ep.dones[start:end]
+            ctx_tensor = ep.context_embeddings_tensor[start:end]
+            tgt_tensor = ep.target_context_embeddings_tensor[start:end]
+            net_tensor = ep.net_actions_tensor[start:end]
+            heat_tensor = ep.heatmap_actions_tensor[start:end]
+            rew_tensor = ep.rewards_tensor[start:end]
+            cont_tensor = 1.0 - ep.dones_tensor[start:end].to(torch.float32)
+            mask_tensor = torch.ones(end - start, dtype=torch.float32)
             
-            net_act = [a[0] for a in act_slice]
-            heat_act = [a[1] for a in act_slice]
-            
-            ctx_tensor = torch.stack(ctx_slice)
-            tgt_tensor = torch.stack(tgt_slice)
-            net_tensor = torch.stack(net_act)
-            heat_tensor = torch.stack(heat_act)
-            rew_tensor = torch.tensor(rew_slice, dtype=torch.float32)
-            cont_tensor = 1.0 - torch.tensor(done_slice, dtype=torch.float32)
-            mask_tensor = torch.ones(len(ctx_slice), dtype=torch.float32)
-            
-            pad_len = seq_len - len(ctx_slice)
+            pad_len = seq_len - (end - start)
             if pad_len > 0:
-                ctx_tensor = torch.cat([ctx_tensor, torch.zeros(pad_len, 768)], dim=0)
-                tgt_tensor = torch.cat([tgt_tensor, torch.zeros(pad_len, 768)], dim=0)
-                net_tensor = torch.cat([net_tensor, torch.zeros(pad_len, dtype=torch.long)], dim=0)
-                heat_tensor = torch.cat([heat_tensor, torch.zeros(pad_len, 256)], dim=0)
-                rew_tensor = torch.cat([rew_tensor, torch.zeros(pad_len)], dim=0)
-                cont_tensor = torch.cat([cont_tensor, torch.zeros(pad_len)], dim=0)
-                mask_tensor = torch.cat([mask_tensor, torch.zeros(pad_len)], dim=0)
+                ctx_tensor = torch.cat([ctx_tensor, torch.zeros(pad_len, ctx_tensor.shape[-1], dtype=ctx_tensor.dtype, device=ctx_tensor.device)], dim=0)
+                tgt_tensor = torch.cat([tgt_tensor, torch.zeros(pad_len, tgt_tensor.shape[-1], dtype=tgt_tensor.dtype, device=tgt_tensor.device)], dim=0)
+                net_tensor = torch.cat([net_tensor, torch.zeros(pad_len, dtype=net_tensor.dtype, device=net_tensor.device)], dim=0)
+                heat_tensor = torch.cat([heat_tensor, torch.zeros(pad_len, heat_tensor.shape[-1], dtype=heat_tensor.dtype, device=heat_tensor.device)], dim=0)
+                rew_tensor = torch.cat([rew_tensor, torch.zeros(pad_len, dtype=rew_tensor.dtype, device=rew_tensor.device)], dim=0)
+                cont_tensor = torch.cat([cont_tensor, torch.zeros(pad_len, dtype=cont_tensor.dtype, device=cont_tensor.device)], dim=0)
+                mask_tensor = torch.cat([mask_tensor, torch.zeros(pad_len, dtype=mask_tensor.dtype, device=mask_tensor.device)], dim=0)
                 
             b_ctx.append(ctx_tensor)
             b_tgt_ctx.append(tgt_tensor)

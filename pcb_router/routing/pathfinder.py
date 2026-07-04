@@ -7,46 +7,32 @@ class AStarPathfinder:
         self.direction_change_penalty = direction_change_penalty
         self.base_via_cost = base_via_cost
         self.heatmap_weight = heatmap_weight
-        # Occupancy threshold above which a cell is treated as blocked
         self.obstacle_threshold = 0.5
-        
-        # 8-directional moves: (dx, dy, is_diagonal)
         self.moves = [
-            (0, 1, False),   # N
-            (0, -1, False),  # S
-            (1, 0, False),   # E
-            (-1, 0, False),  # W
-            (1, 1, True),    # NE
-            (1, -1, True),   # SE
-            (-1, 1, True),   # NW
-            (-1, -1, True)   # SW
+            (0, 1, False), (0, -1, False), (1, 0, False), (-1, 0, False),
+            (1, 1, True), (1, -1, True), (-1, 1, True), (-1, -1, True)
         ]
+        self.SQRT2_MINUS_2 = math.sqrt(2.0) - 2.0
+        self._visited_buf = None
+        self._parent_x_buf = None
+        self._parent_y_buf = None
+        self._parent_l_buf = None
+        self._parent_dir_buf = None
 
     def _heuristic(self, p1, p2):
         """3D heuristic: 2D distance + layer transition cost estimation"""
         x1, y1, z1 = p1
         x2, y2, z2 = p2
-        # Use diagonal distance for 2D
         dx = abs(x1 - x2)
         dy = abs(y1 - y2)
-        d2d = (dx + dy) + (math.sqrt(2.0) - 2.0) * min(dx, dy)
-        
-        # If either coordinate is on layer -1 (through-hole), layer transition cost to connect is 0
+        d2d = (dx + dy) + self.SQRT2_MINUS_2 * min(dx, dy)
         z_dist = 0 if (z1 == -1 or z2 == -1) else abs(z1 - z2)
         d3d = d2d + z_dist * self.base_via_cost
-        # Scale heuristic to match step cost scale, preventing search timeouts (200k max_iterations)
         return d3d * (1.0 + self.heatmap_weight)
 
     def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=30000, board_state=None):
         """
         Find path from source (x, y, layer) to target (x, y, layer)
-        Args:
-            heatmaps: numpy array of shape (N_layers, H, W) — high values = PREFERRED routing areas
-            via_prob: numpy array of shape (H, W) containing via placing confidence [0, 1]
-            source: tuple (x, y, layer)
-            target: tuple (x, y, layer)
-            active_layers: list of active layer indices
-            board_state: optional BoardState for obstacle blocking
         """
         N_layers, H, W = heatmaps.shape
         active_layers_set = set(active_layers)
@@ -63,14 +49,20 @@ class AStarPathfinder:
             p_sl = 0 if sl == -1 else sl
             return [(sx, sy, p_sl)], 0.0
 
+        exempt = {(sx, sy), (tx, ty)}
+
         # Pre-build obstacle maps per layer (cells that are blocked to traversal).
         # Source and target cells are always passable regardless of occupancy.
-        exempt = {(sx, sy), (tx, ty)}
-        obstacle_maps = {}  # layer -> 2D bool array, True = blocked
-        if board_state is not None:
-            for l in active_layers:
+        temp_obstacle_maps = {}
+        for l in active_layers:
+            if board_state is not None:
                 occ = board_state.get_occupancy(l)  # (H, W) float, 1.0 = occupied
-                obstacle_maps[l] = occ >= self.obstacle_threshold
+                t_map = (occ >= self.obstacle_threshold).copy()
+                for ex_x, ex_y in exempt:
+                    t_map[ex_y, ex_x] = False
+                temp_obstacle_maps[l] = t_map
+            else:
+                temp_obstacle_maps[l] = np.zeros((H, W), dtype=bool)
 
         # Compute via clearance offsets
         via_clearance_offsets = []
@@ -95,114 +87,149 @@ class AStarPathfinder:
         else:
             via_clearance_offsets = [(0, 0)]
 
-        # Priority Queue: stores tuples of (f_score, g_score, (x, y, layer), last_direction)
+        # Precompute via blockage per layer using NumPy shift-based dilation
+        via_blocked = {}
+        for l in active_layers:
+            obs = temp_obstacle_maps[l]
+            blocked = np.zeros_like(obs)
+            for dx, dy in via_clearance_offsets:
+                shifted = np.ones_like(obs)
+                y_start_dst = max(0, -dy)
+                y_end_dst = min(H, H - dy)
+                y_start_src = max(0, dy)
+                y_end_src = min(H, H + dy)
+                x_start_dst = max(0, -dx)
+                x_end_dst = min(W, W - dx)
+                x_start_src = max(0, dx)
+                x_end_src = min(W, W + dx)
+                if y_start_dst < y_end_dst and x_start_dst < x_end_dst:
+                    shifted[y_start_dst:y_end_dst, x_start_dst:x_end_dst] = obs[y_start_src:y_end_src, x_start_src:x_end_src]
+                blocked |= shifted
+            via_blocked[l] = blocked
+
+        # Allocate or reuse 4D visited and parent arrays
+        if (self._visited_buf is None or 
+            self._visited_buf.shape[0] < N_layers or 
+            self._visited_buf.shape[1] < H or 
+            self._visited_buf.shape[2] < W):
+            pad_layers = max(N_layers, 8)
+            pad_H = max(H, 512)
+            pad_W = max(W, 512)
+            self._visited_buf = np.full((pad_layers, pad_H, pad_W, 11), np.inf, dtype=np.float32)
+            self._parent_x_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int16)
+            self._parent_y_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int16)
+            self._parent_l_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int8)
+            self._parent_dir_buf = np.full((pad_layers, pad_H, pad_W, 11), -1, dtype=np.int8)
+
+        visited = self._visited_buf[:N_layers, :H, :W, :]
+        visited.fill(np.inf)
+        
+        parent_x = self._parent_x_buf[:N_layers, :H, :W, :]
+        parent_y = self._parent_y_buf[:N_layers, :H, :W, :]
+        parent_l = self._parent_l_buf[:N_layers, :H, :W, :]
+        parent_dir = self._parent_dir_buf[:N_layers, :H, :W, :]
+
+        # We only need to reset start node parents to -1, which they default to.
+        if sl == -1:
+            for l in active_layers:
+                parent_x[l, sy, sx, 0] = -1
+        else:
+            parent_x[sl, sy, sx, 0] = -1
+
+        # Priority Queue: stores tuples of (f_score, g_score, (x, y, layer), last_direction_idx)
         pq = []
         if sl == -1:
             for l in active_layers:
                 start_node = (sx, sy, l)
-                heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, (0, 0, 0)))
+                heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, 0))
         else:
             start_node = source
-            heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, (0, 0, 0)))
-        
-        came_from = {}  # key: (pos, last_dir) -> parent (pos, last_dir)
-        visited = {}    # key: (pos, last_dir) -> g_score
+            heapq.heappush(pq, (self._heuristic(start_node, target), 0.0, start_node, 0))
         
         iterations = 0
         
         while pq and iterations < max_iterations:
             iterations += 1
-            f, g, curr, last_dir = heapq.heappop(pq)
+            f, g, curr, last_dir_idx = heapq.heappop(pq)
+            cx, cy, cl = curr
             
             # Target reached check
-            is_reached = (curr[0] == tx and curr[1] == ty) if tl == -1 else (curr == target)
+            is_reached = (cx == tx and cy == ty) if tl == -1 else (curr == target)
             if is_reached:
                 # Reconstruct path
                 path = []
-                temp = (curr, last_dir)
-                while temp in came_from:
-                    path.append(temp[0])
-                    temp = came_from[temp]
-                path.append(temp[0])  # Append the physical start node
+                rx, ry, rl, rdir = cx, cy, cl, last_dir_idx
+                while rx != -1:
+                    path.append((int(rx), int(ry), int(rl)))
+                    px = parent_x[rl, ry, rx, rdir]
+                    py = parent_y[rl, ry, rx, rdir]
+                    pl = parent_l[rl, ry, rx, rdir]
+                    pdir = parent_dir[rl, ry, rx, rdir]
+                    rx, ry, rl, rdir = px, py, pl, pdir
                 path.reverse()
                 return path, g
                 
-            state_key = (curr, last_dir)
-            if state_key in visited and visited[state_key] < g:
+            if visited[cl, cy, cx, last_dir_idx] <= g:
                 continue
-            visited[state_key] = g
-            
-            cx, cy, cl = curr
+            visited[cl, cy, cx, last_dir_idx] = g
             
             # 1. Check Spatial Neighbors (same layer)
-            for dx, dy, is_diag in self.moves:
+            for i, (dx, dy, is_diag) in enumerate(self.moves):
                 nx, ny = cx + dx, cy + dy
                 
                 # Check boundaries
                 if 0 <= nx < W and 0 <= ny < H:
-                    # Skip obstacle cells (but always allow source/target)
-                    if cl in obstacle_maps and obstacle_maps[cl][ny, nx] and (nx, ny) not in exempt:
+                    # Skip obstacle cells
+                    if temp_obstacle_maps[cl][ny, nx]:
                         continue
                     
-                    # FIX: high heatmap value = policy PREFERS this cell → low cost
-                    # Invert: cost = 1 + w*(1 - h_val) so h_val=1 → cost=1, h_val=0 → cost=1+w
                     h_val = heatmaps[cl, ny, nx]
-                    step_len = math.sqrt(2.0) if is_diag else 1.0
+                    step_len = 1.4142135623730951 if is_diag else 1.0
                     step_cost = step_len * (1.0 + self.heatmap_weight * (1.0 - h_val))
                     
-                    # Direction change penalty
-                    new_dir = (dx, dy, 0)
-                    if last_dir != (0, 0, 0) and last_dir != new_dir:
+                    new_dir_idx = 1 + i
+                    if last_dir_idx != 0 and last_dir_idx != new_dir_idx:
                         step_cost += self.direction_change_penalty
                         
                     next_g = g + step_cost
                     next_pos = (nx, ny, cl)
                     
-                    next_state = (next_pos, new_dir)
-                    if next_state not in visited or visited[next_state] > next_g:
-                        visited[next_state] = next_g
-                        came_from[next_state] = state_key
+                    if visited[cl, ny, nx, new_dir_idx] > next_g:
+                        visited[cl, ny, nx, new_dir_idx] = next_g
+                        parent_x[cl, ny, nx, new_dir_idx] = cx
+                        parent_y[cl, ny, nx, new_dir_idx] = cy
+                        parent_l[cl, ny, nx, new_dir_idx] = cl
+                        parent_dir[cl, ny, nx, new_dir_idx] = last_dir_idx
                         next_f = next_g + self._heuristic(next_pos, target)
-                        heapq.heappush(pq, (next_f, next_g, next_pos, new_dir))
-                        total_pushes += 1
+                        heapq.heappush(pq, (next_f, next_g, next_pos, new_dir_idx))
             
             # 2. Check Layer Transitions (vias)
-            for dl in [-1, 1]:
+            for dl_idx, dl in enumerate([-1, 1]):
                 nl = cl + dl
                 if nl in active_layers_set:
-                    # Check via clearance on both current layer (cl) and target layer (nl)
-                    via_valid = True
-                    for dx, dy in via_clearance_offsets:
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < W and 0 <= ny < H:
-                            if (cl in obstacle_maps and obstacle_maps[cl][ny, nx] and (nx, ny) not in exempt) or \
-                               (nl in obstacle_maps and obstacle_maps[nl][ny, nx] and (nx, ny) not in exempt):
-                                via_valid = False
-                                break
-                        else:
-                            via_valid = False
-                            break
-                    if not via_valid:
+                    # Check precomputed via clearance
+                    if via_blocked[cl][cy, cx] or via_blocked[nl][cy, cx]:
                         continue
                         
                     # Via cost: base cost + penalty for low via probability
                     v_prob = via_prob[cy, cx]
                     via_cost = self.base_via_cost + (1.0 - v_prob) * self.base_via_cost
                     
-                    new_dir = (0, 0, dl)
-                    if last_dir != (0, 0, 0) and last_dir != new_dir:
+                    new_dir_idx = 9 + dl_idx
+                    if last_dir_idx != 0 and last_dir_idx != new_dir_idx:
                         via_cost += self.direction_change_penalty
                         
                     next_g = g + via_cost
                     next_pos = (cx, cy, nl)
                     
-                    next_state = (next_pos, new_dir)
-                    if next_state not in visited or visited[next_state] > next_g:
-                        visited[next_state] = next_g
-                        came_from[next_state] = state_key
+                    if visited[nl, cy, cx, new_dir_idx] > next_g:
+                        visited[nl, cy, cx, new_dir_idx] = next_g
+                        parent_x[nl, cy, cx, new_dir_idx] = cx
+                        parent_y[nl, cy, cx, new_dir_idx] = cy
+                        parent_l[nl, cy, cx, new_dir_idx] = cl
+                        parent_dir[nl, cy, cx, new_dir_idx] = last_dir_idx
                         next_f = next_g + self._heuristic(next_pos, target)
-                        heapq.heappush(pq, (next_f, next_g, next_pos, new_dir))
-                        total_pushes += 1
+                        heapq.heappush(pq, (next_f, next_g, next_pos, new_dir_idx))
                         
 
 

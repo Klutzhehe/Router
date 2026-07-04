@@ -30,7 +30,7 @@ lr_schedule:
   warmup_steps: 1000
   min_lr: 1.0e-6
 
-# Training
+# Training & DreamerV3 training hyperparameters
 training:
   total_timesteps: 5_000_000
   eval_interval: 10_000        # evaluate every N timesteps
@@ -38,26 +38,17 @@ training:
   log_interval: 1_000          # log metrics every N timesteps
   visual_save_interval: 5_000  # save PNG visual checkpoint every N timesteps (not every iteration)
   seed: 42
-
-# Checkpointing (for Colab session recovery)
-checkpoint:
-  save_dir: "checkpoints/"
-  keep_last_n: 3
-  save_optimizer: true
-  save_curriculum_state: true
-
-
-# DreamerV3 training hyperparameters
-training:
+  
   real_steps_per_iteration: 64
   train_ratio: 100
   replay_buffer_size: 5000
-  batch_size: 128
+  batch_size: 256              # increased from 128 for higher VRAM usage and faster training
   seq_len: 50
-  imagine_batch_size: 2048
+  imagine_batch_size: 4096     # increased from 2048 for higher VRAM usage and faster training
   imagination_horizon_start: 5
   imagination_horizon_end: 15
   imagination_horizon_ramp_iters: 20000
+  latent_cache_capacity: 500000 # increased from 10000; utilizes available RAM for historical diversity
 
   world_model_lr: 3.0e-4
   actor_lr: 8.0e-5
@@ -77,4 +68,11 @@ training:
   use_amp: true
   compile_models: true
   critic_target_ema: 0.98
+
+# Checkpointing (for Colab session recovery)
+checkpoint:
+  save_dir: "checkpoints/"
+  keep_last_n: 3
+  save_optimizer: true
+  save_curriculum_state: true
 

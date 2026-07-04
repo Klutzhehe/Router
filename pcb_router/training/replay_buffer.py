@@ -10,13 +10,60 @@ class Episode:
         self.rewards: List[float] = []
         self.dones: List[bool] = []
         self.length: int = 0
+        self._finalized = False
 
     def append(self, context_embedding: torch.Tensor, action: Tuple[torch.Tensor, torch.Tensor], reward: float, done: bool):
+        if self._finalized:
+            raise RuntimeError("Cannot append to a finalized episode.")
         self.context_embeddings.append(context_embedding)
         self.actions.append(action)
         self.rewards.append(reward)
         self.dones.append(done)
         self.length = len(self.context_embeddings)
+
+    def finalize(self):
+        """Convert list elements into contiguous PyTorch tensors on CPU to speed up sampling and save memory."""
+        if self._finalized:
+            return
+        if self.length == 0:
+            self._finalized = True
+            return
+            
+        # Convert lists to contiguous CPU tensors
+        self.context_embeddings_tensor = torch.stack(self.context_embeddings).cpu()
+        
+        net_act_list = [a[0] for a in self.actions]
+        self.net_actions_tensor = torch.stack(net_act_list).cpu() if isinstance(net_act_list[0], torch.Tensor) else torch.tensor(net_act_list, dtype=torch.long).cpu()
+        
+        heat_act_list = [a[1] for a in self.actions]
+        self.heatmap_actions_tensor = torch.stack(heat_act_list).cpu() if isinstance(heat_act_list[0], torch.Tensor) else torch.tensor(heat_act_list, dtype=torch.float32).cpu()
+        
+        self.rewards_tensor = torch.tensor(self.rewards, dtype=torch.float32).cpu()
+        self.dones_tensor = torch.tensor(self.dones, dtype=torch.bool).cpu()
+        
+        # Handle target_context_embeddings
+        if hasattr(self, 'target_context_embeddings') and self.target_context_embeddings:
+            self.target_context_embeddings_tensor = torch.stack(self.target_context_embeddings).cpu()
+        else:
+            self.target_context_embeddings_tensor = self.context_embeddings_tensor
+            
+        # Handle unrouted_masks
+        if hasattr(self, 'unrouted_masks'):
+            if isinstance(self.unrouted_masks, list):
+                self.unrouted_masks = torch.stack(self.unrouted_masks).squeeze(1).cpu()
+
+        # Clear lists to reclaim memory
+        self.context_embeddings = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        if hasattr(self, 'target_context_embeddings'):
+            self.target_context_embeddings = []
+        if hasattr(self, 'net_embeddings_list'):
+            self.net_embeddings_list = []
+        if hasattr(self, 'unrouted_masks_list'):
+            self.unrouted_masks_list = []
+        self._finalized = True
 
 
 class ReplayBuffer:
@@ -28,13 +75,27 @@ class ReplayBuffer:
         self.schema_version = "1.0.0"
 
         # Rolling cache of (h_t, z_t) latents computed during world model training.
-        # Use a deque with maxlen for O(1) eviction instead of list.pop(0) which is O(n).
-        self.latent_cache_capacity = 10000
-        self.latent_cache: Deque[Dict[str, torch.Tensor]] = collections.deque(maxlen=self.latent_cache_capacity)
+        self._latent_cache_capacity = 10000
+        self.latent_cache: Deque[Dict[str, torch.Tensor]] = collections.deque(maxlen=self._latent_cache_capacity)
+
+    @property
+    def latent_cache_capacity(self) -> int:
+        return self._latent_cache_capacity
+
+    @latent_cache_capacity.setter
+    def latent_cache_capacity(self, capacity: int):
+        self._latent_cache_capacity = capacity
+        # Re-create deque keeping existing elements up to the new capacity
+        if hasattr(self, 'latent_cache'):
+            old_cache = self.latent_cache
+            self.latent_cache = collections.deque(old_cache, maxlen=capacity)
+        else:
+            self.latent_cache = collections.deque(maxlen=capacity)
 
     def add_episode(self, episode: Episode):
         if episode.length < self.min_episode_len:
             return
+        episode.finalize()
         if len(self.episodes) < self.capacity_episodes:
             self.episodes.append(episode)
         else:
@@ -52,26 +113,15 @@ class ReplayBuffer:
         z_flat = z.reshape(-1, z.shape[-1]).detach().cpu()
         
         for i in range(h_flat.shape[0]):
-            # deque(maxlen=...) automatically discards the oldest item when full
             self.latent_cache.append({'h': h_flat[i], 'z': z_flat[i]})
 
     def sample_sequences(self, batch_size: int, seq_len: int) -> Dict[str, torch.Tensor]:
         """
         Sample batch_size sequences of length seq_len from the buffer.
-        Weights sampling by episode length to ensure uniform transition representation.
-        Returns:
-            Dict containing:
-                - context_embeddings: (B, T, embed_dim)
-                - net_actions: (B, T) discrete actions
-                - heatmap_actions: (B, T, heatmap_dim)
-                - rewards: (B, T)
-                - continues: (B, T) - (1.0 - done)
-                - masks: (B, T) mask indicating valid (non-padded) entries
         """
         if not self.episodes:
             raise ValueError("Buffer is empty.")
 
-        # Compute sampling weights based on valid start indices in each episode
         weights = []
         valid_episodes = []
         for ep in self.episodes:
@@ -98,47 +148,27 @@ class ReplayBuffer:
                 end_idx = ep.length
                 pad_len = seq_len - ep.length
 
-            # Extract slices
-            ctx_slice = ep.context_embeddings[start_idx:end_idx]
-            act_slice = ep.actions[start_idx:end_idx]
-            rew_slice = ep.rewards[start_idx:end_idx]
-            done_slice = ep.dones[start_idx:end_idx]
-
-            # Separate actions
-            net_act_slice = [a[0] for a in act_slice]
-            heat_act_slice = [a[1] for a in act_slice]
-
-            # Convert to tensors
-            if len(ctx_slice) > 0:
-                ctx_tensor = torch.stack(ctx_slice) if isinstance(ctx_slice[0], torch.Tensor) else torch.tensor(ctx_slice)
-                net_act_tensor = torch.stack(net_act_slice) if isinstance(net_act_slice[0], torch.Tensor) else torch.tensor(net_act_slice)
-                heat_act_tensor = torch.stack(heat_act_slice) if isinstance(heat_act_slice[0], torch.Tensor) else torch.tensor(heat_act_slice)
-            else:
-                ctx_tensor = torch.zeros(0, 384)
-                net_act_tensor = torch.zeros(0, dtype=torch.long)
-                heat_act_tensor = torch.zeros(0, 256)
-
-            rew_tensor = torch.tensor(rew_slice, dtype=torch.float32)
-            cont_tensor = 1.0 - torch.tensor(done_slice, dtype=torch.float32)
-            mask_tensor = torch.ones(len(ctx_slice), dtype=torch.float32)
+            # Extract slices directly from contiguous tensors (avoid stack/tensor creation overhead)
+            ctx_tensor = ep.context_embeddings_tensor[start_idx:end_idx]
+            net_act_tensor = ep.net_actions_tensor[start_idx:end_idx]
+            heat_act_tensor = ep.heatmap_actions_tensor[start_idx:end_idx]
+            rew_tensor = ep.rewards_tensor[start_idx:end_idx]
+            cont_tensor = 1.0 - ep.dones_tensor[start_idx:end_idx].to(torch.float32)
+            mask_tensor = torch.ones(end_idx - start_idx, dtype=torch.float32)
 
             # Padding if needed
             if pad_len > 0:
-                # Pad context embeddings
-                ctx_dim = ctx_tensor.shape[-1] if len(ctx_slice) > 0 else 384
+                ctx_dim = ctx_tensor.shape[-1]
                 ctx_pad = torch.zeros(pad_len, ctx_dim, dtype=ctx_tensor.dtype, device=ctx_tensor.device)
                 ctx_tensor = torch.cat([ctx_tensor, ctx_pad], dim=0)
 
-                # Pad net actions with 0
                 net_act_pad = torch.zeros(pad_len, dtype=net_act_tensor.dtype, device=net_act_tensor.device)
                 net_act_tensor = torch.cat([net_act_tensor, net_act_pad], dim=0)
 
-                # Pad heatmap actions
-                heat_dim = heat_act_tensor.shape[-1] if len(ctx_slice) > 0 else 256
+                heat_dim = heat_act_tensor.shape[-1]
                 heat_act_pad = torch.zeros(pad_len, heat_dim, dtype=heat_act_tensor.dtype, device=heat_act_tensor.device)
                 heat_act_tensor = torch.cat([heat_act_tensor, heat_act_pad], dim=0)
 
-                # Pad reward/continue/mask with 0
                 rew_pad = torch.zeros(pad_len, dtype=torch.float32)
                 rew_tensor = torch.cat([rew_tensor, rew_pad], dim=0)
 
@@ -167,7 +197,6 @@ class ReplayBuffer:
     def sample_latents(self, batch_size: int, device: torch.device = torch.device('cpu')) -> Dict[str, torch.Tensor]:
         """
         Sample batch_size single (h_t, z_t) latents from the cache for seeding imagination.
-        If cache is not populated enough, fallback to initial zero states (caller can check if it returns None).
         """
         if len(self.latent_cache) < batch_size:
             if len(self.latent_cache) > 0:
