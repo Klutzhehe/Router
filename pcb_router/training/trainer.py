@@ -105,6 +105,10 @@ class PPOJEPATrainer:
         # 2. Init Curriculum Manager
         self.curriculum = CurriculumManager(curriculum_config_path)
         
+        # Cache for last completed board state (for visualization)
+        self.last_completed_board_state = None
+        self.last_completed_board = None
+        
         # 3. Create Gym Env
         self.env = PCBRoutingEnv(
             board_config=self.curriculum.get_board_config(),
@@ -482,6 +486,12 @@ class PPOJEPATrainer:
                 # Record completion rate to curriculum
                 self.curriculum.record_episode(next_info['completion_rate'], next_info['drc_violations'] / len(self.env.board.nets))
                 eval_completion_rates.append(next_info['completion_rate'])
+                
+                # Cache completed board state for visualization
+                import copy
+                self.last_completed_board_state = copy.deepcopy(self.env.board_state)
+                self.last_completed_board = copy.deepcopy(self.env.board)
+                
                 obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
                 # New board generated on reset — invalidate cached pin→net mapping
                 self._invalidate_pin_cache()
@@ -1254,6 +1264,11 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
                 self.curriculum.record_episode(cr, drc_rate)
                 completion_rates.append(cr)
+                
+                # Cache completed board state for visualization
+                import copy
+                self.last_completed_board_state = copy.deepcopy(self.env.board_state)
+                self.last_completed_board = copy.deepcopy(self.env.board)
                 
         return np.mean(completion_rates) if completion_rates else 0.0
 
