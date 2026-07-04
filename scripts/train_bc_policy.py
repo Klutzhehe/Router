@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch_geometric.data import Batch
+from torch_geometric.utils import to_dense_batch
 
 from pcb_router.models.vit_encoder import ViTEncoder
 from pcb_router.models.gnn_encoder import HeteroGATEncoder
@@ -28,12 +30,6 @@ class BCDataset(Dataset):
     def __getitem__(self, idx):
         t = self.transitions[idx]
         
-        # Convert PYG graph object to dict of tensors for easy collation
-        graph_data = {
-            'x_dict': {k: v for k, v in t['graph'].x_dict.items()},
-            'edge_index_dict': {k: v for k, v in t['graph'].edge_index_dict.items()}
-        }
-        
         return {
             'raster': torch.tensor(t['raster'], dtype=torch.float32),
             'layer_mask': torch.tensor(t['layer_mask'], dtype=torch.float32),
@@ -43,7 +39,7 @@ class BCDataset(Dataset):
             'action': torch.tensor(t['action'], dtype=torch.long),
             'valid_mask': torch.tensor(t['valid_mask'], dtype=torch.bool),
             'steps_remaining': torch.tensor(t.get('steps_remaining', 0.0), dtype=torch.float32),
-            'graph': graph_data
+            'graph': t['graph']
         }
 
 def collate_fn(batch):
@@ -331,25 +327,20 @@ def main():
             else:
                 spatial_patches, _ = vit(rasters)
                 
-            fused_spatial_list = []
-            for b_idx in range(len(batch['graphs'])):
-                g = batch['graphs'][b_idx]
-                x_d = {k: v.to(device) for k, v in g['x_dict'].items()}
-                e_d = {k: v.to(device) for k, v in g['edge_index_dict'].items()}
-                
-                # Single pass forward
-                if not args.unfreeze_encoders:
-                    with torch.no_grad():
-                        node_embs = gnn(x_d, e_d)
-                        pad_embs = node_embs['pad'].unsqueeze(0)
-                        _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
-                else:
-                    node_embs = gnn(x_d, e_d)
-                    pad_embs = node_embs['pad'].unsqueeze(0)
-                    _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
-                fused_spatial_list.append(f_spatial)
-                
-            fused_spatial = torch.cat(fused_spatial_list, dim=0) # (B, N_patches, C)
+            # Combine individual graphs into a single batched graph
+            batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+            pad_batch = batched_graph['pad'].batch
+            
+            # Forward GNN and dense collate pads in a single batched call
+            if not args.unfreeze_encoders:
+                with torch.no_grad():
+                    node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
+                    pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
+                    fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
+            else:
+                node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
+                pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
+                fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
             
             # Forward policy
             logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
@@ -394,18 +385,14 @@ def main():
                 # Run ViT on the entire batch at once
                 spatial_patches, _ = vit(rasters)
                 
-                fused_spatial_list = []
-                for b_idx in range(len(batch['graphs'])):
-                    g = batch['graphs'][b_idx]
-                    x_d = {k: v.to(device) for k, v in g['x_dict'].items()}
-                    e_d = {k: v.to(device) for k, v in g['edge_index_dict'].items()}
-                    
-                    node_embs = gnn(x_d, e_d)
-                    pad_embs = node_embs['pad'].unsqueeze(0)
-                    _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
-                    fused_spatial_list.append(f_spatial)
-                    
-                fused_spatial = torch.cat(fused_spatial_list, dim=0)
+                # Combine graphs into a single batched graph
+                batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+                pad_batch = batched_graph['pad'].batch
+                
+                # Single batched forward pass for GNN and Fusion
+                node_embs = gnn(batched_graph.x_dict, batched_graph.edge_index_dict)
+                pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
+                fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
                 
                 logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
                 masked_logits = logits.masked_fill(~valid_masks, -1e4)
