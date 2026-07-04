@@ -109,29 +109,10 @@ class AStarPathfinder:
         visited = {}    # key: (pos, last_dir) -> g_score
         
         iterations = 0
-        min_h_seen = min(self._heuristic((sx, sy, l if sl == -1 else sl), target) for l in active_layers)
-        total_pushes = len(pq)
-        total_pops = 0
-        first_pops = []
-        last_pops = []
         
         while pq and iterations < max_iterations:
             iterations += 1
             f, g, curr, last_dir = heapq.heappop(pq)
-            total_pops += 1
-            
-            # Record some popped states for debugging
-            state_info = (f"{f:.2f}", f"{g:.2f}", curr, last_dir)
-            if len(first_pops) < 15:
-                first_pops.append(state_info)
-            else:
-                last_pops.append(state_info)
-                if len(last_pops) > 15:
-                    last_pops.pop(0)
-            
-            h_curr = self._heuristic(curr, target)
-            if h_curr < min_h_seen:
-                min_h_seen = h_curr
             
             # Target reached check
             is_reached = (curr[0] == tx and curr[1] == ty) if tl == -1 else (curr == target)
