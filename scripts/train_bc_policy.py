@@ -217,6 +217,7 @@ def main():
     parser.add_argument('--unfreeze_encoders', action='store_true', default=False)
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='data/bc_dataset', help='Directory to load dataset shards from')
+    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -503,10 +504,10 @@ def main():
             torch.cuda.empty_cache()
             
         # Save checkpoints
-        os.makedirs("checkpoints", exist_ok=True)
+        os.makedirs(args.save_dir, exist_ok=True)
         
         # Save latest checkpoint
-        latest_path = "checkpoints/bc_policy_latest.pt"
+        latest_path = os.path.join(args.save_dir, "bc_policy_latest.pt")
         torch.save({
             'epoch': epoch,
             'policy': policy.state_dict(),
@@ -521,7 +522,7 @@ def main():
         # Save best checkpoint
         if 'best_val_acc' not in locals() or val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_path = "checkpoints/bc_policy_best.pt"
+            best_path = os.path.join(args.save_dir, "bc_policy_best.pt")
             torch.save({
                 'epoch': epoch,
                 'policy': policy.state_dict(),
@@ -535,10 +536,11 @@ def main():
             print(f"  --> Saved new best checkpoint to {best_path} (Val Acc: {val_acc*100:.2f}%)")
         
     # Also save the final one to the expected path for Dreamer
-    final_path = "checkpoints/bc_pretrained_policy.pt"
+    final_path = os.path.join(args.save_dir, "bc_pretrained_policy.pt")
     import shutil
-    if os.path.exists("checkpoints/bc_policy_best.pt"):
-        shutil.copy("checkpoints/bc_policy_best.pt", final_path)
+    best_path = os.path.join(args.save_dir, "bc_policy_best.pt")
+    if os.path.exists(best_path):
+        shutil.copy(best_path, final_path)
         print(f"Pretraining complete. Copied best weights to {final_path}")
     else:
         # Fallback if best doesn't exist for some reason
