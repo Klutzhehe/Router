@@ -179,7 +179,7 @@ def evaluate_closed_loop(env, policy, vit, gnn, fusion, device, num_episodes=5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--unfreeze_encoders', action='store_true', default=False)
@@ -292,7 +292,16 @@ def main():
     if args.unfreeze_encoders:
         params += list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters())
         
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
+    
+    # Cosine annealing with linear warmup (standard for transformer training)
+    warmup_epochs = max(1, int(args.epochs * 0.05))  # 5% warmup
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)  # linear warmup
+        progress = float(epoch - warmup_epochs) / float(max(1, args.epochs - warmup_epochs))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine decay
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     criterion_action = nn.CrossEntropyLoss()
     criterion_value = nn.MSELoss()
@@ -373,6 +382,7 @@ def main():
             
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)  # gradient clipping
             optimizer.step()
             
             train_loss += loss.item() * rasters.size(0)
@@ -429,7 +439,10 @@ def main():
         # Closed-loop evaluation
         comp_rate, mean_drc = evaluate_closed_loop(eval_env, policy, vit, gnn, fusion, device, num_episodes=5)
         
-        print(f"Epoch {epoch+1:02d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Eval Rollout Comp Rate: {comp_rate*100:.1f}% | DRC Violations: {mean_drc:.2f}")
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
+        print(f"Epoch {epoch+1:02d} | LR: {current_lr:.2e} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Eval Rollout Comp Rate: {comp_rate*100:.1f}% | DRC Violations: {mean_drc:.2f}")
         
         # Free memory cache and clean GPU memory
         import gc
