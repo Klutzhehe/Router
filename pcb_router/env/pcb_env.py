@@ -91,7 +91,9 @@ class PCBRoutingEnv(gym.Env):
         super().reset(seed=seed)
         
         # 1. Generate new board
-        if self.curriculum_stage is not None:
+        if options is not None and 'board_config' in options:
+            self.board_config = options['board_config']
+        elif self.curriculum_stage is not None:
             self.board_config = self.board_generator.from_curriculum_stage(self.curriculum_stage)
             
         if seed is not None:

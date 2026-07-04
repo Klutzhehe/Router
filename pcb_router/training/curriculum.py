@@ -70,7 +70,20 @@ class CurriculumManager:
         width = resolve_val(board_gen_cfg.get('board_size_range'), 400)
         height = width
         
-        num_nets = resolve_val(board_gen_cfg.get('num_nets_range'), resolve_val(board_gen_cfg.get('num_nets'), 5))
+        # Dynamic net scaling based on rolling completion rate history
+        num_nets_val = board_gen_cfg.get('num_nets_range')
+        if isinstance(num_nets_val, list):
+            min_n, max_n = num_nets_val[0], num_nets_val[1]
+            if len(self.completion_history) > 0:
+                mean_comp = np.mean(self.completion_history)
+                # Scale between min_n and max_n based on rolling completion rate (0.0 to 1.0)
+                progress = max(0.0, min(1.0, mean_comp))
+                num_nets = int(round(min_n + progress * (max_n - min_n)))
+            else:
+                num_nets = min_n
+        else:
+            num_nets = resolve_val(num_nets_val, resolve_val(board_gen_cfg.get('num_nets'), 5))
+            
         num_layers = resolve_val(board_gen_cfg.get('num_layers_range'), board_gen_cfg.get('num_layers', 2))
         num_components = resolve_val(board_gen_cfg.get('num_components_range'), board_gen_cfg.get('num_components', 4))
         

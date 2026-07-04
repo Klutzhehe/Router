@@ -108,6 +108,7 @@ class PPOJEPATrainer:
         # 3. Create Gym Env
         self.env = PCBRoutingEnv(
             board_config=self.curriculum.get_board_config(),
+            curriculum_stage=self.curriculum.current_stage,
             reward_weights=self.curriculum.get_reward_weights()
         )
         
@@ -304,7 +305,7 @@ class PPOJEPATrainer:
         import time
         self.buffer.clear()
 
-        obs, info = self.env.reset()
+        obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
         # Invalidate pin→net cache whenever the board is regenerated
         self._invalidate_pin_cache()
         done = False
@@ -481,7 +482,7 @@ class PPOJEPATrainer:
                 # Record completion rate to curriculum
                 self.curriculum.record_episode(next_info['completion_rate'], next_info['drc_violations'] / len(self.env.board.nets))
                 eval_completion_rates.append(next_info['completion_rate'])
-                obs, info = self.env.reset()
+                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
                 # New board generated on reset — invalidate cached pin→net mapping
                 self._invalidate_pin_cache()
             else:
@@ -753,8 +754,9 @@ class PPOJEPATrainer:
             # 4. Check Curriculum Advancement
             if self.curriculum.should_advance():
                 self.curriculum.advance()
-                # Update environment board size and components matching new stage
-                self.env.reset()
+                # Update environment curriculum stage and generate new boardconfig
+                self.env.curriculum_stage = self.curriculum.current_stage
+                self.env.reset(options={'board_config': self.curriculum.get_board_config()})
                 
             # 5. Checkpoint
             if self.total_timesteps % self.train_cfg['training']['save_interval'] == 0:
@@ -846,6 +848,8 @@ class PPOJEPATrainer:
             self._safe_load(self.decoder, state['decoder'])
             self.optimizer.load_state_dict(state['optimizer'])
             self.curriculum.load_state(state['curriculum'])
+            self.env.curriculum_stage = self.curriculum.current_stage
+            self.env.reset(options={'board_config': self.curriculum.get_board_config()})
             self.total_timesteps = state['total_timesteps']
             print(f"Checkpoint loaded successfully from {path} (Step {self.total_timesteps})")
         else:
@@ -1086,6 +1090,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             if 'scaler_ac' in state:
                 self.scaler_ac.load_state_dict(state['scaler_ac'])
             self.curriculum.load_state(state['curriculum'])
+            self.env.curriculum_stage = self.curriculum.current_stage
+            self.env.reset(options={'board_config': self.curriculum.get_board_config()})
             self.total_timesteps = state['total_timesteps']
             print(f"Dreamer checkpoint loaded successfully from {path} (Step {self.total_timesteps})")
         else:
@@ -1127,7 +1133,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         completion_rates = []
         
         while steps_collected < num_steps:
-            obs, info = self.env.reset()
+            obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
             episode = Episode()
             h, z = self.jepa.initial_state(batch_size=1, device=self.device)
             done = False
@@ -1563,7 +1569,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             
             if self.curriculum.should_advance():
                 self.curriculum.advance()
-                self.env.reset()
+                self.env.curriculum_stage = self.curriculum.current_stage
+                self.env.reset(options={'board_config': self.curriculum.get_board_config()})
                 
             save_interval = self.train_cfg.get('training', {}).get('save_interval', 50000)
             if self.total_timesteps % save_interval < self.real_steps_per_iteration:

@@ -435,6 +435,15 @@ def draw_board_state(ax, env, board_state, highlight_net_id=None, path=None,
             ax.add_patch(patches.Rectangle((pin.global_x - 3, pin.global_y - 3), 6, 6,
                                            facecolor=col, edgecolor=ec, linewidth=ew, alpha=alpha, zorder=8))
 
+    # Draw unrouted/failed nets as light dotted red lines
+    unrouted_nets = [net for net in board.nets if net.id not in board_state.routed_net_ids]
+    for net in unrouted_nets:
+        pins = [board.pins[pid] for pid in net.pin_ids if pid in board.pins]
+        for idx in range(len(pins) - 1):
+            p1, p2 = pins[idx], pins[idx+1]
+            ax.plot([p1.global_x, p2.global_x], [p1.global_y, p2.global_y],
+                    color='#EF4444', linestyle=':', linewidth=1.2, alpha=0.6)
+
     # Draw routed path for the active net (current step only)
     if path and not show_all_bright:
         layer_to_show = min(show_heatmap_layer, env.board.num_layers - 1)
@@ -806,15 +815,15 @@ st.subheader("📋 Routing History Timeline")
 if not hist:
     st.caption("No steps recorded yet. Press **Next Step** or **Route All** to begin.")
 else:
-    # Progress dots visualization
     dot_html = '<div class="progress-track">'
     for s in hist:
         col = NET_COLORS[s['net_id'] % len(NET_COLORS)]
         is_active = (s['step_num'] - 1 == cur_step_idx)
         border = f"box-shadow:0 0 0 2px #fff" if is_active else ""
         opacity = "1.0" if s['success'] else "0.4"
+        title_str = s['net_name'] or f"Net {s['net_id']}"
         dot_html += (
-            f'<span class="progress-dot" title="Step {s["step_num"]}: {s["net_name"] or f\'Net {s[\"net_id\"]}\' }" '
+            f'<span class="progress-dot" title="Step {s["step_num"]}: {title_str}" '
             f'style="background:{col};opacity:{opacity};{border}"></span>'
         )
     dot_html += '</div>'

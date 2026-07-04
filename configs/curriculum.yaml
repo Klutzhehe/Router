@@ -54,10 +54,10 @@ stages:
 
   # Stage 3: Multi-net, single layer — net ordering & congestion
   - name: "multi_net_single_layer"
-    description: "Route 5-15 nets on a single layer"
+    description: "Route 2-12 nets on a single layer (scaled dynamically by curriculum progression)"
     drc_violation_threshold: 0.20
     board_generator:
-      num_nets_range: [5, 15]
+      num_nets_range: [2, 12]
       num_layers: 2
       board_size_range: [300, 400]
       num_components_range: [4, 10]
@@ -77,10 +77,10 @@ stages:
 
   # Stage 4: Multi-net, multi-layer — via placement & layer assignment
   - name: "multi_net_multi_layer"
-    description: "Route 10-30 nets across 2-4 layers"
+    description: "Route 4-25 nets across 2-4 layers (scaled dynamically by curriculum progression)"
     drc_violation_threshold: 0.10
     board_generator:
-      num_nets_range: [10, 30]
+      num_nets_range: [4, 25]
       num_layers_range: [2, 4]
       board_size_range: [400, 512]
       num_components_range: [6, 15]
