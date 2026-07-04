@@ -163,9 +163,10 @@ st.sidebar.markdown("---")
 board_seed = st.sidebar.number_input("Board Seed", value=42, step=1)
 show_heatmap_layer = st.sidebar.selectbox("Heatmap Layer to Show", [0, 1, 2, 3], index=0,
                                            format_func=lambda l: f"Layer {l}")
-overlay_existing = st.sidebar.checkbox("Overlay Existing Copper on Heatmap", value=True)
-show_occupancy   = st.sidebar.checkbox("Show A* Occupancy Map", value=False)
-show_heatmap     = st.sidebar.checkbox("Show JEPA Heatmap Panel", value=True)
+overlay_existing     = st.sidebar.checkbox("Overlay Existing Copper on Heatmap", value=True)
+show_occupancy       = st.sidebar.checkbox("Show A* Occupancy Map", value=False)
+show_heatmap         = st.sidebar.checkbox("Show JEPA Heatmap Panel", value=True)
+show_all_nets_heatmap = st.sidebar.checkbox("Show All-Nets Heatmap Overview", value=True)
 
 # ─────────────────────────────────────────────────────────
 #  Load model (cached)
@@ -804,6 +805,67 @@ else:
             ax_via.set_title("Via Placement Confidence", color='#E2E8F0', fontsize=10, pad=6)
             st.pyplot(fig_via, use_container_width=True)
             plt.close(fig_via)
+
+# ─────────────────────────────────────────────────────────
+#  ALL-NETS HEATMAP OVERVIEW
+# ─────────────────────────────────────────────────────────
+
+if show_all_nets_heatmap and len(hist) > 0:
+    st.markdown("---")
+    st.subheader("🗺️ All-Nets Heatmap Overview")
+    st.caption(
+        "Each tile shows the JEPA cost heatmap the AI generated for that net before routing it. "
+        "Bright = preferred path, dark = costly/avoid. Layer shown is the selected sidebar layer."
+    )
+
+    # Controls for overview
+    ov_col1, ov_col2 = st.columns([1, 3])
+    with ov_col1:
+        ov_cols_per_row = st.select_slider(
+            "Nets per row", options=[2, 3, 4, 5, 6], value=4, key="ov_cols"
+        )
+    with ov_col2:
+        ov_layer = st.select_slider(
+            "Layer for overview",
+            options=list(range(hist[0]['heatmaps_np'].shape[0])),
+            value=min(show_heatmap_layer, hist[0]['heatmaps_np'].shape[0] - 1),
+            key="ov_layer",
+            format_func=lambda l: f"Layer {l}"
+        )
+
+    rows_ov = [hist[i:i+ov_cols_per_row] for i in range(0, len(hist), ov_cols_per_row)]
+    for row_s in rows_ov:
+        row_c = st.columns(ov_cols_per_row)
+        for col_c, s in zip(row_c, row_s):
+            with col_c:
+                net_color = NET_COLORS[s['net_id'] % len(NET_COLORS)]
+                status_icon_ov = "✅" if s['success'] else "❌"
+                net_label = s['net_name'] or f"Net {s['net_id']}"
+                st.markdown(
+                    f'<p style="margin:0 0 2px 0;font-size:0.75rem;color:{net_color};font-weight:700;">'
+                    f'{status_icon_ov} Step {s["step_num"]} — {net_label}</p>',
+                    unsafe_allow_html=True
+                )
+
+                lyr = min(ov_layer, s['heatmaps_np'].shape[0] - 1)
+                fig_ov, ax_ov = plt.subplots(figsize=(3.2, 3.2), dpi=85)
+                fig_ov.patch.set_facecolor('#0A0B14')
+                # Use board_before so heatmap reflects board state AI saw
+                before_s = s['board_before']
+                before_s.set_current_net(s['net_id'])
+                draw_heatmap_panel(
+                    ax_ov, s['heatmaps_np'][lyr], before_s, env,
+                    path=s['path'],
+                    overlay_copper=overlay_existing,
+                    title=f"L{lyr} — {net_label}"
+                )
+                st.pyplot(fig_ov, use_container_width=True)
+                plt.close(fig_ov)
+
+        # fill any empty slots in last row
+        if len(row_s) < ov_cols_per_row:
+            for _ in range(ov_cols_per_row - len(row_s)):
+                st.write("")
 
 # ─────────────────────────────────────────────────────────
 #  ROUTING HISTORY TIMELINE

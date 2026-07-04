@@ -259,6 +259,7 @@ class PPOJEPATrainer:
 
         self.last_heatmap = None
         self.last_net_idx = None
+        self.all_episode_heatmaps = []  # list of {'net_name', 'net_idx', 'heatmaps_np'} per net in last episode
 
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
@@ -1039,6 +1040,7 @@ class DreamerJEPATrainer(PPOJEPATrainer):
         
         self.last_heatmap = None
         self.last_net_idx = None
+        self.all_episode_heatmaps = []  # list of {'net_name', 'net_idx', 'heatmaps_np'} per net in last episode
         
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
@@ -1148,6 +1150,8 @@ class DreamerJEPATrainer(PPOJEPATrainer):
             episode = Episode()
             h, z = self.jepa.initial_state(batch_size=1, device=self.device)
             done = False
+            self.all_episode_heatmaps = []  # reset per-episode heatmap log
+
             
             while not done and steps_collected < num_steps:
                 raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -1191,6 +1195,14 @@ class DreamerJEPATrainer(PPOJEPATrainer):
                 
                 self.last_heatmap = heatmaps_np
                 self.last_net_idx = net_idx_tensor.item()
+                net_idx_int = net_idx_tensor.item()
+                nets_list = self.env.board.nets
+                net_name = nets_list[net_idx_int].name if net_idx_int < len(nets_list) else f"Net {net_idx_int}"
+                self.all_episode_heatmaps.append({
+                    'net_name': net_name or f"Net {net_idx_int}",
+                    'net_idx': net_idx_int,
+                    'heatmaps_np': heatmaps_np,
+                })
                 
                 next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
                     net_idx_tensor.item(), heatmaps_np, via_prob_np

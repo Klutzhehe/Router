@@ -31,7 +31,7 @@ class AStarPathfinder:
         d3d = d2d + z_dist * self.base_via_cost
         return d3d * (1.0 + self.heatmap_weight)
 
-    def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=30000, board_state=None):
+    def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=200000, board_state=None):
         """
         Find path from source (x, y, layer) to target (x, y, layer)
         """
@@ -237,7 +237,7 @@ class AStarPathfinder:
 
         return None, float('inf')
 
-    def find_path_multi_target(self, heatmaps, via_prob, source, targets, active_layers, max_iterations=30000):
+    def find_path_multi_target(self, heatmaps, via_prob, source, targets, active_layers, max_iterations=200000):
         """
         Finds the shortest path from source to the nearest of multiple targets
         (Useful for connecting a new pin to an already routed net of pads/traces)
