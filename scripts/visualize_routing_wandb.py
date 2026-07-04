@@ -497,6 +497,137 @@ def run_visualization(args):
     wandb.finish()
 
 
+def log_training_rollout_viz(trainer, is_dreamer, stage_cfg, seed, current_step):
+    """
+    Run one full board routing episode on the current stage config using 
+    the trainer's current model weights, and log the step-by-step panels to W&B.
+    
+    This visualizes the whole model (ViT + GNN + Fusion + Policy + Decoder)
+    step-by-step at the current curriculum stage during training.
+    """
+    import wandb
+    
+    board_config = BoardGenerator.from_curriculum_stage(stage_cfg)
+    board_config.seed = seed
+    
+    # Use temporary PCBRoutingEnv to avoid mutating the trainer's training environment state
+    env = PCBRoutingEnv(
+        board_config=board_config,
+        reward_weights=stage_cfg.get('reward_weights')
+    )
+    obs, info = env.reset(seed=seed)
+    
+    h_state, z_state = None, None
+    if is_dreamer:
+        h_state, z_state = trainer.jepa.initial_state(batch_size=1, device=trainer.device)
+        
+    step_num = 0
+    stage_name = stage_cfg.get('name', 'unknown')
+    
+    summary_table = wandb.Table(columns=[
+        'step', 'net_name', 'net_id', 'success',
+        'reward', 'drc_violations', 'completion_pct', 'routing_panel'
+    ])
+    
+    # We use AMP context if training is on GPU
+    amp_ctx = torch.autocast(device_type=trainer.device.type, enabled=(trainer.device.type == 'cuda'))
+    
+    while True:
+        unrouted = [n for n in env.board.nets if n.id not in env.routed_nets]
+        if not unrouted:
+            break
+            
+        net = unrouted[0]
+        net_idx = next(i for i, n in enumerate(env.board.nets) if n.id == net.id)
+        
+        raster_t   = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(trainer.device)
+        layer_mask = torch.tensor(obs['layer_mask'],   dtype=torch.float32).unsqueeze(0).to(trainer.device)
+        
+        graph = info['graph']
+        if hasattr(graph, 'x_dict'):
+            x_dict          = {k: v.to(trainer.device) for k, v in graph.x_dict.items()}
+            edge_index_dict = {k: v.to(trainer.device) for k, v in graph.edge_index_dict.items()}
+        else:
+            x_dict          = {k: v['x'].to(trainer.device) for k, v in graph.items() if isinstance(v, dict) and 'x' in v}
+            edge_index_dict = {k: v.to(trainer.device) for k, v in graph.items() if isinstance(v, torch.Tensor) and v.shape[0] == 2}
+            
+        board_before = env.board_state.clone()
+        board_before.set_current_net(net.id)
+        
+        with torch.no_grad(), amp_ctx:
+            if is_dreamer:
+                context_emb = trainer.jepa.get_context_embedding(
+                    raster_t, x_dict, edge_index_dict, use_target=False)
+                net_embs, _, fs = trainer._get_net_embeddings_and_mask(
+                    raster_t, x_dict, edge_index_dict)
+                sel_emb = net_embs[0, net_idx].unsqueeze(0)
+                heatmap_latent, _, _ = trainer.policy.get_heatmap_latent(
+                    sel_emb, h_state, z_state, deterministic=True)
+                heatmaps_via = trainer.decoder(
+                    heatmap_latent, fs, env.H, env.W, active_layers_mask=layer_mask)
+                action_emb = trainer.jepa.get_action_embedding(
+                    torch.tensor([net_idx], device=trainer.device), heatmap_latent)
+                h_state, z_state, _, _ = trainer.jepa.rssm_step(
+                    h_state, z_state, context_emb, action_emb)
+            else:
+                sp, _ = trainer.vit(raster_t)
+                ne    = trainer.gnn(x_dict, edge_index_dict)
+                fp, fsp = trainer.fusion(ne['pad'].unsqueeze(0), sp)
+                nN    = len(env.board.nets)
+                ne2   = torch.zeros((1, nN, trainer.vit.embed_dim), device=trainer.device)
+                for ni2, n2 in enumerate(env.board.nets):
+                    pi = [i for i, p in enumerate(env.board.pins.values()) if p.net_id == n2.id]
+                    if pi:
+                        ne2[0, ni2] = fp[0, pi].mean(0)
+                heatmap_latent, _, _ = trainer.policy.get_heatmap_latent(
+                    ne2[0, net_idx].unsqueeze(0), fsp.mean(1))
+                heatmaps_via = trainer.decoder(
+                    heatmap_latent, fsp, env.H, env.W, active_layers_mask=layer_mask)
+                    
+        heatmaps_np = heatmaps_via[0, :env.board.num_layers].cpu().numpy()
+        via_prob_np = heatmaps_via[0, 8].cpu().numpy()
+        occ_map = env.board_state.get_occupancy(0)
+        
+        next_obs, reward, terminated, truncated, next_info = env.step_with_heatmaps(
+            net_idx, heatmaps_np, via_prob_np
+        )
+        path = next_info.get('path', [])
+        board_after = env.board_state.clone()
+        
+        step_num += 1
+        success = next_info.get('connected', False)
+        drc_n   = next_info['drc_violations']
+        comp    = next_info['completion_rate']
+        
+        fig = render_routing_step(
+            step_num, net, env,
+            board_before, board_after,
+            heatmaps_np, via_prob_np, occ_map, path,
+            num_layers=env.board.num_layers
+        )
+        wb_img = fig_to_wandb_image(
+            fig,
+            caption=f"Eval Step {step_num} | Net '{net.name}'"
+        )
+        plt.close(fig)
+        
+        summary_table.add_data(
+            step_num, net.name, net.id, success,
+            reward, drc_n, comp * 100, wb_img
+        )
+        
+        obs  = next_obs
+        info = next_info
+        if terminated or truncated:
+            break
+            
+    wandb.log({
+        f"eval_training/step_summary_table": summary_table,
+        f"eval_training/timesteps": current_step,
+        f"eval_training/stage_name": stage_name
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CLI entry point
 # ─────────────────────────────────────────────────────────────────────────────

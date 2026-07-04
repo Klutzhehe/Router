@@ -182,13 +182,51 @@ replacement_metrics_str = """    is_dreamer = "loss_wm" in h
 
 if target_metrics_str in training_source_str:
     training_source_str = training_source_str.replace(target_metrics_str, replacement_metrics_str)
-    # Split back into lines
-    nb["cells"][5]["source"] = [line + "\n" for line in training_source_str.split("\n")]
-    # remove trailing newline duplicate from split
-    if nb["cells"][5]["source"][-1] == "\n":
-        nb["cells"][5]["source"].pop()
 else:
     print("Warning: could not find target metrics_to_plot block in training cell!")
+
+target_on_update_end = """    clear_output(wait=True)
+    ipydisplay.display(fig)
+    plt.close(fig)"""
+
+replacement_on_update_end = """    clear_output(wait=True)
+    ipydisplay.display(fig)
+    if CONFIG["USE_WANDB"]:
+        import wandb
+        try:
+            # Log training dashboard figure as an image
+            wandb.log({"training/dashboard": wandb.Image(fig, caption=f"Training Dashboard at Step {ts}")})
+            
+            # Periodically log step-by-step routing viz of the whole model (every 20 updates)
+            if _update_count[0] % 20 == 0:
+                from scripts.visualize_routing_wandb import log_training_rollout_viz
+                stage_cfg = trainer.curriculum.current_stage
+                is_dreamer = hasattr(trainer, 'jepa')
+                log_training_rollout_viz(
+                    trainer=trainer,
+                    is_dreamer=is_dreamer,
+                    stage_cfg=stage_cfg,
+                    seed=42, # stable seed to compare progress
+                    current_step=ts
+                )
+        except Exception as e:
+            print(f"Warning: Failed to log W&B visuals: {e}")
+    plt.close(fig)"""
+
+if target_on_update_end in training_source_str:
+    training_source_str = training_source_str.replace(target_on_update_end, replacement_on_update_end)
+else:
+    # Try with single quotes if double quotes were used in notebook
+    target_on_update_end_alt = """    clear_output(wait=True)
+    ipydisplay.display(fig)
+    plt.close(fig)"""
+    training_source_str = training_source_str.replace(target_on_update_end_alt, replacement_on_update_end)
+
+# Split back into lines
+nb["cells"][5]["source"] = [line + "\n" for line in training_source_str.split("\n")]
+# remove trailing newline duplicate from split
+if nb["cells"][5]["source"][-1] == "\n":
+    nb["cells"][5]["source"].pop()
 
 # Cell 6 (Evaluation Cell)
 eval_source_str = "".join(nb["cells"][6]["source"])
