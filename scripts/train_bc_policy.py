@@ -313,11 +313,13 @@ def main():
             valid_masks = batch['valid_mask'].to(device)
             steps_remainings = batch['steps_remaining'].to(device)
             
-            # Since graphs are collocated as list, we run batch step-by-step or combine them
-            # However, during pretraining we can extract the batch GNN features by looping
-            # or constructing batch graph. To be fully general and correct, we can build a
-            # batch representation. Since we have pad features, we can construct the fused_spatial
-            # for each batch element.
+            # Run ViT on the entire batch at once
+            if not args.unfreeze_encoders:
+                with torch.no_grad():
+                    spatial_patches, _ = vit(rasters)
+            else:
+                spatial_patches, _ = vit(rasters)
+                
             fused_spatial_list = []
             for b_idx in range(len(batch['graphs'])):
                 g = batch['graphs'][b_idx]
@@ -325,10 +327,15 @@ def main():
                 e_d = {k: v.to(device) for k, v in g['edge_index_dict'].items()}
                 
                 # Single pass forward
-                sp, _ = vit(rasters[b_idx:b_idx+1])
-                node_embs = gnn(x_d, e_d)
-                pad_embs = node_embs['pad'].unsqueeze(0)
-                _, f_spatial = fusion(pad_embs, sp)
+                if not args.unfreeze_encoders:
+                    with torch.no_grad():
+                        node_embs = gnn(x_d, e_d)
+                        pad_embs = node_embs['pad'].unsqueeze(0)
+                        _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
+                else:
+                    node_embs = gnn(x_d, e_d)
+                    pad_embs = node_embs['pad'].unsqueeze(0)
+                    _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
                 fused_spatial_list.append(f_spatial)
                 
             fused_spatial = torch.cat(fused_spatial_list, dim=0) # (B, N_patches, C)
@@ -373,16 +380,18 @@ def main():
                 valid_masks = batch['valid_mask'].to(device)
                 steps_remainings = batch['steps_remaining'].to(device)
                 
+                # Run ViT on the entire batch at once
+                spatial_patches, _ = vit(rasters)
+                
                 fused_spatial_list = []
                 for b_idx in range(len(batch['graphs'])):
                     g = batch['graphs'][b_idx]
                     x_d = {k: v.to(device) for k, v in g['x_dict'].items()}
                     e_d = {k: v.to(device) for k, v in g['edge_index_dict'].items()}
                     
-                    sp, _ = vit(rasters[b_idx:b_idx+1])
                     node_embs = gnn(x_d, e_d)
                     pad_embs = node_embs['pad'].unsqueeze(0)
-                    _, f_spatial = fusion(pad_embs, sp)
+                    _, f_spatial = fusion(pad_embs, spatial_patches[b_idx:b_idx+1])
                     fused_spatial_list.append(f_spatial)
                     
                 fused_spatial = torch.cat(fused_spatial_list, dim=0)
@@ -405,6 +414,12 @@ def main():
         comp_rate, mean_drc = evaluate_closed_loop(eval_env, policy, vit, gnn, fusion, device, num_episodes=5)
         
         print(f"Epoch {epoch+1:02d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Eval Rollout Comp Rate: {comp_rate*100:.1f}% | DRC Violations: {mean_drc:.2f}")
+        
+        # Free memory cache and clean GPU memory
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
     # Save pretrained policy checkpoint
     os.makedirs("checkpoints", exist_ok=True)
