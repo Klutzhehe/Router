@@ -233,40 +233,19 @@ def main():
     train_paths = shard_paths[:split_idx]
     val_paths = shard_paths[split_idx:]
     
-    # Quickly count transitions to compute accurate loss averages
-    def count_transitions(paths):
-        count = 0
-        import gzip, pickle
-        for p in paths:
-            try:
-                open_func = gzip.open if p.endswith('.gz') else open
-                with open_func(p, "rb") as f:
-                    ep = pickle.load(f)
-                count += sum(len(e) for e in ep)
-            except Exception:
-                pass
-        return count
-        
-    print("Counting dataset sizes (this takes a moment but prevents memory crashes)...")
-    train_len = count_transitions(train_paths)
-    val_len = count_transitions(val_paths)
-    if train_len == 0 or val_len == 0:
-        raise ValueError("Failed to load valid episodes! Ensure the dataset is not empty.")
-    
-    print(f"Training set: {train_len} steps, Validation set: {val_len} steps")
-    
+    # No need to count sizes upfront, we'll keep a running tally during the epoch loop
     train_dataset = BCIterableDataset(train_paths, shuffle=True)
     val_dataset = BCIterableDataset(val_paths, shuffle=False)
     
-    # num_workers=4: data loading runs in parallel background threads, freeing GPU
+    # num_workers=0: runs in main thread to avoid Colab shared memory crashes
     # pin_memory=True: enables faster CPU→GPU tensor transfers
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=0, pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=0, pin_memory=True
     )
     
     # 3. Init encoders and policy
@@ -386,6 +365,7 @@ def main():
             
         train_loss = 0.0
         train_acc = 0.0
+        train_steps_count = 0
         
         # Guard check: confirm no gradients flow to encoders if frozen
         if not args.unfreeze_encoders:
@@ -443,9 +423,11 @@ def main():
             train_loss += loss.item() * rasters.size(0)
             preds = masked_logits.argmax(dim=-1)
             train_acc += (preds == actions).sum().item()
+            train_steps_count += rasters.size(0)
             
-        train_loss /= train_len
-        train_acc /= train_len
+        if train_steps_count > 0:
+            train_loss /= train_steps_count
+            train_acc /= train_steps_count
         
         # Validation pass
         policy.eval()
@@ -454,6 +436,7 @@ def main():
         fusion.eval()
         val_loss = 0.0
         val_acc = 0.0
+        val_steps_count = 0
         
         with torch.no_grad():
             for batch in val_loader:
@@ -487,9 +470,11 @@ def main():
                 val_loss += loss.item() * rasters.size(0)
                 preds = masked_logits.argmax(dim=-1)
                 val_acc += (preds == actions).sum().item()
+                val_steps_count += rasters.size(0)
                 
-        val_loss /= val_len
-        val_acc /= val_len
+        if val_steps_count > 0:
+            val_loss /= val_steps_count
+            val_acc /= val_steps_count
         
         # Closed-loop evaluation — expensive, run every 10 epochs only
         if (epoch + 1) % 10 == 0 or epoch == 0:
