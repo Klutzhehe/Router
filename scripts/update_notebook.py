@@ -286,8 +286,113 @@ nb["cells"][6]["source"] = [line + "\n" for line in eval_source_str.split("\n")]
 if nb["cells"][6]["source"][-1] == "\n":
     nb["cells"][6]["source"].pop()
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Cell 7 (NEW) — Step-by-Step Routing Visualizer (Gradio OR W&B)
+# ─────────────────────────────────────────────────────────────────────────────
+viz_cell_source = [
+    "# ================================================================\n",
+    "#  CELL 7 — JEPA STEP-BY-STEP ROUTING VISUALIZER\n",
+    "#\n",
+    "#  Choose your visualizer:\n",
+    "#\n",
+    "#   VIZ_MODE = 'gradio'   →  Full interactive UI with a public URL\n",
+    "#                             (works in Colab — no port forwarding needed)\n",
+    "#\n",
+    "#   VIZ_MODE = 'wandb'    →  Logs every routing step as images to W&B\n",
+    "#                             (persistent, shareable, viewable anywhere)\n",
+    "#\n",
+    "#  Each step shows:\n",
+    "#    • Board BEFORE routing (existing copper visible)\n",
+    "#    • JEPA cost heatmap (white overlay = existing copper the model sees)\n",
+    "#    • A* occupancy map  (what the pathfinder sees as blocked)\n",
+    "#    • Board AFTER routing\n",
+    "#    • Via placement probability map\n",
+    "# ================================================================\n",
+    "\n",
+    "# ── Config ────────────────────────────────────────────────────────\n",
+    "VIZ_MODE        = 'gradio'                              # 'gradio' or 'wandb'\n",
+    "VIZ_CHECKPOINT  = CONFIG.get('LOAD_CHECKPOINT', None)  # None = untrained model\n",
+    "VIZ_STAGE       = 'multi_net_single_layer'             # curriculum stage\n",
+    "VIZ_SEED        = 42                                   # board seed\n",
+    "VIZ_NUM_BOARDS  = 3                                    # W&B only: boards to route\n",
+    "VIZ_WANDB_PROJ  = CONFIG.get('WANDB_PROJECT', 'pcb-router')\n",
+    "\n",
+    "# ── Launch ────────────────────────────────────────────────────────\n",
+    "import sys, os\n",
+    "sys.path.insert(0, CONFIG['REPO_DIR'])\n",
+    "os.chdir(CONFIG['REPO_DIR'])\n",
+    "\n",
+    "if VIZ_MODE == 'gradio':\n",
+    "    # ── Gradio: interactive UI with a public *.gradio.live URL ──────\n",
+    "    try:\n",
+    "        import gradio\n",
+    "    except ImportError:\n",
+    "        import subprocess\n",
+    "        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'gradio'], check=True)\n",
+    "\n",
+    "    from scripts.visualize_routing_gradio import launch_gradio_visualizer\n",
+    "\n",
+    "    print('Launching Gradio step-by-step routing visualizer...')\n",
+    "    print('A public URL will appear below. Click it to open the UI.')\n",
+    "    launch_gradio_visualizer(\n",
+    "        checkpoint_path=VIZ_CHECKPOINT,\n",
+    "        stage=VIZ_STAGE,\n",
+    "        share=True,             # ← generates public *.gradio.live URL\n",
+    "    )\n",
+    "\n",
+    "elif VIZ_MODE == 'wandb':\n",
+    "    # ── W&B: log all steps as images to the W&B cloud dashboard ────\n",
+    "    import argparse\n",
+    "    from scripts.visualize_routing_wandb import run_visualization\n",
+    "\n",
+    "    args = argparse.Namespace(\n",
+    "        checkpoint=str(VIZ_CHECKPOINT) if VIZ_CHECKPOINT else 'none',\n",
+    "        stage=VIZ_STAGE,\n",
+    "        seed=VIZ_SEED,\n",
+    "        num_boards=VIZ_NUM_BOARDS,\n",
+    "        wandb_project=VIZ_WANDB_PROJ,\n",
+    "        wandb_run_name=None,\n",
+    "    )\n",
+    "    print(f'Logging routing steps to W&B project: {VIZ_WANDB_PROJ}')\n",
+    "    run_visualization(args)\n",
+    "\n",
+    "else:\n",
+    "    raise ValueError(f\"Unknown VIZ_MODE '{VIZ_MODE}'. Use 'gradio' or 'wandb'.\")\n",
+]
+
+# Find or insert the step-by-step visualizer cell dynamically to avoid overwriting other cells.
+viz_cell_idx = None
+checkpoint_mgmt_idx = None
+
+for idx, cell in enumerate(nb["cells"]):
+    cell_src = "".join(cell.get("source", []))
+    if "JEPA STEP-BY-STEP ROUTING VISUALIZER" in cell_src:
+        viz_cell_idx = idx
+        break
+    if "CHECKPOINT MANAGEMENT" in cell_src:
+        checkpoint_mgmt_idx = idx
+
+if viz_cell_idx is not None:
+    nb["cells"][viz_cell_idx]["source"] = viz_cell_source
+    print(f"Updated existing step-by-step routing visualizer cell at index {viz_cell_idx}")
+else:
+    viz_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": viz_cell_source,
+    }
+    if checkpoint_mgmt_idx is not None:
+        nb["cells"].insert(checkpoint_mgmt_idx, viz_cell)
+        print(f"Inserted new step-by-step routing visualizer cell at index {checkpoint_mgmt_idx}")
+    else:
+        nb["cells"].append(viz_cell)
+        print("Appended new step-by-step routing visualizer cell to the end")
+
 # Save notebook back to file
 with open(notebook_path, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1)
 
 print("Jupyter Notebook Train_PCB_Router.ipynb successfully updated!")
+
