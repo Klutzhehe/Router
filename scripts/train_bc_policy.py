@@ -39,7 +39,8 @@ class BCDataset(Dataset):
             'action': torch.tensor(t['action'], dtype=torch.long),
             'valid_mask': torch.tensor(t['valid_mask'], dtype=torch.bool),
             'steps_remaining': torch.tensor(t.get('steps_remaining', 0.0), dtype=torch.float32),
-            'graph': t['graph']
+            'graph': t['graph'],
+            'orig_size': torch.tensor(t['raster'].shape[1:], dtype=torch.float32)
         }
 
 def collate_fn(batch):
@@ -48,6 +49,9 @@ def collate_fn(batch):
     max_w = max(x['raster'].shape[2] for x in batch)
     
     padded_rasters = []
+    cursor_poses = []
+    target_poses = []
+    
     for x in batch:
         r = x['raster']
         h, w = r.shape[1], r.shape[2]
@@ -57,10 +61,21 @@ def collate_fn(batch):
             r = F.pad(r, (0, pad_w, 0, pad_h), mode='constant', value=0.0)
         padded_rasters.append(r)
         
+        # Re-normalize coordinates based on padded dimensions
+        cp = x['cursor_pos'].clone()
+        cp[0] = cp[0] * x['orig_size'][1] / max_w
+        cp[1] = cp[1] * x['orig_size'][0] / max_h
+        cursor_poses.append(cp)
+        
+        tp = x['target_pos'].clone()
+        tp[0] = tp[0] * x['orig_size'][1] / max_w
+        tp[1] = tp[1] * x['orig_size'][0] / max_h
+        target_poses.append(tp)
+        
     rasters = torch.stack(padded_rasters)
     layer_masks = torch.stack([x['layer_mask'] for x in batch])
-    cursor_poses = torch.stack([x['cursor_pos'] for x in batch])
-    target_poses = torch.stack([x['target_pos'] for x in batch])
+    cursor_poses = torch.stack(cursor_poses)
+    target_poses = torch.stack(target_poses)
     moves_remaining_fracs = torch.stack([x['moves_remaining_frac'] for x in batch])
     actions = torch.stack([x['action'] for x in batch])
     valid_masks = torch.stack([x['valid_mask'] for x in batch])
