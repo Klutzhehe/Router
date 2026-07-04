@@ -185,6 +185,7 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--unfreeze_encoders', action='store_true', default=False)
     parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--data_dir', type=str, default='data/bc_dataset', help='Directory to load dataset shards from')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -192,9 +193,9 @@ def main():
     
     # 1. Load dataset shards
     all_episodes = []
-    shard_paths = glob.glob("data/bc_dataset/*.pkl.gz") + glob.glob("data/bc_dataset/*.pkl")
+    shard_paths = glob.glob(os.path.join(args.data_dir, "*.pkl.gz")) + glob.glob(os.path.join(args.data_dir, "*.pkl"))
     if not shard_paths:
-        raise FileNotFoundError("No dataset shards found in data/bc_dataset/. Run scripts/generate_bc_dataset.py first.")
+        raise FileNotFoundError(f"No dataset shards found in {args.data_dir}/. Run scripts/generate_bc_dataset.py first.")
         
     for p in shard_paths:
         if os.path.getsize(p) == 0:

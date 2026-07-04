@@ -25,9 +25,9 @@ def cell_delta_to_action(dx, dy, dl):
                 return idx
     raise ValueError(f"Invalid move delta: {(dx, dy, dl)}")
 
-def generate_dataset():
+def generate_dataset(out_dir="data/bc_dataset"):
     # Setup directories
-    os.makedirs("data/bc_dataset", exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     
     curriculum = CurriculumManager("configs/curriculum.yaml")
     # We will generate dataset for stages s00 to s06 (Blocks A and B)
@@ -53,7 +53,7 @@ def generate_dataset():
             
         import glob
         import gzip
-        existing_eps = glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl.gz") + glob.glob(f"data/bc_dataset/{stage_name}_ep*.pkl")
+        existing_eps = glob.glob(f"{out_dir}/{stage_name}_ep*.pkl.gz") + glob.glob(f"{out_dir}/{stage_name}_ep*.pkl")
         if len(existing_eps) >= episodes_per_stage:
             print(f"Dataset for {stage_name} already generated ({len(existing_eps)} episodes). Skipping...")
             continue
@@ -83,8 +83,8 @@ def generate_dataset():
         
         seed = 42
         while successful_episodes < episodes_per_stage:
-            ep_shard_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl.gz"
-            fallback_path = f"data/bc_dataset/{stage_name}_ep{seed}.pkl"
+            ep_shard_path = f"{out_dir}/{stage_name}_ep{seed}.pkl.gz"
+            fallback_path = f"{out_dir}/{stage_name}_ep{seed}.pkl"
             if (os.path.exists(ep_shard_path) and os.path.getsize(ep_shard_path) > 0) or \
                (os.path.exists(fallback_path) and os.path.getsize(fallback_path) > 0):
                 seed += 1
@@ -296,4 +296,8 @@ def generate_dataset():
         print(f"Finished generating stage {stage_name}.\n")
         
 if __name__ == '__main__':
-    generate_dataset()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--out_dir', type=str, default='data/bc_dataset', help='Directory to save the generated dataset shards')
+    args = parser.parse_args()
+    generate_dataset(args.out_dir)
