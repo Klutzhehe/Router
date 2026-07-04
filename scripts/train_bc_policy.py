@@ -413,10 +413,11 @@ def main():
                 # Action masking
                 masked_logits = logits.masked_fill(~valid_masks, -1e4)
                 
-                loss_action = criterion_action(masked_logits, actions)
-                loss_val = criterion_value(value.squeeze(-1), steps_remainings)
-                
-                loss = loss_action + 0.001 * loss_val
+            # Compute loss outside autocast in float32 to prevent MSE overflow
+            loss_action = criterion_action(masked_logits.float(), actions)
+            loss_val = criterion_value(value.float().squeeze(-1), steps_remainings)
+            
+            loss = loss_action + 0.001 * loss_val
                 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -469,9 +470,10 @@ def main():
                     logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
                     masked_logits = logits.masked_fill(~valid_masks, -1e4)
                     
-                    loss_action = criterion_action(masked_logits, actions)
-                    loss_val = criterion_value(value.squeeze(-1), steps_remainings)
-                    loss = loss_action + 0.001 * loss_val
+                # Compute loss outside autocast in float32
+                loss_action = criterion_action(masked_logits.float(), actions)
+                loss_val = criterion_value(value.float().squeeze(-1), steps_remainings)
+                loss = loss_action + 0.001 * loss_val
                 
                 val_loss += loss.item() * rasters.size(0)
                 preds = masked_logits.argmax(dim=-1)
