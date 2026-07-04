@@ -198,8 +198,8 @@ replacement_on_update_end = """    clear_output(wait=True)
             # Log training dashboard figure as an image
             wandb.log({"training/dashboard": wandb.Image(fig, caption=f"Training Dashboard at Step {ts}")})
             
-            # Periodically log step-by-step routing viz of the whole model (every 20 updates)
-            if _update_count[0] % 20 == 0:
+            # Periodically log step-by-step routing viz of the whole model (first update + every 20 updates)
+            if _update_count[0] == 1 or _update_count[0] % 20 == 0:
                 from scripts.visualize_routing_wandb import log_training_rollout_viz
                 stage_cfg = trainer.curriculum.current_stage
                 is_dreamer = hasattr(trainer, 'jepa')
