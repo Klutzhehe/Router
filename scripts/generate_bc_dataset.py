@@ -51,6 +51,11 @@ def generate_dataset():
             print(f"Skipping {stage_name} (not found in curriculum)")
             continue
             
+        shard_path = f"data/bc_dataset/{stage_name}.pkl"
+        if os.path.exists(shard_path) and os.path.getsize(shard_path) > 0:
+            print(f"Dataset shard {shard_path} already exists. Skipping stage {stage_name}...")
+            continue
+            
         stage_idx = stage_idx_map[stage_name]
         curriculum.current_stage_idx = stage_idx
         
