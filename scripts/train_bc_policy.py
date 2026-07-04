@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
 from torch_geometric.utils import to_dense_batch
+from tqdm import tqdm
 
 from pcb_router.models.vit_encoder import ViTEncoder
 from pcb_router.models.gnn_encoder import HeteroGATEncoder
