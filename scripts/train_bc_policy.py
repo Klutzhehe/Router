@@ -313,6 +313,8 @@ def main():
     start_epoch = 0
     best_val_acc = 0.0
     
+    scaler = torch.amp.GradScaler('cuda')
+    
     # Optional load checkpoint for resume
     if args.checkpoint and os.path.exists(args.checkpoint):
         print(f"Loading checkpoint weights from {args.checkpoint}")
@@ -333,6 +335,13 @@ def main():
                     scheduler.load_state_dict(ckpt['scheduler'])
             except Exception as e:
                 print(f"Warning: Could not load optimizer/scheduler state (likely param group mismatch): {e}")
+                
+        if 'scaler' in ckpt:
+            try:
+                scaler.load_state_dict(ckpt['scaler'])
+                print("Loaded AMP GradScaler state.")
+            except Exception as e:
+                print(f"Warning: Could not load scaler state: {e}")
         
         start_epoch = ckpt.get('epoch', -1) + 1
         best_val_acc = ckpt.get('val_acc', 0.0)
@@ -354,7 +363,6 @@ def main():
     )
     
     print("\nStarting BC pretraining loop...")
-    scaler = torch.amp.GradScaler('cuda')
     for epoch in range(start_epoch, args.epochs):
         policy.train()
         if args.unfreeze_encoders:
@@ -516,6 +524,7 @@ def main():
             'fusion': fusion.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
             'val_acc': val_acc
         }, latest_path)
         
@@ -531,6 +540,7 @@ def main():
                 'fusion': fusion.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
                 'val_acc': val_acc
             }, best_path)
             print(f"  --> Saved new best checkpoint to {best_path} (Val Acc: {val_acc*100:.2f}%)")
