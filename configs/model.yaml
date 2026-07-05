@@ -2,18 +2,18 @@
 vit:
   image_channels: 13          # 8 copper layers + 5 semantic channels
   patch_size: 16
-  embed_dim: 384
-  num_heads: 6
-  num_layers: 12
+  embed_dim: 192
+  num_heads: 3
+  num_layers: 6
   mlp_ratio: 4.0
   dropout: 0.1
   max_grid_size: 256          # max 256x256 pixels; 1024 caused 4096 tokens → OOM
 
 # Heterogeneous GAT Encoder
 gnn:
-  hidden_dim: 256
-  out_dim: 384                # projected to match ViT dim for fusion
-  num_layers: 4
+  hidden_dim: 128
+  out_dim: 192                # projected to match ViT dim for fusion
+  num_layers: 3
   num_heads: 4
   dropout: 0.1
   node_types:
@@ -28,16 +28,16 @@ gnn:
 
 # Cross-Attention Fusion
 fusion:
-  num_layers: 4
-  embed_dim: 384
-  num_heads: 6
+  num_layers: 2
+  embed_dim: 192
+  num_heads: 3
   dropout: 0.1
 
 # Spatial-JEPA World Model
 jepa:
-  predictor_layers: 6
-  predictor_dim: 384
-  predictor_heads: 6
+  predictor_layers: 4
+  predictor_dim: 192
+  predictor_heads: 3
   ema_decay: 0.996            # EMA update rate for target encoder
   vicreg_weight: 0.1          # VICReg regularization weight
   variance_weight: 25.0
@@ -46,13 +46,13 @@ jepa:
 
 # Heatmap CNN Decoder
 heatmap_decoder:
-  latent_dim: 256             # policy outputs 256-dim latent vector
-  hidden_channels: [256, 128, 64, 32]
+  latent_dim: 128             # policy outputs 128-dim latent vector
+  hidden_channels: [128, 64, 32, 16]
   max_layers: 8               # max copper layers supported
   output_channels: 9          # 8 layer heatmaps + 1 via probability map
 
 # PPO Policy Network
 policy:
-  net_selector_dim: 256
-  heatmap_latent_dim: 256
-  value_hidden_dim: 256
+  net_selector_dim: 128
+  heatmap_latent_dim: 128
+  value_hidden_dim: 128
