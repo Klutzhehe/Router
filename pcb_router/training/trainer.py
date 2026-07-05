@@ -615,22 +615,21 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         heatmap_latent, fused_spatial,
                         self.env.H, self.env.W, active_layers_mask=layer_mask
                     )
-                
-                # Step the environment using detached numpy arrays
-                heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].detach().cpu().numpy()
-                via_prob_np = heatmaps_via[0, 8].detach().cpu().numpy()
-                
-                self.last_heatmap = heatmaps_np
-                self.last_net_idx = net_idx_tensor.item()
-                net_idx_int = net_idx_tensor.item()
-                nets_list = self.env.board.nets
-                net_name = nets_list[net_idx_int].name if net_idx_int < len(nets_list) else f"Net {net_idx_int}"
-                self.all_episode_heatmaps.append({
-                    'net_name': net_name or f"Net {net_idx_int}",
-                    'net_idx': net_idx_int,
-                    'heatmaps_np': heatmaps_np,
-                })
-                
+                    # Step the environment using detached numpy arrays
+                    heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].detach().cpu().numpy()
+                    via_prob_np = heatmaps_via[0, 8].detach().cpu().numpy()
+                    
+                    self.last_heatmap = heatmaps_np
+                    self.last_net_idx = net_idx_tensor.item()
+                    net_idx_int = net_idx_tensor.item()
+                    nets_list = self.env.board.nets
+                    net_name = nets_list[net_idx_int].name if net_idx_int < len(nets_list) else f"Net {net_idx_int}"
+                    self.all_episode_heatmaps.append({
+                        'net_name': net_name or f"Net {net_idx_int}",
+                        'net_idx': net_idx_int,
+                        'heatmaps_np': heatmaps_np,
+                    })
+                    
                     next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
                         net_idx_tensor.item(), heatmaps_np, via_prob_np
                     )
@@ -640,21 +639,21 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     # Supervised update for decoder and encoders on successful paths
                     if next_info.get('connected', False) and 'path' in next_info and len(next_info['path']) > 1:
                         all_routed_path = next_info['path']
-                    # target has same layers as env + 1 (for via)
-                    target_heatmap = torch.zeros((self.env.board.num_layers + 1, self.env.H, self.env.W), device=self.device)
-                    for idx, wp in enumerate(all_routed_path):
-                        wx, wy, wl = wp
-                        if 0 <= wx < self.env.W and 0 <= wy < self.env.H and 0 <= wl < self.env.board.num_layers:
-                            target_heatmap[wl, wy, wx] = 1.0
-                            # Mark via
-                            if idx > 0 and all_routed_path[idx-1][2] != wl:
-                                target_heatmap[-1, wy, wx] = 1.0
-                                
-                    # Match channels: pred has shape (9, H, W). We take layers 0..num_layers, and layer 8 (via map)
-                    pred_layers = heatmaps_via[0, :self.env.board.num_layers]
-                    pred_via = heatmaps_via[0, 8:9]
-                    pred_selected = torch.cat([pred_layers, pred_via], dim=0)
-                    
+                        # target has same layers as env + 1 (for via)
+                        target_heatmap = torch.zeros((self.env.board.num_layers + 1, self.env.H, self.env.W), device=self.device)
+                        for idx, wp in enumerate(all_routed_path):
+                            wx, wy, wl = wp
+                            if 0 <= wx < self.env.W and 0 <= wy < self.env.H and 0 <= wl < self.env.board.num_layers:
+                                target_heatmap[wl, wy, wx] = 1.0
+                                # Mark via
+                                if idx > 0 and all_routed_path[idx-1][2] != wl:
+                                    target_heatmap[-1, wy, wx] = 1.0
+                                    
+                        # Match channels: pred has shape (9, H, W). We take layers 0..num_layers, and layer 8 (via map)
+                        pred_layers = heatmaps_via[0, :self.env.board.num_layers]
+                        pred_via = heatmaps_via[0, 8:9]
+                        pred_selected = torch.cat([pred_layers, pred_via], dim=0)
+                        
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
                             # Use weighted BCE to handle the massive class imbalance of sparse path pixels
                             # Cast to float32 to prevent underflow or NaN issues with BCE in float16
