@@ -1237,28 +1237,27 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         update = torch.zeros_like(unrouted_mask, dtype=torch.bool)
                         update = update.scatter(1, net_idx.unsqueeze(-1), True)
                         unrouted_mask = unrouted_mask & ~update
-                    
-                bootstrap_value = self.policy.get_value(h, z)
-                
-                traj_h = torch.stack(traj_h, dim=0)
-                traj_z = torch.stack(traj_z, dim=0)
-                traj_rewards = torch.stack(traj_rewards, dim=0)
-                traj_continues = torch.stack(traj_continues, dim=0)
-                traj_values = torch.stack(traj_values, dim=0)
-                traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
-                if self.routing_mode != 'autoregressive':
-                    traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
-                
-                lambda_returns = compute_lambda_returns(
-                    rewards=traj_rewards,
-                    values=traj_values,
-                    continues=traj_continues,
-                    bootstrap=bootstrap_value,
-                    gamma=self.gamma,
-                    lam=self.lambda_
-                )
-                
-                targets = lambda_returns.detach()
+            bootstrap_value = self.policy.get_value(h, z)
+            
+            traj_h = torch.stack(traj_h, dim=0)
+            traj_z = torch.stack(traj_z, dim=0)
+            traj_rewards = torch.stack(traj_rewards, dim=0)
+            traj_continues = torch.stack(traj_continues, dim=0)
+            traj_values = torch.stack(traj_values, dim=0)
+            traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
+            if self.routing_mode != 'autoregressive':
+                traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
+            
+            lambda_returns = compute_lambda_returns(
+                rewards=traj_rewards,
+                values=traj_values,
+                continues=traj_continues,
+                bootstrap=bootstrap_value,
+                gamma=self.gamma,
+                lam=self.lambda_
+            )
+            
+            targets = lambda_returns.detach()
             
             self.actor_opt.zero_grad(set_to_none=True)
             self.critic_opt.zero_grad(set_to_none=True)

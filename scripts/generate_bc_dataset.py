@@ -17,8 +17,8 @@ def cell_delta_to_action(dx, dy, dl):
         return 9
     else:
         moves = [
-            (0, 1), (0, -1), (1, 0), (-1, 0),
-            (1, 1), (1, -1), (-1, 1), (-1, -1)
+            (0, 1), (1, 1), (1, 0), (1, -1),
+            (0, -1), (-1, -1), (-1, 0), (-1, 1)
         ]
         for idx, (mdx, mdy) in enumerate(moves):
             if mdx == dx and mdy == dy:
