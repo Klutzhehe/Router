@@ -1359,7 +1359,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             target_pos_list.append(ep.target_poses_tensor[idx])
             moves_frac_list.append(ep.moves_remaining_fracs_tensor[idx])
             moves_dec_list.append(ep.max_moves_fracs_tensor[idx])
-            fused_sp_list.append(ep.fused_spatials_tensor[idx])
+            fused_sp_list.append(ep.fused_spatials_tensor[idx].clone())
             
         cursor_pos_img = torch.stack(cursor_pos_list).to(self.device)
         target_pos_img = torch.stack(target_pos_list).to(self.device)
@@ -1438,6 +1438,17 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             if mask_down.any():
                 cursor_delta[mask_down, 2] = 1.0
                 
+            # Boundary checks
+            proposed_grid = torch.round(cursor_pos_img * board_dims + cursor_delta)
+            out_of_bounds = (
+                (proposed_grid[:, 0] < 0) | (proposed_grid[:, 0] >= board_dims[:, 0]) |
+                (proposed_grid[:, 1] < 0) | (proposed_grid[:, 1] >= board_dims[:, 1]) |
+                (proposed_grid[:, 2] < 0) | (proposed_grid[:, 2] >= board_dims[:, 2])
+            )
+            
+            if out_of_bounds.any():
+                cursor_delta[out_of_bounds] = 0.0
+                
             # Convert delta to normalized units using per-episode board_dims
             cursor_delta_norm = cursor_delta / board_dims
             
@@ -1448,6 +1459,18 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             # Store next cursor position
             traj_cursor_poses.append(cursor_pos_img.clone())
             
+            # Update fused spatials based on occupancy changes (only for valid moves)
+            for idx in range(B_size):
+                if not out_of_bounds[idx]:
+                    N_patches = fused_sp_list[idx].shape[0]
+                    grid_w = int(math.sqrt(N_patches))
+                    cx = int(torch.clamp(cursor_pos_img[idx, 0], 0.0, 0.99) * grid_w)
+                    cy = int(torch.clamp(cursor_pos_img[idx, 1], 0.0, 0.99) * grid_w)
+                    if 0 <= cx < grid_w and 0 <= cy < grid_w:
+                        cell_idx = cy * grid_w + cx
+                        if cell_idx < N_patches:
+                            fused_sp_list[idx][cell_idx] = fused_sp_list[idx][cell_idx] * 0.5
+            
             # Evolve model states h, z
             action_onehot = F.one_hot(action_id, num_classes=10).float()
             action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
@@ -1457,6 +1480,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
             pred_continue = torch.sigmoid(pred_continue_logits)
             
+            if out_of_bounds.any():
+                pred_reward[out_of_bounds] = -1.0
+                
             traj_rewards.append(pred_reward)
             traj_continues.append(pred_continue)
             
