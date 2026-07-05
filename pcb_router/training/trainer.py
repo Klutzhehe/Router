@@ -78,6 +78,28 @@ class RolloutBuffer:
             done_next = self.dones[t]
 
 
+def get_valid_mask(env):
+    cx, cy, cl = env.cursor_pos
+    tx, ty, tl = env.target_pos
+    active_layers = list(range(env.board.num_layers))
+    exempt = {(cx, cy), (tx, ty)}
+    temp_obs = build_obstacle_maps(env.board_state, active_layers, exempt, shape=(env.H, env.W))
+    temp_via = build_via_blocked_maps(env.board_state, temp_obs, active_layers, shape=(env.H, env.W))
+    
+    valid_mask = np.zeros(10, dtype=bool)
+    for a_idx in range(8):
+        mdx, mdy, _ = env.pathfinder.moves[a_idx]
+        mx, my = cx + mdx, cy + mdy
+        if 0 <= mx < env.W and 0 <= my < env.H:
+            if not temp_obs[cl][my, mx]:
+                valid_mask[a_idx] = True
+    for dl_idx, v_dl in enumerate([-1, 1]):
+        v_nl = cl + v_dl
+        if v_nl in active_layers:
+            if not temp_via[cl][cy, cx] and not temp_via[v_nl][cy, cx]:
+                valid_mask[8 + dl_idx] = True
+    return valid_mask
+
 class BaseRoutingTrainer:
     def __init__(
         self,
