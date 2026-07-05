@@ -848,6 +848,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         cursor_prev = self.env.cursor_pos
                         next_obs, reward, terminated, truncated, next_info = self.env.step({'action_id': action})
                         cursor_curr = self.env.cursor_pos
+                        if cursor_curr is None:
+                            cursor_curr = getattr(self.env, 'last_cursor_pos', cursor_prev)
+                            if cursor_curr is None:
+                                cursor_curr = cursor_prev
                         
                         net_done = (self.env.current_net_index is None)
                         done = terminated or truncated

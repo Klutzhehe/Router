@@ -324,6 +324,7 @@ class PCBRoutingEnv(gym.Env):
                 )
                 
                 # Clear step state for this net
+                self.last_cursor_pos = (cx, cy, cl)
                 self.current_net_index = None
                 self.cursor_pos = None
                 self.target_pos = None
@@ -352,6 +353,7 @@ class PCBRoutingEnv(gym.Env):
             step_reward += terminal_penalty
             
             # Clear step state
+            self.last_cursor_pos = (cx, cy, cl)
             self.current_net_index = None
             self.cursor_pos = None
             self.target_pos = None
@@ -392,6 +394,7 @@ class PCBRoutingEnv(gym.Env):
         # Reset step routing state
         self.current_net_index = None
         self.cursor_pos = None
+        self.last_cursor_pos = None
         self.target_pos = None
         self.remaining_targets = []
         self.moves_taken = 0
