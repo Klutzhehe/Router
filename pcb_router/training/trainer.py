@@ -455,7 +455,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     ckpt = torch.load(bc_path, map_location=self.device)
                     policy_state = ckpt.get('policy', ckpt)
                     self.policy.step_policy.load_state_dict(policy_state)
-                    print("Pretrained BC weights successfully loaded! ✓")
+                    
+                    # Also load the frozen visual and graph encoders!
+                    if 'vit' in ckpt: self.vit.load_state_dict(ckpt['vit'])
+                    if 'gnn' in ckpt: self.gnn.load_state_dict(ckpt['gnn'])
+                    if 'fusion' in ckpt: self.fusion.load_state_dict(ckpt['fusion'])
+                    
+                    print("Pretrained BC weights (Policy + Encoders) successfully loaded! ✓")
                 except Exception as e:
                     print(f"Warning: Failed to load pretrained BC weights: {e}")
             else:
