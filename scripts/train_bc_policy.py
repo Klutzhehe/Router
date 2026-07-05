@@ -62,16 +62,15 @@ class BCIterableDataset(IterableDataset):
                 
             for t in transitions:
                 yield {
-                    'raster': torch.tensor(t['raster'], dtype=torch.float32),
-                    'layer_mask': torch.tensor(t['layer_mask'], dtype=torch.float32),
-                    'cursor_pos': torch.tensor(t['cursor_pos'], dtype=torch.float32),
-                    'target_pos': torch.tensor(t['target_pos'], dtype=torch.float32),
-                    'moves_remaining_frac': torch.tensor(t['moves_remaining_frac'], dtype=torch.float32),
-                    'action': torch.tensor(t['action'], dtype=torch.long),
-                    'valid_mask': torch.tensor(t['valid_mask'], dtype=torch.bool),
-                    'steps_remaining': torch.tensor(t['steps_remaining'], dtype=torch.float32),
-                    'graph': t['graph'],
-                    'orig_size': torch.tensor(t['raster'].shape[1:], dtype=torch.float32)
+                    'raster': t['raster'],
+                    'layer_mask': t['layer_mask'],
+                    'cursor_pos': t['cursor_pos'],
+                    'target_pos': t['target_pos'],
+                    'moves_remaining_frac': t['moves_remaining_frac'],
+                    'action': t['action'],
+                    'valid_mask': t['valid_mask'],
+                    'steps_remaining': t['steps_remaining'],
+                    'graph': t['graph']
                 }
 
 def collate_fn(batch):
@@ -84,7 +83,8 @@ def collate_fn(batch):
     target_poses = []
     
     for x in batch:
-        r = x['raster']
+        # Convert numpy array to tensor efficiently using from_numpy
+        r = torch.from_numpy(x['raster']).float()
         h, w = r.shape[1], r.shape[2]
         pad_h = max_h - h
         pad_w = max_w - w
@@ -92,25 +92,27 @@ def collate_fn(batch):
             r = F.pad(r, (0, pad_w, 0, pad_h), mode='constant', value=0.0)
         padded_rasters.append(r)
         
+        orig_h, orig_w = x['raster'].shape[1], x['raster'].shape[2]
+        
         # Re-normalize coordinates based on padded dimensions
-        cp = x['cursor_pos'].clone()
-        cp[0] = cp[0] * x['orig_size'][1] / max_w
-        cp[1] = cp[1] * x['orig_size'][0] / max_h
+        cp = torch.tensor(x['cursor_pos'], dtype=torch.float32)
+        cp[0] = cp[0] * orig_w / max_w
+        cp[1] = cp[1] * orig_h / max_h
         cursor_poses.append(cp)
         
-        tp = x['target_pos'].clone()
-        tp[0] = tp[0] * x['orig_size'][1] / max_w
-        tp[1] = tp[1] * x['orig_size'][0] / max_h
+        tp = torch.tensor(x['target_pos'], dtype=torch.float32)
+        tp[0] = tp[0] * orig_w / max_w
+        tp[1] = tp[1] * orig_h / max_h
         target_poses.append(tp)
         
     rasters = torch.stack(padded_rasters)
-    layer_masks = torch.stack([x['layer_mask'] for x in batch])
+    layer_masks = torch.stack([torch.from_numpy(x['layer_mask']).float() for x in batch])
     cursor_poses = torch.stack(cursor_poses)
     target_poses = torch.stack(target_poses)
-    moves_remaining_fracs = torch.stack([x['moves_remaining_frac'] for x in batch])
-    actions = torch.stack([x['action'] for x in batch])
-    valid_masks = torch.stack([x['valid_mask'] for x in batch])
-    steps_remainings = torch.stack([x['steps_remaining'] for x in batch])
+    moves_remaining_fracs = torch.tensor([x['moves_remaining_frac'] for x in batch], dtype=torch.float32)
+    actions = torch.tensor([x['action'] for x in batch], dtype=torch.long)
+    valid_masks = torch.stack([torch.from_numpy(x['valid_mask']).bool() for x in batch])
+    steps_remainings = torch.tensor([x['steps_remaining'] for x in batch], dtype=torch.float32)
     
     graphs = [x['graph'] for x in batch]
     
@@ -244,15 +246,16 @@ def main():
     train_dataset = BCIterableDataset(train_paths, shuffle=True)
     val_dataset = BCIterableDataset(val_paths, shuffle=False)
     
-    # num_workers=0: runs in main thread to avoid Colab shared memory crashes
+    # num_workers=2: Safe maximum for Colab's 2 CPU cores. Loads data in parallel background threads
     # pin_memory=True: enables faster CPU→GPU tensor transfers
+    num_workers = 2 if torch.cuda.is_available() else 0
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
     )
     
     # 3. Init encoders and policy
