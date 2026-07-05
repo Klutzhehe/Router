@@ -849,7 +849,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             pad_embs = node_embs['pad'].unsqueeze(0)
                             fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
                             
-                            logits, value = self.policy.forward_step(fused_spatial, cursor_norm, target_norm, moves_frac, h, z)
+                            logits, value = self.policy.forward_step(fused_spatial, cursor_norm, target_norm, moves_frac)
                             if not hasattr(self, 'current_net_values') or self.current_net_values is None:
                                 self.current_net_values = []
                             self.current_net_values.append(value.item())
@@ -1402,7 +1402,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             
             # Policy forward step using current dynamically evolved observations
             logits, value = self.policy.forward_step_cropped(
-                cropped_spatial, cursor_pos_img, target_pos_img, moves_remaining_frac_img, h, z
+                cropped_spatial, cursor_pos_img, target_pos_img, moves_remaining_frac_img
             )
             
             probs = F.softmax(logits, dim=-1)
