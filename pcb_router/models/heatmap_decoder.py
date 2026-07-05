@@ -11,6 +11,7 @@ class HeatmapDecoder(nn.Module):
     ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.spatial_dim = spatial_dim
         self.max_layers = max_layers
         
         # 1. Project policy latent to a small 4x4 spatial feature map
@@ -63,8 +64,8 @@ class HeatmapDecoder(nn.Module):
         x_latent = F.interpolate(x_latent, size=(H_p, W_p), mode='bilinear', align_corners=False)
         
         # 2. Reshape and project spatial context to (B, 256, H_p, W_p)
-        # spatial_context shape is (B, H_p * W_p, 384)
-        x_spatial = spatial_context.transpose(1, 2).view(B, 384, H_p, W_p)
+        # spatial_context shape is (B, H_p * W_p, spatial_dim)
+        x_spatial = spatial_context.transpose(1, 2).view(B, self.spatial_dim, H_p, W_p)
         x_spatial = self.spatial_proj(x_spatial)
         
         # Fuse latent and spatial context
