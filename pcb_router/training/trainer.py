@@ -1346,20 +1346,39 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         moves_decrement = torch.stack(moves_dec_list).to(self.device).unsqueeze(-1)
         
         # Static Map/Moving Window Approximation:
-        # We hold the global board representation (fused_spatial_img) static across the imagined horizon,
+        # We hold the global board representation static across the imagined horizon,
         # which means the policy crops its window based on where it moves (dynamic cursor),
         # but the underlying board occupancy (wires/obstacles) is not dynamically updated.
-        fused_spatial_img = torch.stack(fused_sp_list).to(self.device)
+        # Since different episodes can have different board sizes (varying N_patches),
+        # we keep them as a list of raw tensors and group/crop them dynamically inside the loop.
         
         board_dims = torch.tensor([ep.board_dims for ep in sampled_episodes], dtype=torch.float32, device=self.device)
+        B_size = len(sampled_episodes)
         
         # Store the cursor at t=0
         traj_cursor_poses.append(cursor_pos_img.clone())
         
         # 2. Rollout loop
         for t in range(current_horizon):
-            # Crop spatial features dynamically using the current cursor position
-            cropped_spatial = self.policy.step_policy.crop_spatial(fused_spatial_img, cursor_pos_img)
+            # Group by N_patches to batch-crop efficiently (handles varying board/grid sizes in the batch)
+            crop_size = self.policy.step_policy.crop_size
+            embed_dim = self.policy.step_policy.embed_dim
+            crop_dim = crop_size * crop_size * embed_dim
+            
+            cropped_spatial = torch.zeros((B_size, crop_dim), device=self.device, dtype=cursor_pos_img.dtype)
+            
+            groups = {}
+            for idx_in_batch, f_sp in enumerate(fused_sp_list):
+                N_patches = f_sp.shape[0]
+                if N_patches not in groups:
+                    groups[N_patches] = []
+                groups[N_patches].append(idx_in_batch)
+                
+            for N_patches, indices in groups.items():
+                group_fused = torch.stack([fused_sp_list[idx] for idx in indices]).to(self.device) # shape (G, N_patches, C)
+                group_cursor = cursor_pos_img[indices] # shape (G, 3)
+                group_cropped = self.policy.step_policy.crop_spatial(group_fused, group_cursor) # shape (G, crop_dim)
+                cropped_spatial[indices] = group_cropped
             
             # Policy forward step using current dynamically evolved observations
             logits, value = self.policy.forward_step_cropped(
