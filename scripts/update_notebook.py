@@ -307,12 +307,13 @@ if CONFIG.get("LAUNCH_GRADIO_DURING_TRAINING", False):
 
 print(f"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...")"""
 
-if target_training_start in training_source_str:
-    training_source_str = training_source_str.replace(target_training_start, replacement_training_start)
-else:
-    # Try alt format single quotes
-    target_training_start_alt = "print(f\\\"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...\\\")"
-    training_source_str = training_source_str.replace(target_training_start_alt, replacement_training_start)
+if "LAUNCH_GRADIO_DURING_TRAINING" not in training_source_str:
+    if target_training_start in training_source_str:
+        training_source_str = training_source_str.replace(target_training_start, replacement_training_start)
+    else:
+        # Try alt format single quotes
+        target_training_start_alt = "print(f\\\"Starting training for {CONFIG['TOTAL_TIMESTEPS']:,} timesteps...\\\")"
+        training_source_str = training_source_str.replace(target_training_start_alt, replacement_training_start)
 
 # ── Dynamic replacement for the right board state panel ──────────────────
 try_start_idx = training_source_str.find("    # \\u2500\\u2500 Board state panel")
