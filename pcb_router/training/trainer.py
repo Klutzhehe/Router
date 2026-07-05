@@ -852,6 +852,15 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
                             
                             logits, value = self.policy.forward_step(fused_spatial, cursor_norm, target_norm, moves_frac, h, z)
+                            
+                            # Populate last_heatmap for visualization (JEPA feature activation map)
+                            N_p = fused_spatial.shape[1]
+                            grid_w = int(np.sqrt(N_p))
+                            feat_map = fused_spatial[0].mean(dim=-1).cpu().numpy()
+                            feat_map_2d = feat_map.reshape(grid_w, grid_w)
+                            num_layers = self.env.board.num_layers
+                            self.last_heatmap = np.stack([feat_map_2d] * num_layers, axis=0)
+                            
                             if not hasattr(self, 'current_net_values') or self.current_net_values is None:
                                 self.current_net_values = []
                             self.current_net_values.append(value.item())
