@@ -379,6 +379,10 @@ class PCBRoutingEnv(gym.Env):
         info = self._get_info()
         info['connected'] = success
         info['path'] = self.current_net_path if success else []
+        info['dist_delta'] = float(dist_delta)
+        info['invalid_move'] = invalid_move
+        info['direction_changed'] = direction_changed
+        info['is_via'] = is_via
         
         return obs, step_reward, terminated, truncated, info
 

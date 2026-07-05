@@ -462,8 +462,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'timesteps': [],
             'completion_rate': [],
             'loss_wm': [],
+            'loss_wm_reward': [],
             'loss_actor': [],
             'loss_critic': [],
+            'mean_dist_delta': [],
             'stage': [],
         }
         
@@ -599,6 +601,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         
         steps_collected = 0
         completion_rates = []
+        dist_deltas = []
         
         if self.routing_mode == 'heatmap':
             while steps_collected < num_steps:
@@ -733,6 +736,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     )
                     
                     done = terminated or truncated
+                    if next_info and 'dist_delta' in next_info:
+                        dist_deltas.append(next_info['dist_delta'])
                     
                     with torch.no_grad():
                         next_raster = torch.tensor(next_obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -790,6 +795,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     self.last_completed_board_state = copy.deepcopy(self.env.board_state)
                     self.last_completed_board = copy.deepcopy(self.env.board)
                     
+            self.mean_dist_delta = np.mean(dist_deltas) if dist_deltas else 0.0
             return np.mean(completion_rates) if completion_rates else 0.0
         else:
             # Autoregressive mode
@@ -861,6 +867,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                                 
                         cursor_prev = self.env.cursor_pos
                         next_obs, reward, terminated, truncated, next_info = self.env.step({'action_id': action})
+                        if next_info and 'dist_delta' in next_info:
+                            dist_deltas.append(next_info['dist_delta'])
                         cursor_curr = self.env.cursor_pos
                         if cursor_curr is None:
                             cursor_curr = getattr(self.env, 'last_cursor_pos', cursor_prev)
@@ -937,6 +945,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     self.last_completed_board_state = copy.deepcopy(self.env.board_state)
                     self.last_completed_board = copy.deepcopy(self.env.board)
                     
+            self.mean_dist_delta = np.mean(dist_deltas) if dist_deltas else 0.0
             return np.mean(completion_rates) if completion_rates else 0.0
 
     def _phase2_train_world_model(self):
@@ -1476,22 +1485,26 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             self.metrics_history['timesteps'].append(self.total_timesteps)
             self.metrics_history['completion_rate'].append(mean_completion)
             self.metrics_history['loss_wm'].append(wm_metrics['loss_wm'])
+            self.metrics_history['loss_wm_reward'].append(wm_metrics.get('loss_wm_reward', 0.0))
             self.metrics_history['loss_actor'].append(ac_metrics['loss_actor'])
             self.metrics_history['loss_critic'].append(ac_metrics['loss_critic'])
+            self.metrics_history['mean_dist_delta'].append(self.mean_dist_delta)
             self.metrics_history['stage'].append(self.curriculum.current_stage_name)
             
             print(f"[Step {self.total_timesteps}/{total_timesteps}] "
                   f"Stage: '{self.curriculum.current_stage_name}' | "
                   f"Completion: {mean_completion:.2f} | "
-                  f"Loss WM: {wm_metrics['loss_wm']:.4f} | "
+                  f"Loss WM: {wm_metrics['loss_wm']:.4f} (Reward: {wm_metrics.get('loss_wm_reward', 0.0):.4f}) | "
                   f"Loss Actor: {ac_metrics['loss_actor']:.4f} | "
-                  f"Loss Critic: {ac_metrics['loss_critic']:.4f}")
+                  f"Loss Critic: {ac_metrics['loss_critic']:.4f} | "
+                  f"Dist Delta: {self.mean_dist_delta:.4f}")
             
             progress_bar.n = self.total_timesteps
             progress_bar.set_postfix({
                 'stage': self.curriculum.current_stage_name,
                 'comp_rate': f"{mean_completion:.2f}",
-                'loss_wm': f"{wm_metrics['loss_wm']:.3f}",
+                'loss_wm_rew': f"{wm_metrics.get('loss_wm_reward', 0.0):.3f}",
+                'dist_delta': f"{self.mean_dist_delta:.3f}",
                 'loss_actor': f"{ac_metrics['loss_actor']:.3f}"
             })
             progress_bar.refresh()
