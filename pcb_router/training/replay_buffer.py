@@ -11,6 +11,11 @@ class Episode:
         self.dones: List[bool] = []
         self.length: int = 0
         self._finalized = False
+        
+        self.cached_h = None
+        self.cached_z = None
+        self.fused_spatials: List[torch.Tensor] = []
+        self.max_moves_fracs: List[float] = []
 
     def append(self, context_embedding: torch.Tensor, action: Tuple[torch.Tensor, torch.Tensor], reward: float, done: bool):
         if self._finalized:
@@ -61,6 +66,10 @@ class Episode:
             self.target_poses_tensor = torch.stack(self.target_poses).cpu()
         if hasattr(self, 'moves_remaining_fracs') and self.moves_remaining_fracs:
             self.moves_remaining_fracs_tensor = torch.stack(self.moves_remaining_fracs).cpu()
+        if hasattr(self, 'fused_spatials') and self.fused_spatials:
+            self.fused_spatials_tensor = torch.stack(self.fused_spatials).cpu()
+        if hasattr(self, 'max_moves_fracs') and self.max_moves_fracs:
+            self.max_moves_fracs_tensor = torch.tensor(self.max_moves_fracs, dtype=torch.float32).cpu()
 
         # Clear lists to reclaim memory
         self.context_embeddings = []
@@ -81,6 +90,10 @@ class Episode:
             self.target_poses = []
         if hasattr(self, 'moves_remaining_fracs'):
             self.moves_remaining_fracs = []
+        if hasattr(self, 'fused_spatials'):
+            self.fused_spatials = []
+        if hasattr(self, 'max_moves_fracs'):
+            self.max_moves_fracs = []
         self._finalized = True
 
 

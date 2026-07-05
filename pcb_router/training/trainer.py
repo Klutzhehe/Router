@@ -471,6 +471,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         self.last_net_idx = None
         self.all_episode_heatmaps = []  # list of {'net_name', 'net_idx', 'heatmaps_np'} per net in last episode
         
+        self.autoregressive_fallback_count = 0
+        self.autoregressive_total_count = 0
+        
         if load_checkpoint_path is not None:
             self.load_checkpoint(load_checkpoint_path)
         elif self.routing_mode == 'autoregressive':
@@ -797,6 +800,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 episode.cursor_poses = []
                 episode.target_poses = []
                 episode.moves_remaining_fracs = []
+                episode.fused_spatials = []
+                episode.max_moves_fracs = []
+                episode.board_dims = (self.env.W, self.env.H, self.env.board.num_layers)
                 
                 h, z = self.jepa.initial_state(batch_size=1, device=self.device)
                 
@@ -904,6 +910,11 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             episode.cursor_poses.append(cursor_norm.detach().squeeze(0).cpu())
                             episode.target_poses.append(target_norm.detach().squeeze(0).cpu())
                             episode.moves_remaining_fracs.append(moves_frac.detach().squeeze(0).cpu())
+                            episode.fused_spatials.append(fused_spatial.detach().squeeze(0).cpu())
+                            
+                            max_moves = curr_info.get('max_moves_per_net', 0)
+                            moves_frac_val = 1.0 / max(1, max_moves)
+                            episode.max_moves_fracs.append(moves_frac_val)
                             
                         obs = next_obs
                         info = next_info
@@ -952,6 +963,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         b_target = []
         b_moves = []
         
+        sampled_ep_info = []
         for ep in sampled_episodes:
             if ep.length >= seq_len:
                 start = random.randint(0, ep.length - seq_len)
@@ -959,6 +971,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             else:
                 start = 0
                 end = ep.length
+            sampled_ep_info.append((ep, start, end))
             
             ctx_tensor = ep.context_embeddings_tensor[start:end]
             tgt_tensor = ep.target_context_embeddings_tensor[start:end]
@@ -1043,6 +1056,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         with torch.no_grad():
             B_b, T_b = batch['context_embeddings'].shape[0], batch['context_embeddings'].shape[1]
             h, z = self.jepa.initial_state(B_b, self.device)
+            h_init = h.clone()
+            z_init = z.clone()
             flat_net = batch['net_actions'].reshape(-1)
             flat_heat = batch['heatmap_actions'].reshape(-1, batch['heatmap_actions'].shape[-1])
             if flat_heat.shape[-1] == 3:
@@ -1057,7 +1072,29 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 all_h.append(h)
                 all_z.append(z)
             if all_h:
-                self.replay_buffer.cache_latents(torch.stack(all_h, dim=1), torch.stack(all_z, dim=1))
+                h_seq = torch.stack(all_h, dim=1)
+                z_seq = torch.stack(all_z, dim=1)
+                self.replay_buffer.cache_latents(h_seq, z_seq)
+                
+                h_init_cpu = h_init.detach().cpu()
+                z_init_cpu = z_init.detach().cpu()
+                h_seq_cpu = h_seq.detach().cpu()
+                z_seq_cpu = z_seq.detach().cpu()
+                
+                h_dim = h_seq_cpu.shape[-1]
+                z_dim = z_seq_cpu.shape[-1]
+                
+                for i in range(B_b):
+                    ep, start, end = sampled_ep_info[i]
+                    if ep.cached_h is None:
+                        ep.cached_h = torch.zeros((ep.length, h_dim), dtype=torch.float32)
+                        ep.cached_z = torch.zeros((ep.length, z_dim), dtype=torch.float32)
+                    ep.cached_h[start] = h_init_cpu[i]
+                    ep.cached_z[start] = z_init_cpu[i]
+                    valid_len = end - start - 1
+                    if valid_len > 0:
+                        ep.cached_h[start + 1:end] = h_seq_cpu[i, :valid_len]
+                        ep.cached_z[start + 1:end] = z_seq_cpu[i, :valid_len]
                 
         return {
             'loss_wm': total_loss.item(),
@@ -1080,27 +1117,73 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         metrics = defaultdict(list)
         
         for update_step in range(self.train_ratio):
-            init_states = self.replay_buffer.sample_latents(self.imagine_batch_size, device=self.device)
-            
-            if init_states is None:
-                h0, z0 = self.jepa.initial_state(self.imagine_batch_size, device=self.device)
-            else:
-                h0, z0 = init_states['h'], init_states['z']
-                
-            h0 = h0.detach()
-            z0 = z0.detach()
-            
             sampled_episodes = random.choices(self.replay_buffer.episodes, k=self.imagine_batch_size)
+            sampled_indices = [random.randint(0, max(0, ep.length - 1)) for ep in sampled_episodes]
             
-            net_embs_list = []
-            unrouted_mask_list = []
-            for ep in sampled_episodes:
-                net_embs_list.append(ep.net_embeddings)
-                idx = random.randint(0, ep.length - 1)
-                unrouted_mask_list.append(ep.unrouted_masks[idx])
+            if self.routing_mode == 'autoregressive':
+                h0_list = []
+                z0_list = []
+                for i, ep in enumerate(sampled_episodes):
+                    idx = sampled_indices[i]
+                    if ep.cached_h is not None:
+                        h0_list.append(ep.cached_h[idx].to(self.device))
+                        z0_list.append(ep.cached_z[idx].to(self.device))
+                        self.autoregressive_total_count += 1
+                    else:
+                        single_h, single_z = self.jepa.initial_state(batch_size=1, device=self.device)
+                        h0_list.append(single_h.squeeze(0))
+                        z0_list.append(single_z.squeeze(0))
+                        self.autoregressive_fallback_count += 1
+                        self.autoregressive_total_count += 1
+                h0 = torch.stack(h0_list).detach()
+                z0 = torch.stack(z0_list).detach()
                 
-            net_embeddings = torch.stack(net_embs_list).to(self.device)
-            unrouted_mask = torch.stack(unrouted_mask_list).to(self.device)
+                # Debug assertions check
+                if getattr(self, 'debug_assertions', False):
+                    for i in range(min(5, self.imagine_batch_size)):
+                        ep = sampled_episodes[i]
+                        idx = sampled_indices[i]
+                        if ep.cached_h is not None and not torch.all(ep.cached_h[0] == 0):
+                            h_check, z_check = self.jepa.initial_state(batch_size=1, device=self.device)
+                            for t in range(idx):
+                                ctx_t = ep.context_embeddings_tensor[t].unsqueeze(0).to(self.device)
+                                net_act_t = ep.net_actions_tensor[t].unsqueeze(0).to(self.device)
+                                heat_act_t = ep.heatmap_actions_tensor[t].unsqueeze(0).to(self.device)
+                                
+                                if heat_act_t.shape[-1] == 3:
+                                    move_action_onehot = F.one_hot(net_act_t.long(), num_classes=10).float()
+                                    action_emb_t = self.jepa.get_action_embedding_move(move_action_onehot, heat_act_t)
+                                else:
+                                    action_emb_t = self.jepa.get_action_embedding(net_act_t, heat_act_t)
+                                    
+                                h_check, z_check, _, _ = self.jepa.rssm_step(h_check, z_check, ctx_t, action_emb_t)
+                                
+                            h_cached = ep.cached_h[idx].to(self.device)
+                            assert torch.allclose(h_check.squeeze(0), h_cached, atol=1e-3, rtol=1e-3), \
+                                f"Debug assertion failed: cached h at idx {idx} does not match recomputed h!"
+                
+                net_embeddings = None
+                unrouted_mask = None
+            else:
+                init_states = self.replay_buffer.sample_latents(self.imagine_batch_size, device=self.device)
+                
+                if init_states is None:
+                    h0, z0 = self.jepa.initial_state(self.imagine_batch_size, device=self.device)
+                else:
+                    h0, z0 = init_states['h'], init_states['z']
+                    
+                h0 = h0.detach()
+                z0 = z0.detach()
+                
+                net_embs_list = []
+                unrouted_mask_list = []
+                for ep in sampled_episodes:
+                    net_embs_list.append(ep.net_embeddings)
+                    idx = random.randint(0, ep.length - 1)
+                    unrouted_mask_list.append(ep.unrouted_masks[idx])
+                    
+                net_embeddings = torch.stack(net_embs_list).to(self.device)
+                unrouted_mask = torch.stack(unrouted_mask_list).to(self.device)
             
             h, z = h0, z0
             traj_h = []
@@ -1116,84 +1199,20 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             current_horizon = self._current_imagination_horizon()
             
             if self.routing_mode == 'autoregressive':
-                cropped_sp_list = []
-                cursor_pos_list = []
-                target_pos_list = []
-                moves_frac_list = []
-                
-                for ep in sampled_episodes:
-                    idx = random.randint(0, max(0, ep.length - 1))
-                    end_idx = min(idx + current_horizon, ep.length)
-                    pad_len = current_horizon - (end_idx - idx)
-                    
-                    c_sp = ep.cropped_spatials_tensor[idx:end_idx]
-                    c_pos = ep.cursor_poses_tensor[idx:end_idx]
-                    t_pos = ep.target_poses_tensor[idx:end_idx]
-                    m_frac = ep.moves_remaining_fracs_tensor[idx:end_idx]
-                    
-                    if pad_len > 0:
-                        c_sp = torch.cat([c_sp, torch.zeros(pad_len, c_sp.shape[-1], dtype=c_sp.dtype)], dim=0)
-                        c_pos = torch.cat([c_pos, torch.zeros(pad_len, c_pos.shape[-1], dtype=c_pos.dtype)], dim=0)
-                        t_pos = torch.cat([t_pos, torch.zeros(pad_len, t_pos.shape[-1], dtype=t_pos.dtype)], dim=0)
-                        m_frac = torch.cat([m_frac, torch.zeros(pad_len, m_frac.shape[-1], dtype=m_frac.dtype)], dim=0)
-                        
-                    cropped_sp_list.append(c_sp)
-                    cursor_pos_list.append(c_pos)
-                    target_pos_list.append(t_pos)
-                    moves_frac_list.append(m_frac)
-                    
-                cropped_spatials = torch.stack(cropped_sp_list).transpose(0, 1).to(self.device)
-                cursor_poses = torch.stack(cursor_pos_list).transpose(0, 1).to(self.device)
-                target_poses = torch.stack(target_pos_list).transpose(0, 1).to(self.device)
-                moves_remaining_fracs = torch.stack(moves_frac_list).transpose(0, 1).to(self.device)
-            
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                for t in range(current_horizon):
-                    if self.routing_mode == 'autoregressive':
-                        logits, value = self.policy.forward_step_cropped(
-                            cropped_spatials[t], cursor_poses[t], target_poses[t], moves_remaining_fracs[t]
-                        )
-                        
-                        probs = F.softmax(logits, dim=-1)
-                        dist = torch.distributions.Categorical(probs)
-                        action_id = dist.sample()
-                        log_prob = dist.log_prob(action_id)
-                        
-                        pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                        pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-                        pred_continue = torch.sigmoid(pred_continue_logits)
-                        
-                        traj_h.append(h)
-                        traj_z.append(z)
-                        traj_actions_net.append(action_id)
-                        traj_rewards.append(pred_reward)
-                        traj_continues.append(pred_continue)
-                        traj_values.append(value)
-                        traj_log_probs_net.append(log_prob)
-                        
-                        device = action_id.device
-                        moves_delta = torch.tensor([
-                            [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
-                            [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]
-                        ], device=device)
-                        
-                        B_size = action_id.shape[0]
-                        cursor_delta = torch.zeros((B_size, 3), device=device)
-                        
-                        mask_grid = (action_id < 8)
-                        if mask_grid.any():
-                            cursor_delta[mask_grid] = moves_delta[action_id[mask_grid]]
-                        mask_up = (action_id == 8)
-                        if mask_up.any():
-                            cursor_delta[mask_up, 2] = -1.0
-                        mask_down = (action_id == 9)
-                        if mask_down.any():
-                            cursor_delta[mask_down, 2] = 1.0
-                            
-                        action_onehot = F.one_hot(action_id, num_classes=10).float()
-                        action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
-                        h, z = self.jepa.predict_step(h, z, action_emb)
-                    else:
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    rollout = self._imagine_autoregressive_rollout(h, z, sampled_episodes, sampled_indices, current_horizon)
+                traj_h = rollout['traj_h']
+                traj_z = rollout['traj_z']
+                traj_actions_net = rollout['traj_actions_net']
+                traj_rewards = rollout['traj_rewards']
+                traj_continues = rollout['traj_continues']
+                traj_values = rollout['traj_values']
+                traj_log_probs_net = rollout['traj_log_probs_net']
+                h = rollout['final_h']
+                z = rollout['final_z']
+            else:
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    for t in range(current_horizon):
                         net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy(
                             net_embeddings, unrouted_mask, h, z, deterministic=False
                         )
@@ -1286,6 +1305,129 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'imagined_return_mean': np.mean(metrics['imagined_return_mean']),
             'actor_grad_norm': np.mean(metrics['actor_grad_norm']),
             'critic_grad_norm': np.mean(metrics['critic_grad_norm'])
+        }
+
+    def _imagine_autoregressive_rollout(
+        self,
+        h0: torch.Tensor,
+        z0: torch.Tensor,
+        sampled_episodes: List[Episode],
+        sampled_indices: List[int],
+        current_horizon: int
+    ) -> Dict[str, Any]:
+        h, z = h0, z0
+        traj_h = []
+        traj_z = []
+        traj_actions_net = []
+        traj_rewards = []
+        traj_continues = []
+        traj_values = []
+        traj_log_probs_net = []
+        traj_cursor_poses = []
+        
+        # 1. Initialize per-episode values at t = 0
+        cursor_pos_list = []
+        target_pos_list = []
+        moves_frac_list = []
+        moves_dec_list = []
+        fused_sp_list = []
+        
+        for i, ep in enumerate(sampled_episodes):
+            idx = sampled_indices[i]
+            cursor_pos_list.append(ep.cursor_poses_tensor[idx])
+            target_pos_list.append(ep.target_poses_tensor[idx])
+            moves_frac_list.append(ep.moves_remaining_fracs_tensor[idx])
+            moves_dec_list.append(ep.max_moves_fracs_tensor[idx])
+            fused_sp_list.append(ep.fused_spatials_tensor[idx])
+            
+        cursor_pos_img = torch.stack(cursor_pos_list).to(self.device)
+        target_pos_img = torch.stack(target_pos_list).to(self.device)
+        moves_remaining_frac_img = torch.stack(moves_frac_list).to(self.device)
+        moves_decrement = torch.stack(moves_dec_list).to(self.device).unsqueeze(-1)
+        
+        # Static Map/Moving Window Approximation:
+        # We hold the global board representation (fused_spatial_img) static across the imagined horizon,
+        # which means the policy crops its window based on where it moves (dynamic cursor),
+        # but the underlying board occupancy (wires/obstacles) is not dynamically updated.
+        fused_spatial_img = torch.stack(fused_sp_list).to(self.device)
+        
+        board_dims = torch.tensor([ep.board_dims for ep in sampled_episodes], dtype=torch.float32, device=self.device)
+        
+        # Store the cursor at t=0
+        traj_cursor_poses.append(cursor_pos_img.clone())
+        
+        # 2. Rollout loop
+        for t in range(current_horizon):
+            # Crop spatial features dynamically using the current cursor position
+            cropped_spatial = self.policy.step_policy.crop_spatial(fused_spatial_img, cursor_pos_img)
+            
+            # Policy forward step using current dynamically evolved observations
+            logits, value = self.policy.forward_step_cropped(
+                cropped_spatial, cursor_pos_img, target_pos_img, moves_remaining_frac_img
+            )
+            
+            probs = F.softmax(logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            action_id = dist.sample()
+            log_prob = dist.log_prob(action_id)
+            
+            pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+            pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+            pred_continue = torch.sigmoid(pred_continue_logits)
+            
+            traj_h.append(h)
+            traj_z.append(z)
+            traj_actions_net.append(action_id)
+            traj_rewards.append(pred_reward)
+            traj_continues.append(pred_continue)
+            traj_values.append(value)
+            traj_log_probs_net.append(log_prob)
+            
+            device = action_id.device
+            moves_delta = torch.tensor([
+                [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]
+            ], device=device)
+            
+            B_size = action_id.shape[0]
+            cursor_delta = torch.zeros((B_size, 3), device=device)
+            
+            mask_grid = (action_id < 8)
+            if mask_grid.any():
+                cursor_delta[mask_grid] = moves_delta[action_id[mask_grid]]
+            mask_up = (action_id == 8)
+            if mask_up.any():
+                cursor_delta[mask_up, 2] = -1.0
+            mask_down = (action_id == 9)
+            if mask_down.any():
+                cursor_delta[mask_down, 2] = 1.0
+                
+            # Convert delta to normalized units using per-episode board_dims
+            cursor_delta_norm = cursor_delta / board_dims
+            
+            # Evolve observation inputs for the next step (t+1)
+            cursor_pos_img = torch.clamp(cursor_pos_img + cursor_delta_norm, 0.0, 1.0)
+            moves_remaining_frac_img = torch.clamp(moves_remaining_frac_img - moves_decrement, 0.0, 1.0)
+            
+            # Store next cursor position
+            traj_cursor_poses.append(cursor_pos_img.clone())
+            
+            # Evolve model states h, z
+            action_onehot = F.one_hot(action_id, num_classes=10).float()
+            action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
+            h, z = self.jepa.predict_step(h, z, action_emb)
+            
+        return {
+            'traj_h': traj_h,
+            'traj_z': traj_z,
+            'traj_actions_net': traj_actions_net,
+            'traj_rewards': traj_rewards,
+            'traj_continues': traj_continues,
+            'traj_values': traj_values,
+            'traj_log_probs_net': traj_log_probs_net,
+            'traj_cursor_poses': traj_cursor_poses,
+            'final_h': h,
+            'final_z': z
         }
 
     def _current_entropy_coef(self) -> float:

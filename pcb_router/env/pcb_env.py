@@ -650,7 +650,8 @@ class PCBRoutingEnv(gym.Env):
             'drc_violations': len(self.drc_violations),
             'completion_rate': comp_rate,
             'current_step': self.step_count,
-            'graph': self.graph # Expose PyG HeteroData graph via info dict
+            'graph': self.graph, # Expose PyG HeteroData graph via info dict
+            'max_moves_per_net': self.max_moves_per_net
         }
 
     def _calculate_manhattan_distance(self, pins) -> float:
