@@ -465,6 +465,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'loss_wm_reward': [],
             'loss_actor': [],
             'loss_critic': [],
+            'entropy': [],
             'mean_dist_delta': [],
             'stage': [],
         }
@@ -1217,6 +1218,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 traj_continues = rollout['traj_continues']
                 traj_values = rollout['traj_values']
                 traj_log_probs_net = rollout['traj_log_probs_net']
+                traj_entropy = rollout['traj_entropy']
                 h = rollout['final_h']
                 z = rollout['final_z']
             else:
@@ -1254,6 +1256,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             traj_continues = torch.stack(traj_continues, dim=0)
             traj_values = torch.stack(traj_values, dim=0)
             traj_log_probs_net = torch.stack(traj_log_probs_net, dim=0)
+            if self.routing_mode == 'autoregressive':
+                traj_entropy = torch.stack(traj_entropy, dim=0)
             if self.routing_mode != 'autoregressive':
                 traj_log_probs_heat = torch.stack(traj_log_probs_heat, dim=0)
             
@@ -1276,9 +1280,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 advantages = (targets - traj_values).detach()
                 if self.routing_mode == 'autoregressive':
                     loss_policy = -traj_log_probs_net * advantages
+                    loss_policy = loss_policy.mean() - self._current_entropy_coef() * traj_entropy.mean()
                 else:
                     loss_policy = -(traj_log_probs_net + traj_log_probs_heat) * advantages
-                loss_policy = loss_policy.mean()
+                    loss_policy = loss_policy.mean()
                 total_loss = loss_policy + critic_loss
             
             self.scaler_ac.scale(total_loss).backward()
@@ -1303,6 +1308,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             metrics['imagined_return_mean'].append(targets.mean().item())
             metrics['actor_grad_norm'].append(grad_norm_act.item())
             metrics['critic_grad_norm'].append(grad_norm_crit.item())
+            if self.routing_mode == 'autoregressive':
+                metrics['entropy'].append(traj_entropy.mean().item())
+            else:
+                metrics['entropy'].append(0.0)
             
         for p in self.jepa.parameters():
             p.requires_grad = True
@@ -1312,7 +1321,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'loss_critic': np.mean(metrics['loss_critic']),
             'imagined_return_mean': np.mean(metrics['imagined_return_mean']),
             'actor_grad_norm': np.mean(metrics['actor_grad_norm']),
-            'critic_grad_norm': np.mean(metrics['critic_grad_norm'])
+            'critic_grad_norm': np.mean(metrics['critic_grad_norm']),
+            'entropy': np.mean(metrics['entropy'])
         }
 
     def _imagine_autoregressive_rollout(
@@ -1331,6 +1341,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         traj_continues = []
         traj_values = []
         traj_log_probs_net = []
+        traj_entropy = []
         traj_cursor_poses = []
         
         # 1. Initialize per-episode values at t = 0
@@ -1397,6 +1408,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             dist = torch.distributions.Categorical(probs)
             action_id = dist.sample()
             log_prob = dist.log_prob(action_id)
+            entropy = dist.entropy()
             
             pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
             pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
@@ -1409,6 +1421,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             traj_continues.append(pred_continue)
             traj_values.append(value)
             traj_log_probs_net.append(log_prob)
+            traj_entropy.append(entropy)
             
             device = action_id.device
             moves_delta = torch.tensor([
@@ -1452,6 +1465,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'traj_continues': traj_continues,
             'traj_values': traj_values,
             'traj_log_probs_net': traj_log_probs_net,
+            'traj_entropy': traj_entropy,
             'traj_cursor_poses': traj_cursor_poses,
             'final_h': h,
             'final_z': z
@@ -1488,6 +1502,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             self.metrics_history['loss_wm_reward'].append(wm_metrics.get('loss_wm_reward', 0.0))
             self.metrics_history['loss_actor'].append(ac_metrics['loss_actor'])
             self.metrics_history['loss_critic'].append(ac_metrics['loss_critic'])
+            self.metrics_history['entropy'].append(ac_metrics.get('entropy', 0.0))
             self.metrics_history['mean_dist_delta'].append(self.mean_dist_delta)
             self.metrics_history['stage'].append(self.curriculum.current_stage_name)
             
@@ -1497,6 +1512,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                   f"Loss WM: {wm_metrics['loss_wm']:.4f} (Reward: {wm_metrics.get('loss_wm_reward', 0.0):.4f}) | "
                   f"Loss Actor: {ac_metrics['loss_actor']:.4f} | "
                   f"Loss Critic: {ac_metrics['loss_critic']:.4f} | "
+                  f"Entropy: {ac_metrics.get('entropy', 0.0):.4f} | "
                   f"Dist Delta: {self.mean_dist_delta:.4f}")
             
             progress_bar.n = self.total_timesteps
@@ -1504,6 +1520,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 'stage': self.curriculum.current_stage_name,
                 'comp_rate': f"{mean_completion:.2f}",
                 'loss_wm_rew': f"{wm_metrics.get('loss_wm_reward', 0.0):.3f}",
+                'entropy': f"{ac_metrics.get('entropy', 0.0):.3f}",
                 'dist_delta': f"{self.mean_dist_delta:.3f}",
                 'loss_actor': f"{ac_metrics['loss_actor']:.3f}"
             })

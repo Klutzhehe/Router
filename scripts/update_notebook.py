@@ -188,14 +188,22 @@ training_source_str = training_source_str.replace("def on_update(trainer):", "de
 training_source_str = training_source_str.replace("trainer.total_updates", 'len(getattr(trainer, "metrics_history", getattr(trainer, "history", {}))["completion_rate"])')
 training_source_str = training_source_str.replace("h = trainer.history", 'h = getattr(trainer, "metrics_history", getattr(trainer, "history", {}))')
 
-# New gridspec adjustments to support 3 rows of plots dynamically
+# New gridspec adjustments to support 4 rows of plots dynamically
+training_source_str = training_source_str.replace(
+    "num_rows = 3 if \"loss_wm\" in h else 2\n    fig = plt.figure(figsize=(16, 9 if num_rows == 2 else 11), facecolor=BG)",
+    "num_rows = 4 if \"loss_wm\" in h else 2\n    fig = plt.figure(figsize=(16, 9 if num_rows == 2 else 13), facecolor=BG)"
+)
 training_source_str = training_source_str.replace(
     "fig = plt.figure(figsize=(16, 9), facecolor=BG)",
-    "num_rows = 3 if \"loss_wm\" in h else 2\n    fig = plt.figure(figsize=(16, 9 if num_rows == 2 else 11), facecolor=BG)"
+    "num_rows = 4 if \"loss_wm\" in h else 2\n    fig = plt.figure(figsize=(16, 9 if num_rows == 2 else 13), facecolor=BG)"
+)
+training_source_str = training_source_str.replace(
+    "gs  = gridspec.GridSpec(num_rows, 4, figure=fig, hspace=0.45, wspace=0.35,\n                            left=0.06, right=0.97, top=0.88 if num_rows == 2 else 0.91, bottom=0.09 if num_rows == 2 else 0.07)",
+    "gs  = gridspec.GridSpec(num_rows, 4, figure=fig, hspace=0.45, wspace=0.35,\n                            left=0.06, right=0.97, top=0.88 if num_rows == 2 else 0.93, bottom=0.09 if num_rows == 2 else 0.05)"
 )
 training_source_str = training_source_str.replace(
     "gs  = gridspec.GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.35,\n                            left=0.06, right=0.97, top=0.88, bottom=0.09)",
-    "gs  = gridspec.GridSpec(num_rows, 4, figure=fig, hspace=0.45, wspace=0.35,\n                            left=0.06, right=0.97, top=0.88 if num_rows == 2 else 0.91, bottom=0.09 if num_rows == 2 else 0.07)"
+    "gs  = gridspec.GridSpec(num_rows, 4, figure=fig, hspace=0.45, wspace=0.35,\n                            left=0.06, right=0.97, top=0.88 if num_rows == 2 else 0.93, bottom=0.09 if num_rows == 2 else 0.05)"
 )
 
 target_metrics_str = """    is_dreamer = "loss_wm" in h
@@ -205,6 +213,8 @@ target_metrics_str = """    is_dreamer = "loss_wm" in h
             (h["loss_actor"],      "Actor Loss (Dreamer)",    BLUE,   "Loss",  (0, 1)),
             (h["loss_wm"],         "JEPA World Model Loss",   PURPLE, "Loss",  (1, 0)),
             (h["loss_critic"],     "Critic Loss (Dreamer)",   AMBER,  "Loss",  (1, 1)),
+            (h.get("loss_wm_reward", []), "JEPA WM Reward Loss", "#EC4899", "Loss",  (2, 0)),
+            (h.get("mean_dist_delta", []), "Step Distance Delta", "#F97316", "Delta", (2, 1)),
         ]
     else:
         metrics_to_plot = [
@@ -223,6 +233,7 @@ replacement_metrics_str = """    is_dreamer = "loss_wm" in h
             (h["loss_critic"],     "Critic Loss (Dreamer)",   AMBER,  "Loss",  (1, 1)),
             (h.get("loss_wm_reward", []), "JEPA WM Reward Loss", "#EC4899", "Loss",  (2, 0)),
             (h.get("mean_dist_delta", []), "Step Distance Delta", "#F97316", "Delta", (2, 1)),
+            (h.get("entropy", []), "Policy Action Entropy", "#06B6D4", "Entropy", (3, 0)),
         ]
     else:
         metrics_to_plot = [
