@@ -220,6 +220,11 @@ def main():
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
     args = parser.parse_args()
     
+    # Enable PyTorch speed optimizations for modern GPUs
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')  # Uses TF32 on TensorCores for huge speedup
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -298,8 +303,8 @@ def main():
     params = list(policy.parameters())
     if args.unfreeze_encoders:
         params += list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters())
-        
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
+    # fused=True drastically speeds up the optimizer step on the GPU
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4, fused=torch.cuda.is_available())
     
     # Cosine annealing with linear warmup (standard for transformer training)
     warmup_epochs = max(1, int(args.epochs * 0.05))  # 5% warmup
