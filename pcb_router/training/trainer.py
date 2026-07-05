@@ -180,6 +180,7 @@ class BaseRoutingTrainer:
 
         self.total_timesteps = 0
         self.last_action_probs = None
+        self.current_net_values = None
         self.checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else self.train_cfg['checkpoint']['save_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
@@ -813,6 +814,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         net_idx_tensor, _, _ = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
                         
                     self.env.start_routing_net(net_idx_tensor.item())
+                    self.current_net_values = []
                     
                     net_done = False
                     while not net_done and steps_collected < num_steps:
@@ -835,6 +837,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
                             
                             logits, value = self.policy.forward_step(fused_spatial, cursor_norm, target_norm, moves_frac)
+                            if not hasattr(self, 'current_net_values') or self.current_net_values is None:
+                                self.current_net_values = []
+                            self.current_net_values.append(value.item())
                             
                             v_mask = torch.tensor(get_valid_mask(self.env), dtype=torch.bool, device=self.device).unsqueeze(0)
                             masked_logits = logits.masked_fill(~v_mask, -1e4)

@@ -343,9 +343,24 @@ if try_start_idx != -1 and end_idx != -1:
         is_ar = (getattr(trainer, 'routing_mode', 'astar_guided') == 'autoregressive')
         if is_ar and hasattr(trainer.env, 'current_net_path') and len(trainer.env.current_net_path) > 0:
             active_path = trainer.env.current_net_path
-            xs = [p[0] for p in active_path]
-            ys = [p[1] for p in active_path]
-            ax_board.plot(xs, ys, color='#10B981', linewidth=1.5, alpha=0.95, solid_capstyle="round", zorder=9)
+            values = getattr(trainer, 'current_net_values', [])
+            if len(values) > 0:
+                v_min, v_max = min(values), max(values)
+                v_range = v_max - v_min if v_max != v_min else 1.0
+                norm_vals = [(v - v_min) / v_range for v in values]
+            else:
+                norm_vals = [1.0] * len(active_path)
+            
+            import matplotlib.cm as cm
+            cmap = cm.get_cmap('plasma')
+            
+            for i in range(len(active_path) - 1):
+                p1 = active_path[i]
+                p2 = active_path[i+1]
+                v_idx = min(i, len(norm_vals) - 1)
+                c_val = cmap(norm_vals[v_idx])
+                ax_board.plot([p1[0], p2[0]], [p1[1], p2[1]], color=c_val, linewidth=2.0, alpha=0.95, solid_capstyle="round", zorder=9)
+                
             for wp in active_path:
                 wx, wy, wl = wp
                 c = layer_colors[wl % len(layer_colors)]
@@ -410,14 +425,25 @@ if try_start_idx != -1 and end_idx != -1:
                     alpha=0.85
                 )
             elif is_ar and hasattr(trainer.env, 'current_net_path') and len(trainer.env.current_net_path) > 0:
-                # Draw segments on layer l
+                # Draw segments on layer l with color mapped to critic values
                 active_path = trainer.env.current_net_path
+                values = getattr(trainer, 'current_net_values', [])
+                if len(values) > 0:
+                    v_min, v_max = min(values), max(values)
+                    v_range = v_max - v_min if v_max != v_min else 1.0
+                    norm_vals = [(v - v_min) / v_range for v in values]
+                else:
+                    norm_vals = [1.0] * len(active_path)
+                import matplotlib.cm as cm
+                cmap = cm.get_cmap('plasma')
+                
                 for i in range(len(active_path) - 1):
                     p1 = active_path[i]
                     p2 = active_path[i+1]
                     if p1[2] == l or p2[2] == l:
-                        c = layer_colors[l % len(layer_colors)]
-                        ax_hm.plot([p1[0], p2[0]], [p1[1], p2[1]], color=c, linewidth=2.0, alpha=0.9, marker='o', markersize=2)
+                        v_idx = min(i, len(norm_vals) - 1)
+                        c_val = cmap(norm_vals[v_idx])
+                        ax_hm.plot([p1[0], p2[0]], [p1[1], p2[1]], color=c_val, linewidth=2.0, alpha=0.9, marker='o', markersize=2)
                 
                 # Draw cursor/target if they are on layer l
                 if hasattr(trainer.env, 'cursor_pos') and trainer.env.cursor_pos is not None:
