@@ -220,6 +220,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='data/bc_dataset', help='Directory to load dataset shards from')
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
+    parser.add_argument('--limit_data', type=float, default=1.0, help='Fraction of dataset files to use (e.g., 0.2 for 20%)')
     args = parser.parse_args()
     
     # Enable PyTorch speed optimizations for modern GPUs
@@ -238,6 +239,13 @@ def main():
     # 2. Train/val split by file
     random.seed(42)
     random.shuffle(shard_paths)
+    
+    # Optional dataset limiting
+    if args.limit_data < 1.0:
+        num_files = max(1, int(len(shard_paths) * args.limit_data))
+        shard_paths = shard_paths[:num_files]
+        print(f"Limiting dataset to {args.limit_data*100:.1f}% ({num_files} files) to speed up training")
+        
     split_idx = int(len(shard_paths) * 0.8)
     train_paths = shard_paths[:split_idx]
     val_paths = shard_paths[split_idx:]
