@@ -4,10 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class RouteStepPolicy(nn.Module):
-    def __init__(self, embed_dim=384, cursor_embed_dim=32, hidden_dim=256, crop_size=3):
+    def __init__(self, embed_dim=384, cursor_embed_dim=32, hidden_dim=256, crop_size=3, state_dim=1536):
         super().__init__()
         self.embed_dim = embed_dim
         self.crop_size = crop_size
+        self.state_dim = state_dim
         
         # Position projections
         self.cursor_proj = nn.Sequential(
@@ -35,7 +36,7 @@ class RouteStepPolicy(nn.Module):
         
         # Fused MLP
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 3 * cursor_embed_dim, hidden_dim),
+            nn.Linear(hidden_dim + 3 * cursor_embed_dim + state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
@@ -43,7 +44,6 @@ class RouteStepPolicy(nn.Module):
         
         # Heads
         self.action_head = nn.Linear(hidden_dim, 10)
-        self.value_head = nn.Linear(hidden_dim, 1)
 
     def crop_spatial(self, fused_spatial, cursor_pos):
         """
@@ -90,32 +90,36 @@ class RouteStepPolicy(nn.Module):
         cropped = torch.gather(padded_flat, 2, flat_indices_expanded)
         return cropped.transpose(1, 2).reshape(B, -1)
 
-    def forward(self, fused_spatial, cursor_pos, target_pos, moves_remaining_frac):
+    def forward(self, fused_spatial, cursor_pos, target_pos, moves_remaining_frac, h, z):
         """
         fused_spatial: (B, N_patches, C)
         cursor_pos: (B, 3)
         target_pos: (B, 3)
         moves_remaining_frac: (B, 1)
+        h: (B, h_dim)
+        z: (B, z_dim)
         """
         cropped_spatial = self.crop_spatial(fused_spatial, cursor_pos)
-        return self.forward_cropped(cropped_spatial, cursor_pos, target_pos, moves_remaining_frac)
+        return self.forward_cropped(cropped_spatial, cursor_pos, target_pos, moves_remaining_frac, h, z)
 
-    def forward_cropped(self, cropped_spatial, cursor_pos, target_pos, moves_remaining_frac):
+    def forward_cropped(self, cropped_spatial, cursor_pos, target_pos, moves_remaining_frac, h, z):
         """
         cropped_spatial: (B, crop_size * crop_size * C)
         cursor_pos: (B, 3)
         target_pos: (B, 3)
         moves_remaining_frac: (B, 1)
+        h: (B, h_dim)
+        z: (B, z_dim)
         """
         spatial_emb = self.spatial_proj(cropped_spatial)
         cursor_emb = self.cursor_proj(cursor_pos)
         target_emb = self.target_proj(target_pos)
         budget_emb = self.budget_proj(moves_remaining_frac)
         
-        x = torch.cat([spatial_emb, cursor_emb, target_emb, budget_emb], dim=-1)
+        state = torch.cat([h, z], dim=-1)
+        x = torch.cat([spatial_emb, cursor_emb, target_emb, budget_emb, state], dim=-1)
         feat = self.mlp(x)
         
         logits = self.action_head(feat)
-        value = self.value_head(feat)
         
-        return logits, value
+        return logits
