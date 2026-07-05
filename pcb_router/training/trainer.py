@@ -571,24 +571,25 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         steps_collected = 0
         completion_rates = []
         
-        while steps_collected < num_steps:
-            obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
-            episode = Episode()
-            h, z = self.jepa.initial_state(batch_size=1, device=self.device)
-            done = False
-            self.all_episode_heatmaps = []  # reset per-episode heatmap log
-
-            
-            while not done and steps_collected < num_steps:
-                raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
-                graph = info['graph']
-                x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
-                edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
-                layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
+        if self.routing_mode == 'heatmap':
+            while steps_collected < num_steps:
+                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
+                episode = Episode()
+                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
+                done = False
+                self.all_episode_heatmaps = []  # reset per-episode heatmap log
+    
                 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    # 1. Forward pass WITH gradients enabled for supervised path training
-                    context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
+                while not done and steps_collected < num_steps:
+                    raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                    graph = info['graph']
+                    x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
+                    edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
+                    layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
+                    
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        # 1. Forward pass WITH gradients enabled for supervised path training
+                        context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
                     target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
                     net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
                     
@@ -630,14 +631,15 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     'heatmaps_np': heatmaps_np,
                 })
                 
-                next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
-                    net_idx_tensor.item(), heatmaps_np, via_prob_np
-                )
-                done = terminated or truncated
-                
-                # Supervised update for decoder and encoders on successful paths
-                if next_info.get('connected', False) and 'path' in next_info and len(next_info['path']) > 1:
-                    all_routed_path = next_info['path']
+                    next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
+                        net_idx_tensor.item(), heatmaps_np, via_prob_np
+                    )
+                    done = terminated or truncated
+                    steps_collected += 1
+                    
+                    # Supervised update for decoder and encoders on successful paths
+                    if next_info.get('connected', False) and 'path' in next_info and len(next_info['path']) > 1:
+                        all_routed_path = next_info['path']
                     # target has same layers as env + 1 (for via)
                     target_heatmap = torch.zeros((self.env.board.num_layers + 1, self.env.H, self.env.W), device=self.device)
                     for idx, wp in enumerate(all_routed_path):
@@ -653,15 +655,15 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     pred_via = heatmaps_via[0, 8:9]
                     pred_selected = torch.cat([pred_layers, pred_via], dim=0)
                     
-                    with torch.cuda.amp.autocast(enabled=self.use_amp):
-                        # Use weighted BCE to handle the massive class imbalance of sparse path pixels
-                        # Cast to float32 to prevent underflow or NaN issues with BCE in float16
-                        with torch.cuda.amp.autocast(enabled=False):
-                            bce_loss = F.binary_cross_entropy(pred_selected.float(), target_heatmap.float(), reduction='none')
-                        weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
-                        loss_dec = (bce_loss * weight_mask).mean()
-                    
-                    self.actor_opt.zero_grad(set_to_none=True)
+                        with torch.amp.autocast('cuda', enabled=self.use_amp):
+                            # Use weighted BCE to handle the massive class imbalance of sparse path pixels
+                            # Cast to float32 to prevent underflow or NaN issues with BCE in float16
+                            with torch.amp.autocast('cuda', enabled=False):
+                                bce_loss = F.binary_cross_entropy(pred_selected.float(), target_heatmap.float(), reduction='none')
+                            weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
+                            loss_dec = (bce_loss * weight_mask).mean()
+                        
+                        self.actor_opt.zero_grad(set_to_none=True)
         if self.routing_mode == 'astar_guided':
             while steps_collected < num_steps:
                 obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
