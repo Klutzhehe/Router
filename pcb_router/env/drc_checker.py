@@ -213,8 +213,8 @@ class DRCChecker:
             for i in range(len(all_keys)):
                 for j in range(i + 1, len(all_keys)):
                     k1, k2 = all_keys[i], all_keys[j]
-                    # If same grid location and same layer (or overlaps)
-                    if k1[0] == k2[0] and k1[1] == k2[1] and k1[2] == k2[2]:
+                    # If same grid location and same layer (or wildcard pin layer -1)
+                    if k1[0] == k2[0] and k1[1] == k2[1] and (k1[2] == k2[2] or k1[2] == -1 or k2[2] == -1):
                         union(k1, k2)
                         
             # Verify if all net pins belong to the same component
