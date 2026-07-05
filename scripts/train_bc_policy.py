@@ -109,10 +109,10 @@ def collate_fn(batch):
     layer_masks = torch.stack([torch.from_numpy(x['layer_mask']).float() for x in batch])
     cursor_poses = torch.stack(cursor_poses)
     target_poses = torch.stack(target_poses)
-    moves_remaining_fracs = torch.tensor([x['moves_remaining_frac'] for x in batch], dtype=torch.float32)
-    actions = torch.tensor([x['action'] for x in batch], dtype=torch.long)
+    moves_remaining_fracs = torch.from_numpy(np.array([x['moves_remaining_frac'] for x in batch])).float()
+    actions = torch.from_numpy(np.array([x['action'] for x in batch])).long()
     valid_masks = torch.stack([torch.from_numpy(x['valid_mask']).bool() for x in batch])
-    steps_remainings = torch.tensor([x['steps_remaining'] for x in batch], dtype=torch.float32)
+    steps_remainings = torch.from_numpy(np.array([x['steps_remaining'] for x in batch])).float()
     
     graphs = [x['graph'] for x in batch]
     
