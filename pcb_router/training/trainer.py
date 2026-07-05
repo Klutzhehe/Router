@@ -1277,6 +1277,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 critic_loss = F.mse_loss(traj_values, targets)
                 advantages = (targets - traj_values).detach()
+                # Normalize advantages to stabilize training and maintain correct scale relative to entropy
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 if self.routing_mode == 'autoregressive':
                     loss_policy = -traj_log_probs_net * advantages
                     loss_policy = loss_policy.mean() - self._current_entropy_coef() * traj_entropy.mean()

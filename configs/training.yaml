@@ -31,8 +31,8 @@ training:
   gamma: 0.997
   lambda_: 0.95
 
-  entropy_coef_start: 3.0e-3
-  entropy_coef_end: 3.0e-4
+  entropy_coef_start: 3.0e-2
+  entropy_coef_end: 3.0e-3
   entropy_coef_decay_iters: 50000
 
   use_amp: true
