@@ -127,10 +127,12 @@ class DreamerActorCritic(nn.Module):
         return net_idx, heatmap_latent, log_prob_net, log_prob_heatmap, value
 
     def forward_step(self, fused_spatial, cursor_pos, target_pos, moves_remaining_frac):
-        return self.step_policy(fused_spatial, cursor_pos, target_pos, moves_remaining_frac)
+        logits, value = self.step_policy(fused_spatial, cursor_pos, target_pos, moves_remaining_frac)
+        return logits, value.squeeze(-1)
 
     def forward_step_cropped(self, cropped_spatial, cursor_pos, target_pos, moves_remaining_frac):
-        return self.step_policy.forward_cropped(cropped_spatial, cursor_pos, target_pos, moves_remaining_frac)
+        logits, value = self.step_policy.forward_cropped(cropped_spatial, cursor_pos, target_pos, moves_remaining_frac)
+        return logits, value.squeeze(-1)
 
     def act(self, net_embeddings, unrouted_mask, h, z, explore=True):
         with torch.no_grad():
