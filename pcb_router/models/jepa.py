@@ -250,7 +250,16 @@ class JEPAWorldModel(nn.Module):
             ctx_next = target_context_embs[:, t + 1]
             mask_t = masks[:, t]
 
-            h, z, post_probs, prior_probs = self.rssm_step(h, z, ctx_t, act_emb)
+            ctx_next_pred = self.jepa_predictor(torch.cat([h, z, act_emb], dim=-1))
+            mse = F.mse_loss(ctx_next_pred, ctx_next, reduction='none').mean(dim=-1)
+            pred_losses.append(mse * mask_t)
+
+            var_loss = self.compute_variance_loss(ctx_next_pred)
+            cov_loss = self.compute_covariance_loss(ctx_next_pred)
+            variance_losses.append(var_loss * mask_t)
+            covariance_losses.append(cov_loss * mask_t)
+
+            h, z, post_probs, prior_probs = self.rssm_step(h, z, ctx_next, act_emb)
 
             post_p = post_probs.reshape(B, self.stochastic_groups, self.stochastic_classes)
             prior_p = prior_probs.reshape(B, self.stochastic_groups, self.stochastic_classes)
@@ -260,15 +269,6 @@ class JEPAWorldModel(nn.Module):
 
             kl_balanced = torch.max(kl_sum, torch.tensor(self.free_bits, device=device))
             kl_losses.append(kl_balanced * mask_t)
-
-            ctx_next_pred = self.jepa_predictor(torch.cat([h, z, act_emb], dim=-1))
-            mse = F.mse_loss(ctx_next_pred, ctx_next, reduction='none').mean(dim=-1)
-            pred_losses.append(mse * mask_t)
-
-            var_loss = self.compute_variance_loss(ctx_next_pred)
-            cov_loss = self.compute_covariance_loss(ctx_next_pred)
-            variance_losses.append(var_loss * mask_t)
-            covariance_losses.append(cov_loss * mask_t)
 
             pred_reward = self.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
             target_reward = symlog(rewards[:, t])

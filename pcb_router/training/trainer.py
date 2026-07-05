@@ -330,7 +330,8 @@ def compute_lambda_returns(rewards, values, continues, bootstrap, gamma, lam):
     returns = torch.zeros_like(rewards)
     last_return = bootstrap
     for t in reversed(range(H)):
-        returns[t] = rewards[t] + gamma * continues[t] * ((1.0 - lam) * values[t] + lam * last_return)
+        next_val = values[t + 1] if t + 1 < H else bootstrap
+        returns[t] = rewards[t] + gamma * continues[t] * ((1.0 - lam) * next_val + lam * last_return)
         last_return = returns[t]
     return returns
 
@@ -1411,15 +1412,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             log_prob = dist.log_prob(action_id)
             entropy = dist.entropy()
             
-            pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-            pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-            pred_continue = torch.sigmoid(pred_continue_logits)
-            
             traj_h.append(h)
             traj_z.append(z)
             traj_actions_net.append(action_id)
-            traj_rewards.append(pred_reward)
-            traj_continues.append(pred_continue)
             traj_values.append(value)
             traj_log_probs_net.append(log_prob)
             traj_entropy.append(entropy)
@@ -1457,6 +1452,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             action_onehot = F.one_hot(action_id, num_classes=10).float()
             action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
             h, z = self.jepa.predict_step(h, z, action_emb)
+            
+            pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+            pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+            pred_continue = torch.sigmoid(pred_continue_logits)
+            
+            traj_rewards.append(pred_reward)
+            traj_continues.append(pred_continue)
             
         return {
             'traj_h': traj_h,
