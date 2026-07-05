@@ -114,7 +114,7 @@ def collate_fn(batch):
     valid_masks = torch.stack([torch.from_numpy(x['valid_mask']).bool() for x in batch])
     steps_remainings = torch.from_numpy(np.array([x['steps_remaining'] for x in batch])).float()
     
-    graphs = [x['graph'] for x in batch]
+    graphs = Batch.from_data_list([x['graph'] for x in batch])
     
     return {
         'raster': rasters,
@@ -409,8 +409,8 @@ def main():
                 else:
                     spatial_patches, _ = vit(rasters)
                     
-                # Combine individual graphs into a single batched graph
-                batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+                # Get the pre-batched graph from the loader
+                batched_graph = batch['graphs'].to(device)
                 pad_batch = batched_graph['pad'].batch
                 
                 # Forward GNN and dense collate pads in a single batched call
@@ -475,8 +475,8 @@ def main():
                     # Run ViT on the entire batch at once
                     spatial_patches, _ = vit(rasters)
                     
-                    # Combine graphs into a single batched graph
-                    batched_graph = Batch.from_data_list(batch['graphs']).to(device)
+                    # Get the pre-batched graph from the loader
+                    batched_graph = batch['graphs'].to(device)
                     pad_batch = batched_graph['pad'].batch
                     
                     # Single batched forward pass for GNN and Fusion
