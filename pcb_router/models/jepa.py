@@ -93,7 +93,7 @@ class JEPAWorldModel(nn.Module):
         self.gru_norm = nn.LayerNorm(deterministic_size)
 
         # Context embedding dim
-        self.context_dim = 768
+        self.context_dim = 2 * vit_encoder.embed_dim
 
         # Prior/Posterior heads
         self.prior_head = nn.Sequential(

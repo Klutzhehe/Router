@@ -354,6 +354,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         jepa_cfg = self.model_cfg.get('jepa', {})
         self.routing_mode = self.train_cfg.get('training', {}).get('routing_mode', 'astar_guided')
         self.env.routing_mode = self.routing_mode
+        
+        pol_cfg = self.model_cfg.get('policy', {})
         self.jepa = JEPAWorldModel(
             vit_encoder=self.vit,
             gnn_encoder=self.gnn,
@@ -361,10 +363,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             deterministic_size=512,
             stochastic_groups=32,
             stochastic_classes=32,
+            heatmap_latent_dim=pol_cfg.get('heatmap_latent_dim', 256),
             ema_decay=jepa_cfg.get('ema_decay', 0.995)
         ).to(self.device)
         
-        pol_cfg = self.model_cfg.get('policy', {})
         vit_cfg = self.model_cfg.get('vit', {})
         self.policy = DreamerActorCritic(
             h_dim=512,
