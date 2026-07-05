@@ -174,6 +174,10 @@ class CurriculumManager:
         if len(self.completion_history) > 0 and len(self.violation_history) == 0:
             self.violation_history = [0.0] * len(self.completion_history)
 
+    @property
+    def completion_rate_ma(self) -> float:
+        return np.mean(self.completion_history) if self.completion_history else 0.0
+
     def get_progress_summary(self) -> Dict[str, Any]:
         mean_comp = np.mean(self.completion_history) if self.completion_history else 0.0
         mean_viol = np.mean(self.violation_history) if self.violation_history else 0.0

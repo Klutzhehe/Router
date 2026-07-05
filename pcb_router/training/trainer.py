@@ -800,8 +800,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 
                 h, z = self.jepa.initial_state(batch_size=1, device=self.device)
                 
+                done = False
                 for net_idx in range(len(self.env.board.nets)):
-                    if steps_collected >= num_steps:
+                    if steps_collected >= num_steps or done:
                         break
                         
                     raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)

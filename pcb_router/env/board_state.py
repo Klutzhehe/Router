@@ -276,6 +276,8 @@ class BoardState:
                 
         if trace_segments:
             self.routed_net_ids.add(trace_segments[0].net_id)
+        elif vias:
+            self.routed_net_ids.add(vias[0].net_id)
 
     def rasterize_partial_move(self, x1, y1, l1, x2, y2, l2, net_class='default'):
         """Render a single partial step segment/via incrementally into raster.

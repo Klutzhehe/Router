@@ -677,13 +677,7 @@ class PCBRoutingEnv(gym.Env):
         if self.board is None or self.board_state is None:
             return False, {"error": "No board loaded"}
 
-        # 1. Check connectivity
-        total_nets = len(self.board.nets)
-        routed_nets_count = len(self.routed_nets)
-        all_connected = (routed_nets_count == total_nets)
-        unrouted_nets = [net.id for net in self.board.nets if net.id not in self.routed_nets]
-
-        # 2. Run fresh, full DRC check
+        # 1. Run fresh, full DRC check first to get physical unconnected violations
         drc_checker = DRCChecker(self.board.design_rules, self.resolution_mm())
         all_violations = drc_checker.check_all(
             self.board_state, self.board_state.traces, self.board_state.vias, self.board
@@ -691,6 +685,14 @@ class PCBRoutingEnv(gym.Env):
         
         # Update cache
         self.drc_violations = all_violations
+
+        # 2. Determine physical connectivity from DRC unconnected violations
+        unconnected_nets = {v.net_id_a for v in all_violations if v.type == 'unconnected'}
+        unrouted_nets = list(unconnected_nets)
+        
+        total_nets = len(self.board.nets)
+        connected_nets_count = len([net for net in self.board.nets if net.id not in unconnected_nets])
+        all_connected = (connected_nets_count == total_nets)
         
         # 3. Determine validity
         is_valid = all_connected and (len(all_violations) == 0)
@@ -698,7 +700,7 @@ class PCBRoutingEnv(gym.Env):
         report = {
             "is_valid": is_valid,
             "total_nets": total_nets,
-            "routed_nets_count": routed_nets_count,
+            "routed_nets_count": connected_nets_count,
             "unrouted_nets": unrouted_nets,
             "drc_violations_count": len(all_violations),
             "drc_violations": [
