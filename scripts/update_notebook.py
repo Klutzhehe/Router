@@ -296,9 +296,9 @@ if try_start_idx != -1 and end_idx != -1:
         num_layers = board.num_layers
         import matplotlib.patches as mpatches
         
-        # Grid layout for the right side: Row 0 is the fully routed board, Row 1 is the layer heatmaps
+        # Grid layout for the right side: Row 0 fully routed board, Row 1 layer traces, Row 2 action probabilities
         sub_gs = gridspec.GridSpecFromSubplotSpec(
-            2, 2, subplot_spec=gs[:, 2:], hspace=0.35, wspace=0.25
+            3, 2, subplot_spec=gs[:, 2:], hspace=0.45, wspace=0.25
         )
         
         # 1. Draw the Fully Routed Board (taking the entire Row 0)
@@ -444,6 +444,35 @@ if try_start_idx != -1 and end_idx != -1:
             ax_hm.set_xlim(0, board.width)
             ax_hm.set_ylim(0, board.height)
             ax_hm.set_aspect("equal")
+            
+        # 3. Draw Action Probabilities Bar Chart
+        ax_act = fig.add_subplot(sub_gs[2, :])
+        ax_act.set_facecolor(PANEL)
+        ax_act.set_title("Policy Action Probabilities (What the AI is thinking)", color=WHITE, fontsize=10, pad=6)
+        
+        actions_labels = ['Left', 'Right', 'Down', 'Up', 'Diag-DL', 'Diag-DR', 'Diag-UL', 'Diag-UR', 'Layer-DN', 'Layer-UP']
+        
+        if hasattr(trainer, 'last_action_probs') and trainer.last_action_probs is not None:
+            probs = trainer.last_action_probs
+            colors = [AMBER if p == max(probs) else BLUE for p in probs]
+            bars = ax_act.bar(actions_labels, probs, color=colors, alpha=0.85, width=0.6, edgecolor=BORDER)
+            
+            for bar in bars:
+                height = bar.get_height()
+                ax_act.annotate(f'{height:.2f}',
+                                xy=(bar.get_x() + bar.get_width() / 2, height),
+                                xytext=(0, 2),
+                                textcoords="offset points",
+                                ha='center', va='bottom', color=WHITE, fontsize=7)
+        else:
+            ax_act.text(0.5, 0.5, "No Action Probabilities Yet (Warmup / PPO Mode)", color="#888",
+                        transform=ax_act.transAxes, ha="center", va="center")
+                        
+        ax_act.set_ylim(0, 1.15)
+        ax_act.tick_params(colors="#6B7280", labelsize=8)
+        for spine in ax_act.spines.values():
+            spine.set_color(BORDER)
+        ax_act.grid(color=BORDER, linestyle="--", linewidth=0.5, axis='y')
     except Exception as e:
         ax_err = fig.add_subplot(gs[:, 2:])
         ax_err.set_facecolor(PANEL)

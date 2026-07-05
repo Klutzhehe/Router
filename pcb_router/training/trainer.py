@@ -179,6 +179,7 @@ class BaseRoutingTrainer:
         ).to(self.device)
 
         self.total_timesteps = 0
+        self.last_action_probs = None
         self.checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else self.train_cfg['checkpoint']['save_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
@@ -838,10 +839,11 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             v_mask = torch.tensor(get_valid_mask(self.env), dtype=torch.bool, device=self.device).unsqueeze(0)
                             masked_logits = logits.masked_fill(~v_mask, -1e4)
                             
+                            probs = F.softmax(masked_logits, dim=-1)
+                            self.last_action_probs = probs.squeeze(0).detach().cpu().numpy()
                             if not explore:
                                 action = masked_logits.argmax(dim=-1).item()
                             else:
-                                probs = F.softmax(masked_logits, dim=-1)
                                 dist = torch.distributions.Categorical(probs)
                                 action = dist.sample().item()
                                 
