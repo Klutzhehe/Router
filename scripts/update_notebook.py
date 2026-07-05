@@ -184,6 +184,7 @@ nb["cells"][init_cell_idx]["source"] = new_init_source
 
 # Cell 5 (Training Cell)
 training_source_str = "".join(nb["cells"][training_cell_idx]["source"])
+training_source_str = training_source_str.replace("def on_update(trainer):", "def on_update(trainer, info=None):")
 target_metrics_str = """    metrics_to_plot = [
         (h["completion_rate"], "Routing Completion Rate", TEAL,   "Rate",  (0, 0)),
         (h["loss_policy"],     "Policy Loss (PPO)",       BLUE,   "Loss",  (0, 1)),
