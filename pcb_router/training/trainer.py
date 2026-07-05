@@ -369,13 +369,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         )
         
         if self.routing_mode == 'autoregressive':
-            actor_params = (
+            actor_params_raw = (
                 list(self.policy.state_proj.parameters()) +
                 list(self.policy.net_scorer.parameters()) +
                 list(self.policy.step_policy.parameters())
             )
         else:
-            actor_params = (
+            actor_params_raw = (
                 list(self.policy.state_proj.parameters()) +
                 list(self.policy.net_scorer.parameters()) +
                 list(self.policy.heatmap_mlp.parameters()) +
@@ -383,12 +383,16 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 list(self.decoder.parameters()) +
                 [self.policy.heatmap_log_std]
             )
-        self.actor_opt = torch.optim.AdamW(actor_params, lr=actor_lr)
-        self.critic_opt = torch.optim.AdamW(self.policy.value_head.parameters(), lr=critic_lr)
+        
+        # Remove duplicates while preserving order
+        actor_params = list(dict.fromkeys(actor_params_raw))
+        
+        self.actor_opt = torch.optim.AdamW(actor_params, lr=actor_lr, fused=torch.cuda.is_available())
+        self.critic_opt = torch.optim.AdamW(self.policy.value_head.parameters(), lr=critic_lr, fused=torch.cuda.is_available())
         
         self.use_amp = t_cfg.get('use_amp', True)
-        self.scaler_wm = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-        self.scaler_ac = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler_wm = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        self.scaler_ac = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         
         self.replay_buffer = ReplayBuffer(capacity_episodes=t_cfg.get('replay_buffer_size', 5000))
         self.replay_buffer.latent_cache_capacity = t_cfg.get('latent_cache_capacity', 10000)
