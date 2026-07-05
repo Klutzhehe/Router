@@ -81,12 +81,16 @@ class RolloutBuffer:
 
 def get_valid_mask(env):
     cx, cy, cl = env.cursor_pos
-    tx, ty, tl = env.target_pos
     active_layers = list(range(env.board.num_layers))
-    exempt = {(cx, cy), (tx, ty)}
-    temp_obs = build_obstacle_maps(env.board_state, active_layers, exempt, shape=(env.H, env.W))
-    temp_via = build_via_blocked_maps(env.board_state, temp_obs, active_layers, shape=(env.H, env.W))
-    
+    # Reuse the per-net cached maps built in start_routing_net (same clean-clone basis as
+    # step_move), instead of rebuilding them from scratch every single step. Fallback to a
+    # fresh build only if no net is currently being routed.
+    temp_obs = env._net_obstacle_maps
+    temp_via = env._net_via_blocked
+    if temp_obs is None or temp_via is None:
+        temp_obs = build_obstacle_maps(env.board_state, active_layers, {(cx, cy)}, shape=(env.H, env.W))
+        temp_via = build_via_blocked_maps(env.board_state, temp_obs, active_layers, shape=(env.H, env.W))
+
     valid_mask = np.zeros(10, dtype=bool)
     for a_idx in range(8):
         mdx, mdy, _ = env.pathfinder.moves[a_idx]
@@ -323,7 +327,7 @@ class BaseRoutingTrainer:
 from pcb_router.models.jepa import JEPAWorldModel, symexp
 from pcb_router.models.policy import DreamerActorCritic
 from pcb_router.training.replay_buffer import ReplayBuffer, Episode
-from collections import defaultdict
+from collections import defaultdict, deque
 import random
 
 def compute_lambda_returns(rewards, values, continues, bootstrap, gamma, lam):
@@ -387,11 +391,19 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         critic_lr = float(t_cfg.get('critic_lr', 8e-5))
         weight_decay = float(t_cfg.get('wm_weight_decay', 1e-6))
         
-        self.wm_opt = torch.optim.AdamW(
+        # Note: jepa.online_vit/online_gnn/online_fusion are the SAME module objects as
+        # self.vit/gnn/fusion, so listing both would enter each encoder param twice and
+        # (once encoders receive gradient) double its effective update. Dedup by identity
+        # and drop the frozen EMA-target copies (requires_grad=False).
+        wm_params_raw = (
             list(self.vit.parameters()) +
             list(self.gnn.parameters()) +
             list(self.fusion.parameters()) +
-            list(self.jepa.parameters()),
+            list(self.jepa.parameters())
+        )
+        wm_params = [p for p in dict.fromkeys(wm_params_raw) if p.requires_grad]
+        self.wm_opt = torch.optim.AdamW(
+            wm_params,
             lr=wm_lr,
             weight_decay=weight_decay
         )
@@ -440,6 +452,21 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         
         self.gamma = t_cfg.get('gamma', 0.997)
         self.lambda_ = t_cfg.get('lambda_', 0.95)
+
+        # Analytic imagination reward parameters (autoregressive step routing).
+        self.imagination_completion_bonus = float(t_cfg.get('imagination_completion_bonus', 3.0))
+        self.imagination_reach_threshold = int(t_cfg.get('imagination_reach_threshold', 3))
+
+        # Encoder fine-tuning (JEPA self-supervised loss over a bounded recent-raw-obs buffer).
+        self.train_encoders = bool(t_cfg.get('train_encoders', True))
+        self.encoder_raw_buffer_size = int(t_cfg.get('encoder_raw_buffer_size', 1200))
+        self.encoder_train_batch = int(t_cfg.get('encoder_train_batch', 8))
+        self.encoder_seq_len = int(t_cfg.get('encoder_seq_len', 12))
+        self.encoder_grad_clip = float(t_cfg.get('encoder_grad_clip', 100.0))
+        # Ring buffer of recent episodes' raw observations (each entry is a list of per-step dicts).
+        # Bounded by total transition count so RAM stays predictable regardless of board size.
+        self._raw_obs_episodes: deque = deque()
+        self._raw_obs_count = 0
         
         # Optional torch.compile() for PyTorch 2.0+ GPU acceleration.
         # Only compile jepa and policy — they have fully static shapes (fixed latent dims)
@@ -464,13 +491,14 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'completion_rate': [],
             'loss_wm': [],
             'loss_wm_reward': [],
+            'loss_enc': [],
             'loss_actor': [],
             'loss_critic': [],
             'entropy': [],
             'mean_dist_delta': [],
             'stage': [],
         }
-        
+
         self.last_heatmap = None
         self.last_net_idx = None
         self.all_episode_heatmaps = []  # list of {'net_name', 'net_idx', 'heatmaps_np'} per net in last episode
@@ -494,7 +522,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     if 'gnn' in ckpt: self.gnn.load_state_dict(ckpt['gnn'])
                     if 'fusion' in ckpt: self.fusion.load_state_dict(ckpt['fusion'])
                     
-                    print("Pretrained BC weights (Policy + Encoders) successfully loaded! ✓")
+                    print("Pretrained BC weights (Policy + Encoders) successfully loaded! [OK]")
                 except Exception as e:
                     print(f"Warning: Failed to load pretrained BC weights: {e}")
             else:
@@ -800,7 +828,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 episode.fused_spatials = []
                 episode.max_moves_fracs = []
                 episode.board_dims = (self.env.W, self.env.H, self.env.board.num_layers)
-                
+
+                # Per-episode raw observations for encoder fine-tuning (kept only if enabled).
+                raw_steps = []
+
                 h, z = self.jepa.initial_state(batch_size=1, device=self.device)
                 
                 done = False
@@ -894,13 +925,12 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             context_emb = torch.cat([global_spatial, global_graph], dim=-1)
                             context_emb = F.layer_norm(context_emb, (context_emb.shape[-1],))
 
-                            # EMA target encoder on this same observation — this is what gets
-                            # stored as target_context_embeddings[t] and consumed as the JEPA
-                            # prediction target for step t-1. Must come from the target_vit/
-                            # target_gnn/target_fusion EMA copies, not the online encoder above,
-                            # otherwise the invariance loss can be trivially minimized by the
-                            # online encoder collapsing rather than actually modeling dynamics.
-                            target_context_emb = self.jepa.get_context_embedding(r_tensor, x_dict_t, edge_index_dict_t, use_target=True)
+                            # The phase-2 world-model loss runs on these DETACHED cached embeddings,
+                            # so it never trains the encoders. The stored JEPA target is therefore
+                            # just the online embedding (skips a duplicate encoder pass here). Actual
+                            # encoder fine-tuning happens in phase 2b on raw observations, where the
+                            # real EMA target encoder is used (see _phase2b_train_encoders).
+                            target_context_emb = context_emb.detach()
 
                             h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
                             h = h.detach()
@@ -916,7 +946,17 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                                 episode.unrouted_masks_list = []
                                 
                             action_tuple = (torch.tensor(action, dtype=torch.long).cpu(), cursor_delta_tensor.detach().squeeze(0).cpu())
-                            
+
+                            if self.train_encoders:
+                                # Store raw obs (fp16 raster + graph tensors) for encoder fine-tuning.
+                                raw_steps.append({
+                                    'raster': r_tensor.detach().squeeze(0).half().cpu(),
+                                    'x_dict': {k: v.detach().cpu() for k, v in x_dict_t.items()},
+                                    'edge_index_dict': {k: v.detach().cpu() for k, v in edge_index_dict_t.items()},
+                                    'action_id': int(action),
+                                    'cursor_delta': cursor_delta_tensor.detach().squeeze(0).cpu(),
+                                })
+
                             episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
                             episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
                             episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
@@ -926,7 +966,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             episode.cursor_poses.append(cursor_norm.detach().squeeze(0).cpu())
                             episode.target_poses.append(target_norm.detach().squeeze(0).cpu())
                             episode.moves_remaining_fracs.append(moves_frac.detach().squeeze(0).cpu())
-                            episode.fused_spatials.append(fused_spatial.detach().squeeze(0).cpu())
+                            # Stored in fp16 to halve replay RAM (this is the largest per-step
+                            # tensor: full board patch grid). Re-cast to fp32 when used in imagination.
+                            episode.fused_spatials.append(fused_spatial.detach().squeeze(0).half().cpu())
                             
                             max_moves = curr_info.get('max_moves_per_net', 0)
                             moves_frac_val = 1.0 / max(1, max_moves)
@@ -943,18 +985,124 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     episode.net_embeddings = episode.net_embeddings_list[0]
                     episode.unrouted_masks = episode.unrouted_masks_list
                     self.replay_buffer.add_episode(episode)
+                    if self.train_encoders and len(raw_steps) > 1:
+                        self._push_raw_episode(raw_steps)
                     cr = info.get('completion_rate', 0.0)
                     drc_viol = info.get('drc_violations', 0)
                     num_nets = len(self.env.board.nets)
                     drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
                     self.curriculum.record_episode(cr, drc_rate)
                     completion_rates.append(cr)
-                    
+
                     self.last_completed_board_state = copy.deepcopy(self.env.board_state)
                     self.last_completed_board = copy.deepcopy(self.env.board)
-                    
+
             self.mean_dist_delta = np.mean(dist_deltas) if dist_deltas else 0.0
             return np.mean(completion_rates) if completion_rates else 0.0
+
+    def _push_raw_episode(self, raw_steps: List[dict]):
+        """Add one episode's raw observations to the bounded encoder-training buffer,
+        evicting the oldest episodes until the total transition count is within budget."""
+        self._raw_obs_episodes.append(raw_steps)
+        self._raw_obs_count += len(raw_steps)
+        while self._raw_obs_count > self.encoder_raw_buffer_size and len(self._raw_obs_episodes) > 1:
+            evicted = self._raw_obs_episodes.popleft()
+            self._raw_obs_count -= len(evicted)
+
+    def _phase2b_train_encoders(self) -> Dict[str, float]:
+        """Fine-tune ViT/GNN/Fusion with the JEPA self-supervised objective on recent RAW
+        observations (recomputed WITH gradients), so the representation keeps improving during
+        RL instead of staying frozen at its BC-pretrained state. Kept cheap and memory-bounded:
+        only a small buffer of recent raw obs is stored, and only encoder_train_batch short
+        sequences are recomputed per iteration.
+
+        Unlike the detached phase-2 path, the JEPA prediction target here comes from the EMA
+        *target* encoder (no grad), which is the mechanism that prevents representation collapse.
+        VICReg variance/covariance are computed across the sequence's time dimension so they
+        remain well-defined without cross-board batching (each board has a different graph/size).
+        """
+        if not self.train_encoders:
+            return {}
+        eligible = [ep for ep in self._raw_obs_episodes if len(ep) >= 2]
+        if not eligible:
+            return {}
+
+        self.vit.train(); self.gnn.train(); self.fusion.train(); self.jepa.train()
+
+        loss_accum = torch.zeros((), device=self.device)
+        n_seq = 0
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            for _ in range(self.encoder_train_batch):
+                ep = random.choice(eligible)
+                L = min(self.encoder_seq_len, len(ep))
+                start = random.randint(0, len(ep) - L)
+                chunk = ep[start:start + L]
+
+                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
+                preds = []
+                mse_sum = torch.zeros((), device=self.device)
+                steps = 0
+                for t in range(L - 1):
+                    s0, s1 = chunk[t], chunk[t + 1]
+                    r0 = s0['raster'].float().unsqueeze(0).to(self.device)
+                    x0 = {k: v.to(self.device) for k, v in s0['x_dict'].items()}
+                    e0 = {k: v.to(self.device) for k, v in s0['edge_index_dict'].items()}
+                    r1 = s1['raster'].float().unsqueeze(0).to(self.device)
+                    x1 = {k: v.to(self.device) for k, v in s1['x_dict'].items()}
+                    e1 = {k: v.to(self.device) for k, v in s1['edge_index_dict'].items()}
+
+                    # Online encoding of the CURRENT obs (WITH grad) conditions the RSSM posterior —
+                    # this is the path that actually trains the encoder. The predictor then predicts
+                    # the EMA-target encoding of the NEXT obs (no grad), the collapse-safe JEPA target.
+                    e_t = self.jepa.get_context_embedding(r0, x0, e0, use_target=False)
+                    with torch.no_grad():
+                        te_next = self.jepa.get_context_embedding(r1, x1, e1, use_target=True)
+
+                    action_onehot = F.one_hot(torch.tensor([s0['action_id']], device=self.device), num_classes=10).float()
+                    cursor_delta = s0['cursor_delta'].unsqueeze(0).to(self.device)
+                    act_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
+
+                    # Advance state conditioned on the online current embedding, then predict the
+                    # target next embedding. Gradient flows target_next <- pred <- z <- e_t (encoder).
+                    h, z, _, _ = self.jepa.rssm_step(h, z, e_t, act_emb)
+                    pred = self.jepa.jepa_predictor(torch.cat([h, z, act_emb], dim=-1))
+                    preds.append(pred)
+                    mse_sum = mse_sum + F.mse_loss(pred, te_next)
+                    steps += 1
+
+                if steps == 0:
+                    continue
+                pred_stack = torch.cat(preds, dim=0)  # (steps, context_dim)
+                var_loss = self.jepa.compute_variance_loss(pred_stack)
+                cov_loss = self.jepa.compute_covariance_loss(pred_stack)
+                seq_loss = (
+                    self.jepa.invariance_weight * (mse_sum / steps) +
+                    self.jepa.variance_weight * var_loss +
+                    self.jepa.covariance_weight * cov_loss
+                )
+                loss_accum = loss_accum + seq_loss
+                n_seq += 1
+
+        if n_seq == 0:
+            return {}
+
+        loss = loss_accum / n_seq
+        enc_params = (
+            list(self.vit.parameters()) +
+            list(self.gnn.parameters()) +
+            list(self.fusion.parameters()) +
+            list(self.jepa.jepa_predictor.parameters())
+        )
+        self.wm_opt.zero_grad(set_to_none=True)
+        self.scaler_wm.scale(loss).backward()
+        self.scaler_wm.unscale_(self.wm_opt)
+        grad_norm = torch.nn.utils.clip_grad_norm_(enc_params, self.encoder_grad_clip)
+        self.scaler_wm.step(self.wm_opt)
+        self.scaler_wm.update()
+        # Encoders moved → refresh the EMA target encoder so it trails the online encoder.
+        self.jepa.update_target_weights()
+
+        return {'loss_enc': float(loss.item()), 'enc_grad_norm': float(grad_norm.item())}
 
     def _phase2_train_world_model(self):
         self.jepa.train()
@@ -1349,6 +1497,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         sampled_indices: List[int],
         current_horizon: int
     ) -> Dict[str, Any]:
+        device = self.device
         h, z = h0, z0
         traj_h = []
         traj_z = []
@@ -1359,150 +1508,155 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         traj_log_probs_net = []
         traj_entropy = []
         traj_cursor_poses = []
-        
-        # 1. Initialize per-episode values at t = 0
+
+        B_size = len(sampled_episodes)
+
+        # 1. Initialize per-episode observation state at the sampled start index.
         cursor_pos_list = []
         target_pos_list = []
         moves_frac_list = []
         moves_dec_list = []
-        fused_sp_list = []
-        
         for i, ep in enumerate(sampled_episodes):
             idx = sampled_indices[i]
             cursor_pos_list.append(ep.cursor_poses_tensor[idx])
             target_pos_list.append(ep.target_poses_tensor[idx])
             moves_frac_list.append(ep.moves_remaining_fracs_tensor[idx])
             moves_dec_list.append(ep.max_moves_fracs_tensor[idx])
-            fused_sp_list.append(ep.fused_spatials_tensor[idx].clone())
-            
-        cursor_pos_img = torch.stack(cursor_pos_list).to(self.device)
-        target_pos_img = torch.stack(target_pos_list).to(self.device)
-        moves_remaining_frac_img = torch.stack(moves_frac_list).to(self.device)
-        moves_decrement = torch.stack(moves_dec_list).to(self.device).unsqueeze(-1)
-        
-        # Static Map/Moving Window Approximation:
-        # We hold the global board representation static across the imagined horizon,
-        # which means the policy crops its window based on where it moves (dynamic cursor),
-        # but the underlying board occupancy (wires/obstacles) is not dynamically updated.
-        # Since different episodes can have different board sizes (varying N_patches),
-        # we keep them as a list of raw tensors and group/crop them dynamically inside the loop.
-        
-        board_dims = torch.tensor([ep.board_dims for ep in sampled_episodes], dtype=torch.float32, device=self.device)
-        B_size = len(sampled_episodes)
-        
-        # Store the cursor at t=0
+
+        cursor_pos_img = torch.stack(cursor_pos_list).to(device)
+        target_pos_img = torch.stack(target_pos_list).to(device)
+        moves_remaining_frac_img = torch.stack(moves_frac_list).to(device)
+        moves_decrement = torch.stack(moves_dec_list).to(device).unsqueeze(-1)
+        board_dims = torch.tensor([ep.board_dims for ep in sampled_episodes], dtype=torch.float32, device=device)
+
+        # Static-map approximation: the board representation is held fixed across the imagined
+        # horizon (only the cursor moves and re-crops). Because it is static, we upload each
+        # episode's fused spatial map to the GPU exactly ONCE here (grouped by patch count so
+        # equal-sized boards batch together), instead of re-stacking CPU tensors every step.
+        # This removes both the per-step host->device transfer and the per-step Python loop
+        # that previously "decayed" occupancy cells.
+        groups: Dict[int, List[int]] = {}
+        for idx_in_batch, ep in enumerate(sampled_episodes):
+            f_sp = ep.fused_spatials_tensor[sampled_indices[idx_in_batch]]
+            groups.setdefault(f_sp.shape[0], []).append(idx_in_batch)
+        group_fused_gpu: Dict[int, torch.Tensor] = {}
+        group_index_gpu: Dict[int, torch.Tensor] = {}
+        for N_patches, indices in groups.items():
+            group_fused_gpu[N_patches] = torch.stack(
+                [sampled_episodes[i].fused_spatials_tensor[sampled_indices[i]] for i in indices]
+            ).to(device).float()  # (G, N_patches, C)  — fp16 in storage -> fp32 here
+            group_index_gpu[N_patches] = torch.tensor(indices, device=device, dtype=torch.long)
+
+        crop_size = self.policy.step_policy.crop_size
+        embed_dim = self.policy.step_policy.embed_dim
+        crop_dim = crop_size * crop_size * embed_dim
+
+        # Track the cursor in integer GRID units to avoid normalization round-off drift.
+        cursor_grid = torch.round(cursor_pos_img * board_dims)
+        target_grid = torch.round(target_pos_img * board_dims)
+
+        # The 10 discrete moves as (dx, dy, dl): 8 planar directions, then via down / via up.
+        # Matches env.step_move action ids (8 -> layer-1, 9 -> layer+1) and rewards.calculate_step.
+        all_moves = torch.tensor([
+            [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0]
+        ], device=device)  # (10, 3)
+
+        prev_delta = torch.zeros((B_size, 3), device=device)
+        reach_thresh = float(self.imagination_reach_threshold)
+
         traj_cursor_poses.append(cursor_pos_img.clone())
-        
+
         # 2. Rollout loop
         for t in range(current_horizon):
-            # Group by N_patches to batch-crop efficiently (handles varying board/grid sizes in the batch)
-            crop_size = self.policy.step_policy.crop_size
-            embed_dim = self.policy.step_policy.embed_dim
-            crop_dim = crop_size * crop_size * embed_dim
-            
-            cropped_spatial = torch.zeros((B_size, crop_dim), device=self.device, dtype=cursor_pos_img.dtype)
-            
-            groups = {}
-            for idx_in_batch, f_sp in enumerate(fused_sp_list):
-                N_patches = f_sp.shape[0]
-                if N_patches not in groups:
-                    groups[N_patches] = []
-                groups[N_patches].append(idx_in_batch)
-                
-            for N_patches, indices in groups.items():
-                group_fused = torch.stack([fused_sp_list[idx] for idx in indices]).to(self.device) # shape (G, N_patches, C)
-                group_cursor = cursor_pos_img[indices] # shape (G, 3)
-                group_cropped = self.policy.step_policy.crop_spatial(group_fused, group_cursor) # shape (G, crop_dim)
-                cropped_spatial[indices] = group_cropped
-            
-            # Policy forward step using current dynamically evolved observations
+            # Crop the local window from the GPU-resident static maps (per size-group).
+            cropped_spatial = torch.zeros((B_size, crop_dim), device=device)
+            for N_patches, idx_tensor in group_index_gpu.items():
+                group_cursor = cursor_pos_img.index_select(0, idx_tensor)
+                group_cropped = self.policy.step_policy.crop_spatial(group_fused_gpu[N_patches], group_cursor)
+                cropped_spatial.index_copy_(0, idx_tensor, group_cropped.to(cropped_spatial.dtype))
+
             logits, value = self.policy.forward_step_cropped(
                 cropped_spatial, cursor_pos_img, target_pos_img, moves_remaining_frac_img, h, z
             )
-            
-            probs = F.softmax(logits, dim=-1)
+
+            # Boundary action masking — mirror the real env, which masks off-board moves during
+            # collection (get_valid_mask). Without this, imagination trains in a world with free
+            # boundaries and the actor learns to walk off the board (the corner-walk exploit).
+            proposed_all = cursor_grid.unsqueeze(1) + all_moves.unsqueeze(0)  # (B, 10, 3)
+            in_bounds = ((proposed_all >= 0).all(-1) &
+                         (proposed_all < board_dims.unsqueeze(1)).all(-1))     # (B, 10)
+            any_valid = in_bounds.any(-1, keepdim=True)
+            safe_mask = torch.where(any_valid, in_bounds, torch.ones_like(in_bounds))
+            masked_logits = logits.masked_fill(~safe_mask, -1e4)
+
+            probs = F.softmax(masked_logits, dim=-1)
             dist = torch.distributions.Categorical(probs)
             action_id = dist.sample()
             log_prob = dist.log_prob(action_id)
             entropy = dist.entropy()
-            
+
             traj_h.append(h)
             traj_z.append(z)
             traj_actions_net.append(action_id)
             traj_values.append(value)
             traj_log_probs_net.append(log_prob)
             traj_entropy.append(entropy)
-            
-            device = action_id.device
-            moves_delta = torch.tensor([
-                [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]
-            ], device=device)
-            
-            B_size = action_id.shape[0]
-            cursor_delta = torch.zeros((B_size, 3), device=device)
-            
-            mask_grid = (action_id < 8)
-            if mask_grid.any():
-                cursor_delta[mask_grid] = moves_delta[action_id[mask_grid]]
-            mask_up = (action_id == 8)
-            if mask_up.any():
-                cursor_delta[mask_up, 2] = -1.0
-            mask_down = (action_id == 9)
-            if mask_down.any():
-                cursor_delta[mask_down, 2] = 1.0
-                
-            # Boundary checks
-            proposed_grid = torch.round(cursor_pos_img * board_dims + cursor_delta)
-            out_of_bounds = (
-                (proposed_grid[:, 0] < 0) | (proposed_grid[:, 0] >= board_dims[:, 0]) |
-                (proposed_grid[:, 1] < 0) | (proposed_grid[:, 1] >= board_dims[:, 1]) |
-                (proposed_grid[:, 2] < 0) | (proposed_grid[:, 2] >= board_dims[:, 2])
-            )
-            
-            if out_of_bounds.any():
-                cursor_delta[out_of_bounds] = 0.0
-                
-            # Convert delta to normalized units using per-episode board_dims
-            cursor_delta_norm = cursor_delta / board_dims
-            
-            # Evolve observation inputs for the next step (t+1)
-            cursor_pos_img = torch.clamp(cursor_pos_img + cursor_delta_norm, 0.0, 1.0)
-            moves_remaining_frac_img = torch.clamp(moves_remaining_frac_img - moves_decrement, 0.0, 1.0)
-            
-            # Store next cursor position
-            traj_cursor_poses.append(cursor_pos_img.clone())
-            
-            # Update fused spatials based on occupancy changes (only for valid moves)
-            for idx in range(B_size):
-                if not out_of_bounds[idx]:
-                    N_patches = fused_sp_list[idx].shape[0]
-                    grid_w = int(math.sqrt(N_patches))
-                    cx = int(torch.clamp(cursor_pos_img[idx, 0], 0.0, 0.99) * grid_w)
-                    cy = int(torch.clamp(cursor_pos_img[idx, 1], 0.0, 0.99) * grid_w)
-                    if 0 <= cx < grid_w and 0 <= cy < grid_w:
-                        cell_idx = cy * grid_w + cx
-                        if cell_idx < N_patches:
-                            fused_sp_list[idx][cell_idx] = fused_sp_list[idx][cell_idx] * 0.5
-            
-            # Evolve model states h, z
+
+            cursor_delta = all_moves.index_select(0, action_id)  # (B, 3)
+            is_via = (action_id >= 8)
+
+            # Safety net: if a row was fully masked and an off-board action still slipped
+            # through, treat it as an invalid (no-op) move exactly like the real env.
+            proposed_sel = cursor_grid + cursor_delta
+            oob = ((proposed_sel < 0).any(-1) | (proposed_sel >= board_dims).any(-1))
+            if oob.any():
+                cursor_delta = torch.where(oob.unsqueeze(-1), torch.zeros_like(cursor_delta), cursor_delta)
+
+            # --- Analytic step reward (closed form; mirrors RewardCalculator.calculate_step). ---
+            # This replaces the learned reward head, which conditioned only on (h, z) — a global
+            # board summary with no cursor/target geometry — and so could only ever hallucinate a
+            # correlation like "diagonal move => +2". The real reward is exactly known here because
+            # we simulate the cursor kinematics, so we compute it directly.
+            dist_prev = (cursor_grid - target_grid).abs().sum(-1)
+            cursor_grid_new = cursor_grid + cursor_delta
+            dist_curr = (cursor_grid_new - target_grid).abs().sum(-1)
+            dist_delta = dist_prev - dist_curr
+
+            prev_dir = torch.sign(prev_delta)
+            curr_dir = torch.sign(cursor_delta)
+            prev_nonzero = (prev_dir != 0).any(-1)
+            dir_changed = prev_nonzero & (prev_dir != curr_dir).any(-1)
+
+            reward = dist_delta \
+                - 0.2 * dir_changed.float() \
+                - 0.5 * is_via.float() \
+                - 1.0 * oob.float()
+
+            # Completion bonus when the imagined cursor reaches the target pin (xy within the pad
+            # tolerance and correct layer), and terminate imagination there (continue = 0).
+            xy_dist = (cursor_grid_new[:, :2] - target_grid[:, :2]).abs().sum(-1)
+            layer_dist = (cursor_grid_new[:, 2] - target_grid[:, 2]).abs()
+            reached = (xy_dist <= reach_thresh) & (layer_dist == 0)
+            reward = reward + self.imagination_completion_bonus * reached.float()
+            pred_continue = 1.0 - reached.float()
+
+            traj_rewards.append(reward)
+            traj_continues.append(pred_continue)
+
+            # Evolve latent world-model state h, z.
             action_onehot = F.one_hot(action_id, num_classes=10).float()
             action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
             h, z = self.jepa.predict_step(h, z, action_emb)
-            
-            # Invert the symlog the reward head was trained to regress against
-            # (see jepa.py compute_loss / symlog(rewards)) before this prediction
-            # is consumed as a real-unit reward for lambda-returns.
-            pred_reward = symexp(self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1))
-            pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
-            pred_continue = torch.sigmoid(pred_continue_logits)
 
-            if out_of_bounds.any():
-                pred_reward[out_of_bounds] = -1.0  # fixed real-unit penalty, not a model prediction
-                
-            traj_rewards.append(pred_reward)
-            traj_continues.append(pred_continue)
-            
+            # Evolve observation bookkeeping for t+1.
+            cursor_grid = cursor_grid_new
+            cursor_pos_img = torch.clamp(cursor_grid / board_dims, 0.0, 1.0)
+            moves_remaining_frac_img = torch.clamp(moves_remaining_frac_img - moves_decrement, 0.0, 1.0)
+            prev_delta = cursor_delta
+            traj_cursor_poses.append(cursor_pos_img.clone())
+
         return {
             'traj_h': traj_h,
             'traj_z': traj_z,
@@ -1540,12 +1694,14 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         while self.total_timesteps < total_timesteps:
             mean_completion = self._phase1_collect_real(num_steps=self.real_steps_per_iteration, explore=True)
             wm_metrics = self._phase2_train_world_model()
+            enc_metrics = self._phase2b_train_encoders()
             ac_metrics = self._phase3_train_actor_critic()
             
             self.metrics_history['timesteps'].append(self.total_timesteps)
             self.metrics_history['completion_rate'].append(mean_completion)
             self.metrics_history['loss_wm'].append(wm_metrics['loss_wm'])
             self.metrics_history['loss_wm_reward'].append(wm_metrics.get('loss_wm_reward', 0.0))
+            self.metrics_history['loss_enc'].append(enc_metrics.get('loss_enc', 0.0))
             self.metrics_history['loss_actor'].append(ac_metrics['loss_actor'])
             self.metrics_history['loss_critic'].append(ac_metrics['loss_critic'])
             self.metrics_history['entropy'].append(ac_metrics.get('entropy', 0.0))
@@ -1556,6 +1712,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                   f"Stage: '{self.curriculum.current_stage_name}' | "
                   f"Completion: {mean_completion:.2f} | "
                   f"Loss WM: {wm_metrics['loss_wm']:.4f} (Reward: {wm_metrics.get('loss_wm_reward', 0.0):.4f}) | "
+                  f"Loss Enc: {enc_metrics.get('loss_enc', 0.0):.4f} | "
                   f"Loss Actor: {ac_metrics['loss_actor']:.4f} | "
                   f"Loss Critic: {ac_metrics['loss_critic']:.4f} | "
                   f"Entropy: {ac_metrics.get('entropy', 0.0):.4f} | "
@@ -1593,6 +1750,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     'timesteps': self.total_timesteps,
                     'completion_rate': mean_completion,
                     **wm_metrics,
+                    **enc_metrics,
                     **ac_metrics
                 })
 

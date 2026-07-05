@@ -86,6 +86,12 @@ class PCBRoutingEnv(gym.Env):
         self.start_board_state_clone = None
         self.current_net_path = []
 
+        # Per-net cached obstacle/via-blockage maps (built once in start_routing_net).
+        # These are static across all of a net's per-cell moves, so rebuilding them every
+        # step (previously done twice: once in step_move, once in get_valid_mask) was pure waste.
+        self._net_obstacle_maps = None
+        self._net_via_blocked = None
+
     def set_board_config(self, config: BoardConfig):
         self.board_config = config
         self.H = config.board_height
@@ -114,6 +120,8 @@ class PCBRoutingEnv(gym.Env):
         self._drc_cache_pairwise = []
         self.step_count = 0
         self.max_steps = 2 * len(board.nets)
+        self._net_obstacle_maps = None
+        self._net_via_blocked = None
 
     def start_routing_net(self, net_index: int):
         """Initialize step-by-step routing for a selected net."""
@@ -154,6 +162,21 @@ class PCBRoutingEnv(gym.Env):
         # Clone board state for rollback in case of failure
         self.start_board_state_clone = self.board_state.clone()
 
+        # Pre-build obstacle & via-blockage maps ONCE for this net. They are constant across
+        # all of this net's per-cell moves (built from the clean start-of-net clone, which
+        # excludes the net's own partial trace). Every pin of this net is exempted so the
+        # segment source/target cells stay passable — a superset of the old per-step
+        # exempt={cursor,target}, and identical for destination/via checks.
+        active_layers = list(range(self.board.num_layers))
+        exempt_pins = {(self.board.pins[pid].global_x, self.board.pins[pid].global_y)
+                       for pid in selected_net.pin_ids}
+        self._net_obstacle_maps = build_obstacle_maps(
+            self.start_board_state_clone, active_layers, exempt_pins, shape=(self.H, self.W)
+        )
+        self._net_via_blocked = build_via_blocked_maps(
+            self.start_board_state_clone, self._net_obstacle_maps, active_layers, shape=(self.H, self.W)
+        )
+
     def step_move(self, action_id: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         """Advance the current net's cursor state by one cell or via.
         
@@ -169,15 +192,10 @@ class PCBRoutingEnv(gym.Env):
         tx, ty, tl = self.target_pos
         
         active_layers = list(range(self.board.num_layers))
-        
-        # Rebuild obstacle and via maps based on start board state (to exclude current net's own partial traces)
-        exempt = {(cx, cy), (tx, ty)}
-        temp_obstacle_maps = build_obstacle_maps(
-            self.start_board_state_clone, active_layers, exempt, shape=(self.H, self.W)
-        )
-        via_blocked = build_via_blocked_maps(
-            self.start_board_state_clone, temp_obstacle_maps, active_layers, shape=(self.H, self.W)
-        )
+
+        # Use the per-net cached maps built once in start_routing_net (see note there).
+        temp_obstacle_maps = self._net_obstacle_maps
+        via_blocked = self._net_via_blocked
         
         # Determine movement
         invalid_move = False
@@ -431,7 +449,9 @@ class PCBRoutingEnv(gym.Env):
         self.max_moves_per_net = 0
         self.start_board_state_clone = None
         self.current_net_path = []
-        
+        self._net_obstacle_maps = None
+        self._net_via_blocked = None
+
         # Re-init reward weights if curriculum changed
         if self.curriculum_stage:
             self.reward_calculator.update_weights(self.curriculum_stage.get('reward_weights'))

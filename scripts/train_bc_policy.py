@@ -193,8 +193,13 @@ def evaluate_closed_loop(env, policy, vit, gnn, fusion, device, num_episodes=5):
                     pad_embs = node_embs['pad'].unsqueeze(0)
                     fused_pads, fused_spatial = fusion(pad_embs, spatial_patches)
                     
-                    # Get action from policy
-                    logits, value = policy(fused_spatial, cursor_norm, target_norm, moves_frac)
+                    # Get action from policy. The RL step policy conditions on the RSSM state (h, z);
+                    # during BC there is no world model, so we feed zeros (h_dim=512, z_dim=1024 to
+                    # match DreamerActorCritic in the trainer). The h,z pathway is then learned in RL.
+                    B = fused_spatial.shape[0]
+                    h0 = torch.zeros(B, 512, device=device)
+                    z0 = torch.zeros(B, 1024, device=device)
+                    logits = policy(fused_spatial, cursor_norm, target_norm, moves_frac, h0, z0)
                     
                     # Mask logits dynamically
                     v_mask = torch.tensor(get_valid_mask(env), dtype=torch.bool, device=device).unsqueeze(0)
@@ -365,7 +370,6 @@ def main():
 
     
     criterion_action = nn.CrossEntropyLoss()
-    criterion_value = nn.MSELoss()
     
     # Init validation env (use a simple stage config)
     curriculum = CurriculumManager("configs/curriculum.yaml")
@@ -432,17 +436,17 @@ def main():
                     pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
                     fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
                 
-                # Forward policy
-                logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
-                
+                # Forward policy with zero RSSM state (see note in evaluate_closed_loop).
+                B = fused_spatial.shape[0]
+                h0 = torch.zeros(B, 512, device=device)
+                z0 = torch.zeros(B, 1024, device=device)
+                logits = policy(fused_spatial, cursor_poses, target_poses, moves_fracs, h0, z0)
+
                 # Action masking
                 masked_logits = logits.masked_fill(~valid_masks, -1e4)
-                
-            # Compute loss outside autocast in float32 to prevent MSE overflow
-            loss_action = criterion_action(masked_logits.float(), actions)
-            loss_val = criterion_value(value.float().squeeze(-1), steps_remainings)
-            
-            loss = loss_action + 0.001 * loss_val
+
+            # Behavior-cloning loss on the expert action (float32 for numerical stability).
+            loss = criterion_action(masked_logits.float(), actions)
                 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -492,13 +496,14 @@ def main():
                     pad_embs_dense, pad_mask = to_dense_batch(node_embs['pad'], pad_batch)
                     fused_pads, fused_spatial = fusion(pad_embs_dense, spatial_patches, gnn_mask=pad_mask)
                     
-                    logits, value = policy(fused_spatial, cursor_poses, target_poses, moves_fracs)
+                    B = fused_spatial.shape[0]
+                    h0 = torch.zeros(B, 512, device=device)
+                    z0 = torch.zeros(B, 1024, device=device)
+                    logits = policy(fused_spatial, cursor_poses, target_poses, moves_fracs, h0, z0)
                     masked_logits = logits.masked_fill(~valid_masks, -1e4)
-                    
-                # Compute loss outside autocast in float32
-                loss_action = criterion_action(masked_logits.float(), actions)
-                loss_val = criterion_value(value.float().squeeze(-1), steps_remainings)
-                loss = loss_action + 0.001 * loss_val
+
+                # Behavior-cloning loss (float32 for numerical stability).
+                loss = criterion_action(masked_logits.float(), actions)
                 
                 val_loss += loss.item() * rasters.size(0)
                 preds = masked_logits.argmax(dim=-1)

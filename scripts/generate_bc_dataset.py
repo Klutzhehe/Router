@@ -16,9 +16,12 @@ def cell_delta_to_action(dx, dy, dl):
     elif dl == 1:
         return 9
     else:
+        # MUST match AStarPathfinder.moves / env.step_move action ids exactly, otherwise the
+        # recorded expert labels encode the wrong direction and the deterministic reconstruction
+        # (and any BC-trained policy) desyncs. This list is env.pathfinder.moves in order.
         moves = [
-            (0, 1), (1, 1), (1, 0), (1, -1),
-            (0, -1), (-1, -1), (-1, 0), (-1, 1)
+            (0, 1), (0, -1), (1, 0), (-1, 0),
+            (1, 1), (1, -1), (-1, 1), (-1, -1)
         ]
         for idx, (mdx, mdy) in enumerate(moves):
             if mdx == dx and mdy == dy:
@@ -260,25 +263,33 @@ def generate_dataset(out_dir="data/bc_dataset"):
                 
                 t_idx = 0
                 val_success = True
-                
+
                 for net_idx, net in enumerate(episode_nets):
                     val_env.start_routing_net(net_idx)
-                    
+
                     net_done = False
-                    while not net_done:
+                    # Bound the replay by the number of recorded transitions. The env's
+                    # tolerance-based "target reached" (within a few cells of the pad) can land a
+                    # step off from the recorded A* path length; without this bound, running past
+                    # the transitions list raises IndexError and kills the whole generation run.
+                    # Exhausting the recorded actions without completing the net means the replay
+                    # desynced from the expert path — treat that as a failed reconstruction and
+                    # skip the episode (same outcome as a truncation below).
+                    while not net_done and t_idx < len(episode_transitions):
                         action = episode_transitions[t_idx]['action']
                         obs_v, reward_v, term_v, trunc_v, info_v = val_env.step({'action_id': action})
-                        
+
                         net_done = (val_env.current_net_index is None)
                         t_idx += 1
-                        
+
                         if trunc_v:
                             val_success = False
                             break
-                            
-                    if not val_success:
+
+                    if not val_success or not net_done:
+                        val_success = False
                         break
-                        
+
                 if val_success and len(val_env.routed_nets) == len(episode_nets):
                     print(" PASSED.", flush=True)
                     

@@ -9,16 +9,39 @@ training:
   seed: 42
   
   real_steps_per_iteration: 64
-  train_ratio: 100
+  train_ratio: 16              # gradient updates per iteration. Was 100 → ~50x over-optimization
+                               # against a still-wrong world model; the actor sprinted into the
+                               # reward model's blind spots (corner-walk exploit) faster than the
+                               # WM could correct. DreamerV3 uses O(8-32).
   replay_buffer_size: 5000
-  batch_size: 256              # increased from 128 for higher VRAM usage and faster training
-  seq_len: 200
+  batch_size: 128              # was 256; halved to cut phase-2 sequential-GRU cost
+  seq_len: 64                  # was 200; a 200-step BPTT graph is far longer than DreamerV3's ~64
   routing_mode: "autoregressive"
-  imagine_batch_size: 4096     # increased from 2048 for higher VRAM usage and faster training
+  imagine_batch_size: 512      # was 4096; combined with train_ratio this is ~50x less phase-3 compute
   imagination_horizon_start: 5
   imagination_horizon_end: 15
   imagination_horizon_ramp_iters: 20000
-  latent_cache_capacity: 500000 # increased from 10000; utilizes available RAM for historical diversity
+  latent_cache_capacity: 50000 # was 500000 (~3GB of RAM churn); trimmed to reduce swapping
+
+  # Analytic imagination reward (autoregressive step routing). The step reward is a known
+  # closed form (distance-to-target progress + turn/via penalties), so we compute it exactly
+  # inside imagination instead of trusting the learned reward head — which could not even see
+  # cursor/target geometry and hallucinated "diagonal = good", producing the corner-walk.
+  imagination_completion_bonus: 3.0   # bonus when the imagined cursor reaches the target pin
+  imagination_reach_threshold: 3      # cells of xy tolerance for "reached" (matches env pad half-size)
+
+  # Encoder (ViT/GNN/Fusion) fine-tuning during RL via the JEPA self-supervised loss.
+  # The big replay buffer stores tiny detached embeddings (cheap), so it cannot backprop into
+  # the encoders. Instead we keep a small, bounded buffer of RECENT raw observations and run a
+  # JEPA predict+VICReg loss on those with gradients enabled, so the representation keeps
+  # improving instead of staying frozen at its BC-pretrained state. Set train_encoders: false
+  # to disable (encoders stay frozen, lower RAM/compute — the previously-verified fast path).
+  train_encoders: true
+  encoder_raw_buffer_size: 1200       # max recent raw transitions kept (rasters are large;
+                                      # lower at the biggest board stages if host RAM is tight)
+  encoder_train_batch: 8              # short sequences recomputed per encoder update
+  encoder_seq_len: 12                 # length of each recomputed sequence (JEPA predict window)
+  encoder_grad_clip: 100.0
 
   world_model_lr: 3.0e-4
   actor_lr: 8.0e-5
