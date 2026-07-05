@@ -5,9 +5,44 @@ notebook_path = "notebooks/Train_PCB_Router.ipynb"
 with open(notebook_path, "r", encoding="utf-8") as f:
     nb = json.load(f)
 
+# Deduplicate cells by header
+seen_headers = set()
+unique_cells = []
+for cell in nb["cells"]:
+    src = "".join(cell.get("source", []))
+    header = None
+    for line in cell.get("source", []):
+        if "CELL" in line:
+            header = line.strip()
+            break
+    if header and header in seen_headers:
+        print(f"Deduplicating notebook: removing extra cell '{header}'")
+        continue
+    if header:
+        seen_headers.add(header)
+    unique_cells.append(cell)
+nb["cells"] = unique_cells
+
+# Find cell indices dynamically
+config_cell_idx = 1
+init_cell_idx = 4
+training_cell_idx = 5
+eval_cell_idx = 6
+
+for i, cell in enumerate(nb["cells"]):
+    src = "".join(cell.get("source", []))
+    if "CELL 2 — CONFIGURATION" in src:
+        config_cell_idx = i
+    elif "CELL 5 — INITIALIZE TRAINER" in src:
+        init_cell_idx = i
+    elif "CELL 6 — TRAINING WITH LIVE VISUALS" in src:
+        training_cell_idx = i
+    elif "CELL 7 — LOAD CHECKPOINT + EVALUATE" in src:
+        eval_cell_idx = i
+
 # Cell 1 (CONFIG cell)
 # Find the config cell (Cell 1) and update CONFIG dictionary
-config_source = nb["cells"][1]["source"]
+config_source = nb["cells"][config_cell_idx]["source"]
 # Let's rebuild the CONFIG dictionary source lines
 new_config_source = [
     "# ================================================================\n",
@@ -80,7 +115,7 @@ new_config_source = [
     "for k, v in CONFIG.items():\n",
     "    print(f\"  {k}: {v}\")\n"
 ]
-nb["cells"][1]["source"] = new_config_source
+nb["cells"][config_cell_idx]["source"] = new_config_source
 
 # Cell 4 (Initialize Trainer)
 new_init_source = [
@@ -145,10 +180,10 @@ new_init_source = [
     "print(f\"  Timesteps so far: {trainer.total_timesteps:,}\")\n"
 ]
 
-nb["cells"][4]["source"] = new_init_source
+nb["cells"][init_cell_idx]["source"] = new_init_source
 
 # Cell 5 (Training Cell)
-training_source_str = "".join(nb["cells"][5]["source"])
+training_source_str = "".join(nb["cells"][training_cell_idx]["source"])
 target_metrics_str = """    metrics_to_plot = [
         (h["completion_rate"], "Routing Completion Rate", TEAL,   "Rate",  (0, 0)),
         (h["loss_policy"],     "Policy Loss (PPO)",       BLUE,   "Loss",  (0, 1)),
@@ -301,6 +336,30 @@ if try_start_idx != -1 and end_idx != -1:
             ax_board.plot([seg.start_x, seg.end_x], [seg.start_y, seg.end_y],
                           color=c, linewidth=lw, alpha=0.9, solid_capstyle="round")
                           
+        # Draw active net path if in autoregressive mode
+        is_ar = (getattr(trainer, 'routing_mode', 'astar_guided') == 'autoregressive')
+        if is_ar and hasattr(trainer.env, 'current_net_path') and len(trainer.env.current_net_path) > 0:
+            active_path = trainer.env.current_net_path
+            xs = [p[0] for p in active_path]
+            ys = [p[1] for p in active_path]
+            ax_board.plot(xs, ys, color='#10B981', linewidth=1.5, alpha=0.95, solid_capstyle="round", zorder=9)
+            for wp in active_path:
+                wx, wy, wl = wp
+                c = layer_colors[wl % len(layer_colors)]
+                ax_board.add_patch(mpatches.Circle((wx, wy), radius=0.6, fc=c, ec=WHITE, lw=0.3, alpha=0.9, zorder=9))
+            
+        # Draw cursor and target if available
+        if is_ar and hasattr(trainer.env, 'cursor_pos') and trainer.env.cursor_pos is not None:
+            cx, cy, cl = trainer.env.cursor_pos
+            ax_board.add_patch(mpatches.Circle(
+                (cx, cy), radius=1.8,
+                fc="#F59E0B", ec=WHITE, lw=1.0, alpha=1.0, zorder=10))
+        if is_ar and hasattr(trainer.env, 'target_pos') and trainer.env.target_pos is not None:
+            tx, ty, tl = trainer.env.target_pos
+            ax_board.add_patch(mpatches.Circle(
+                (tx, ty), radius=1.8,
+                fc="#EF4444", ec=WHITE, lw=1.0, alpha=1.0, zorder=10))
+
         # Draw vias
         for via in state.vias:
             ax_board.add_patch(mpatches.Circle(
@@ -321,27 +380,57 @@ if try_start_idx != -1 and end_idx != -1:
         ax_board.set_ylim(0, board.height)
         ax_board.set_aspect("equal")
         
-        # 2. Draw Layer Heatmaps (in Row 1)
+        # 2. Draw Layer Heatmaps or Active Traces (in Row 1)
         for l in range(min(2, num_layers)):
             ax_hm = fig.add_subplot(sub_gs[1, l])
             ax_hm.set_facecolor(PANEL)
-            ax_hm.set_title(f"Layer {l} Heatmap (AI Cost)", color=layer_colors[l % len(layer_colors)], fontsize=9, pad=4)
+            if is_ar:
+                ax_hm.set_title(f"Layer {l} Active Trace", color=layer_colors[l % len(layer_colors)], fontsize=9, pad=4)
+            else:
+                ax_hm.set_title(f"Layer {l} Heatmap (AI Cost)", color=layer_colors[l % len(layer_colors)], fontsize=9, pad=4)
+                
             ax_hm.set_xticks([]); ax_hm.set_yticks([])
             for spine in ax_hm.spines.values():
                 spine.set_color(BORDER)
                 
-            if hasattr(trainer, 'last_heatmap') and trainer.last_heatmap is not None:
+            # Draw obstacles on this layer
+            for obs in board.obstacles:
+                ax_hm.add_patch(mpatches.Rectangle(
+                    (obs.x, obs.y), obs.width, obs.height,
+                    fc="#EF4444", alpha=0.1, lw=0, hatch='//'))
+            
+            if not is_ar and hasattr(trainer, 'last_heatmap') and trainer.last_heatmap is not None:
                 ax_hm.imshow(
                     trainer.last_heatmap[l],
                     cmap='magma', origin='lower',
                     extent=(0, board.width, 0, board.height),
                     alpha=0.85
                 )
+            elif is_ar and hasattr(trainer.env, 'current_net_path') and len(trainer.env.current_net_path) > 0:
+                # Draw segments on layer l
+                active_path = trainer.env.current_net_path
+                for i in range(len(active_path) - 1):
+                    p1 = active_path[i]
+                    p2 = active_path[i+1]
+                    if p1[2] == l or p2[2] == l:
+                        c = layer_colors[l % len(layer_colors)]
+                        ax_hm.plot([p1[0], p2[0]], [p1[1], p2[1]], color=c, linewidth=2.0, alpha=0.9, marker='o', markersize=2)
+                
+                # Draw cursor/target if they are on layer l
+                if hasattr(trainer.env, 'cursor_pos') and trainer.env.cursor_pos is not None:
+                    cx, cy, cl = trainer.env.cursor_pos
+                    if cl == l:
+                        ax_hm.add_patch(mpatches.Circle((cx, cy), radius=1.5, fc="#F59E0B", ec=WHITE, lw=0.5, alpha=1.0, zorder=10))
+                if hasattr(trainer.env, 'target_pos') and trainer.env.target_pos is not None:
+                    tx, ty, tl = trainer.env.target_pos
+                    if tl == l:
+                        ax_hm.add_patch(mpatches.Circle((tx, ty), radius=1.5, fc="#EF4444", ec=WHITE, lw=0.5, alpha=1.0, zorder=10))
             else:
-                ax_hm.text(0.5, 0.5, "No Heatmap Yet", color="#888",
+                text_str = "No Active Path" if is_ar else "No Heatmap Yet"
+                ax_hm.text(0.5, 0.5, text_str, color="#888",
                            transform=ax_hm.transAxes, ha="center", va="center")
                            
-            # Overlay active pins on heatmap for reference
+            # Overlay active pins on heatmap/trace for reference
             for pin in board.pins.values():
                 if pin.layer == l:
                     c = net_colors[pin.net_id % len(net_colors)]
@@ -365,13 +454,13 @@ else:
     print("Warning: Could not locate board rendering panel for replacement in training cell!")
 
 # Split back into lines
-nb["cells"][5]["source"] = [line + "\n" for line in training_source_str.split("\n")]
+nb["cells"][training_cell_idx]["source"] = [line + "\n" for line in training_source_str.split("\n")]
 # remove trailing newline duplicate from split
-if nb["cells"][5]["source"][-1] == "\n":
-    nb["cells"][5]["source"].pop()
+if nb["cells"][training_cell_idx]["source"][-1] == "\n":
+    nb["cells"][training_cell_idx]["source"].pop()
 
 # Cell 6 (Evaluation Cell)
-eval_source_str = "".join(nb["cells"][6]["source"])
+eval_source_str = "".join(nb["cells"][eval_cell_idx]["source"])
 target_eval_import = "    from pcb_router.training.trainer import DreamerJEPATrainer"
 replacement_eval_import = "    from pcb_router.training.trainer import DreamerJEPATrainer"
 
@@ -438,9 +527,9 @@ if target_eval_instantiation in eval_source_str:
 if target_eval_loop in eval_source_str:
     eval_source_str = eval_source_str.replace(target_eval_loop, replacement_eval_loop)
 
-nb["cells"][6]["source"] = [line + "\n" for line in eval_source_str.split("\n")]
-if nb["cells"][6]["source"][-1] == "\n":
-    nb["cells"][6]["source"].pop()
+nb["cells"][eval_cell_idx]["source"] = [line + "\n" for line in eval_source_str.split("\n")]
+if nb["cells"][eval_cell_idx]["source"][-1] == "\n":
+    nb["cells"][eval_cell_idx]["source"].pop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Cell 7 (NEW) — Step-by-Step Routing Visualizer (Gradio OR W&B)
