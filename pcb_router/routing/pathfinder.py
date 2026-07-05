@@ -46,8 +46,28 @@ class AStarPathfinder:
             return None, float('inf')
         if not (0 <= tx < W and 0 <= ty < H):
             return None, float('inf')
+        target_pin = None
+        if board_state and board_state.board:
+            for pin in board_state.board.pins.values():
+                if pin.global_x == tx and pin.global_y == ty:
+                    target_pin = pin
+                    break
+
+        def check_target_reached(x, y, l):
+            if target_pin:
+                dx = abs(x - tx)
+                dy = abs(y - ty)
+                w_half = 3
+                h_half = 3
+                reached = (dx <= w_half and dy <= h_half)
+                if tl != -1 and l != tl:
+                    reached = False
+                return reached
+            else:
+                return (tl == -1 and x == tx and y == ty) or (x == tx and y == ty and l == tl)
+
         # Early-exit: already at destination
-        if (tl == -1 and sx == tx and sy == ty) or (tl != -1 and source == target):
+        if check_target_reached(sx, sy, sl):
             p_sl = 0 if sl == -1 else sl
             return [(sx, sy, p_sl)], 0.0
 
@@ -107,8 +127,7 @@ class AStarPathfinder:
             cx, cy, cl = curr
 
             # Target reached check
-            is_reached = (cx == tx and cy == ty) if tl == -1 else (curr == target)
-            if is_reached:
+            if check_target_reached(cx, cy, cl):
                 # Reconstruct path
                 path = []
                 rx, ry, rl, rdir = cx, cy, cl, last_dir_idx

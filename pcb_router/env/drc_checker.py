@@ -184,7 +184,16 @@ class DRCChecker:
             # Initialize union find nodes
             # Pin nodes
             for pin in net_pins:
-                parent[(pin.global_x, pin.global_y, pin.layer)] = (pin.global_x, pin.global_y, pin.layer)
+                pin_root = (pin.global_x, pin.global_y, pin.layer)
+                parent[pin_root] = pin_root
+                
+                # Pins have a drawn radius of 3 (7x7 footprint)
+                for dx in range(-3, 4):
+                    for dy in range(-3, 4):
+                        p_cell = (pin.global_x + dx, pin.global_y + dy, pin.layer)
+                        if p_cell not in parent:
+                            parent[p_cell] = p_cell
+                        union(pin_root, p_cell)
                 
             # Trace segment endpoints
             for t in net_traces:

@@ -246,7 +246,21 @@ class PCBRoutingEnv(gym.Env):
         step_reward = self.reward_calculator.calculate_step(step_info)
         
         # Check if current segment target reached
-        target_reached = (cx == tx and cy == ty) if tl == -1 else (cx == tx and cy == ty and cl == tl)
+        target_pin = None
+        for p in self.board.nets[self.current_net_index].pin_ids:
+            pin = self.board.pins[p]
+            if pin.global_x == tx and pin.global_y == ty:
+                target_pin = pin
+                break
+                
+        if target_pin:
+            w_half = 3
+            h_half = 3
+            target_reached = (abs(cx - tx) <= w_half and abs(cy - ty) <= h_half)
+            if tl != -1 and cl != tl:
+                target_reached = False
+        else:
+            target_reached = (cx == tx and cy == ty) if tl == -1 else (cx == tx and cy == ty and cl == tl)
         
         terminated = False
         truncated = False
@@ -504,8 +518,8 @@ class PCBRoutingEnv(gym.Env):
             if path:
                 all_routed_path.extend(path[1:])
                 path_cost += cost
-                # Next target is routed from the current target or trace points
-                curr_source = target_pos
+                # Next target is routed from the exact point the current path ended
+                curr_source = path[-1]
                 success = True
             else:
                 success = False
