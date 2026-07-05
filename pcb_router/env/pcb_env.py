@@ -70,6 +70,12 @@ class PCBRoutingEnv(gym.Env):
         self.routed_nets = set()
         self.drc_violations = []
 
+        # Incremental DRC cache: avoids re-scanning already-checked trace pairs
+        # on every step (see DRCChecker.check_incremental). Reset whenever
+        # board_state.traces is reset/replaced (reset(), set_board()).
+        self._drc_cache_trace_count = 0
+        self._drc_cache_pairwise = []
+
         # Step routing state
         self.current_net_index = None
         self.cursor_pos = None
@@ -104,6 +110,8 @@ class PCBRoutingEnv(gym.Env):
         self.graph = self.graph_builder.build_graph(board)
         self.routed_nets.clear()
         self.drc_violations.clear()
+        self._drc_cache_trace_count = 0
+        self._drc_cache_pairwise = []
         self.step_count = 0
         self.max_steps = 2 * len(board.nets)
 
@@ -302,9 +310,11 @@ class PCBRoutingEnv(gym.Env):
                 self.routed_nets.add(net_id)
                 
                 # Calculate terminal bonus/penalties using normal calculate()
-                all_violations = drc_checker.check_all(
-                    self.board_state, self.board_state.traces, self.board_state.vias, self.board
+                all_violations, self._drc_cache_pairwise = drc_checker.check_incremental(
+                    self.board_state, self.board_state.traces, self.board_state.vias, self.board,
+                    self._drc_cache_trace_count, self._drc_cache_pairwise
                 )
+                self._drc_cache_trace_count = len(self.board_state.traces)
                 num_new_violations = len(all_violations) - len(self.drc_violations)
                 self.drc_violations = all_violations
                 
@@ -407,6 +417,8 @@ class PCBRoutingEnv(gym.Env):
         
         self.routed_nets.clear()
         self.drc_violations.clear()
+        self._drc_cache_trace_count = 0
+        self._drc_cache_pairwise = []
         self.step_count = 0
 
         # Reset step routing state
@@ -557,10 +569,13 @@ class PCBRoutingEnv(gym.Env):
         t_post = time.perf_counter() - t_post_start
             
         t_drc_start = time.perf_counter()
-        # 5. Check DRC violations
-        all_violations = drc_checker.check_all(
-            self.board_state, self.board_state.traces, self.board_state.vias, self.board
+        # 5. Check DRC violations (incremental: avoids re-scanning already-checked
+        # trace pairs every step, see DRCChecker.check_incremental)
+        all_violations, self._drc_cache_pairwise = drc_checker.check_incremental(
+            self.board_state, self.board_state.traces, self.board_state.vias, self.board,
+            self._drc_cache_trace_count, self._drc_cache_pairwise
         )
+        self._drc_cache_trace_count = len(self.board_state.traces)
         # Find violations introduced by this step
         num_new_violations = len(all_violations) - len(self.drc_violations)
         self.drc_violations = all_violations

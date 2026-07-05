@@ -320,7 +320,7 @@ class BaseRoutingTrainer:
             print(f"Warning: Failed to save visual checkpoint: {e}")
 
 
-from pcb_router.models.jepa import JEPAWorldModel
+from pcb_router.models.jepa import JEPAWorldModel, symexp
 from pcb_router.models.policy import DreamerActorCritic
 from pcb_router.training.replay_buffer import ReplayBuffer, Episode
 from collections import defaultdict
@@ -711,16 +711,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                     edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
                     
                     with torch.no_grad():
-                        spatial_patches, cls_spatial = self.vit(raster_tensor)
-                        node_embs = self.gnn(x_dict, edge_index_dict)
-                        pad_embs = node_embs['pad'].unsqueeze(0)
-                        fused_pads, fused_spatial = self.fusion(pad_embs, spatial_patches)
-                        
-                        global_spatial = cls_spatial
-                        global_graph = fused_pads.mean(dim=1)
-                        context_emb = torch.cat([global_spatial, global_graph], dim=-1)
-                        context_emb = F.layer_norm(context_emb, (context_emb.shape[-1],))
-                        
+                        # Online encoder: this is the input the RSSM posterior conditions on.
+                        context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
+
                     net_embs, unrouted_mask, _ = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
                     
                     with torch.no_grad():
@@ -746,16 +739,12 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         next_graph = next_info['graph']
                         next_x_dict = {k: v.to(self.device) for k, v in next_graph.x_dict.items()}
                         next_edge_index_dict = {k: v.to(self.device) for k, v in next_graph.edge_index_dict.items()}
-                        
-                        next_sp, next_cls = self.vit(next_raster)
-                        next_node = self.gnn(next_x_dict, next_edge_index_dict)
-                        next_pad = next_node['pad'].unsqueeze(0)
-                        next_fused_pads, _ = self.fusion(next_pad, next_sp)
-                        
-                        next_global_spatial = next_cls
-                        next_global_graph = next_fused_pads.mean(dim=1)
-                        target_context_emb = torch.cat([next_global_spatial, next_global_graph], dim=-1)
-                        target_context_emb = F.layer_norm(target_context_emb, (target_context_emb.shape[-1],))
+
+                        # EMA target encoder (JEPAWorldModel.target_vit/target_gnn/target_fusion),
+                        # NOT the online encoder — the predictor must chase a slowly-moving target,
+                        # otherwise the online encoder can trivially collapse to minimize the
+                        # invariance loss against itself.
+                        target_context_emb = self.jepa.get_context_embedding(next_raster, next_x_dict, next_edge_index_dict, use_target=True)
                         
                     with torch.no_grad():
                         action_tuple = (net_idx_tensor.detach().squeeze(0).cpu(), heatmap_latent.detach().squeeze(0).cpu())
@@ -899,12 +888,20 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             cursor_delta_tensor = torch.tensor(cursor_delta, dtype=torch.float32, device=self.device).unsqueeze(0)
                             
                             action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta_tensor)
-                            
+
                             global_spatial = cls_spatial
                             global_graph = fused_pads.mean(dim=1)
                             context_emb = torch.cat([global_spatial, global_graph], dim=-1)
                             context_emb = F.layer_norm(context_emb, (context_emb.shape[-1],))
-                            
+
+                            # EMA target encoder on this same observation — this is what gets
+                            # stored as target_context_embeddings[t] and consumed as the JEPA
+                            # prediction target for step t-1. Must come from the target_vit/
+                            # target_gnn/target_fusion EMA copies, not the online encoder above,
+                            # otherwise the invariance loss can be trivially minimized by the
+                            # online encoder collapsing rather than actually modeling dynamics.
+                            target_context_emb = self.jepa.get_context_embedding(r_tensor, x_dict_t, edge_index_dict_t, use_target=True)
+
                             h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
                             h = h.detach()
                             z = z.detach()
@@ -921,7 +918,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             action_tuple = (torch.tensor(action, dtype=torch.long).cpu(), cursor_delta_tensor.detach().squeeze(0).cpu())
                             
                             episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
-                            episode.target_context_embeddings.append(context_emb.detach().squeeze(0).cpu())
+                            episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
                             episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
                             episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
                             
@@ -1238,10 +1235,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             net_embeddings, unrouted_mask, h, z, deterministic=False
                         )
                         
-                        pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+                        # reward_head was trained to regress symlog(reward) (see jepa.py
+                        # compute_loss); invert it here so lambda-returns/advantages are
+                        # computed in real reward units, not compressed symlog units.
+                        pred_reward = symexp(self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1))
                         pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
                         pred_continue = torch.sigmoid(pred_continue_logits)
-                        
+
                         traj_h.append(h)
                         traj_z.append(z)
                         traj_actions_net.append(net_idx)
@@ -1258,7 +1258,11 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         update = torch.zeros_like(unrouted_mask, dtype=torch.bool)
                         update = update.scatter(1, net_idx.unsqueeze(-1), True)
                         unrouted_mask = unrouted_mask & ~update
-            bootstrap_value = self.policy.get_value(h, z)
+            # Bootstrap with the EMA target critic (updated via update_target_critic),
+            # not the live critic being regressed toward these same returns in this
+            # same update — otherwise the bootstrap anchor moves every step alongside
+            # the thing it's supposed to stabilize (the moving-target problem).
+            bootstrap_value = self.policy.get_value(h, z, use_target=True)
             
             traj_h = torch.stack(traj_h, dim=0)
             traj_z = torch.stack(traj_z, dim=0)
@@ -1486,12 +1490,15 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             action_emb = self.jepa.get_action_embedding_move(action_onehot, cursor_delta)
             h, z = self.jepa.predict_step(h, z, action_emb)
             
-            pred_reward = self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
+            # Invert the symlog the reward head was trained to regress against
+            # (see jepa.py compute_loss / symlog(rewards)) before this prediction
+            # is consumed as a real-unit reward for lambda-returns.
+            pred_reward = symexp(self.jepa.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1))
             pred_continue_logits = self.jepa.continue_head(torch.cat([h, z], dim=-1)).squeeze(-1)
             pred_continue = torch.sigmoid(pred_continue_logits)
-            
+
             if out_of_bounds.any():
-                pred_reward[out_of_bounds] = -1.0
+                pred_reward[out_of_bounds] = -1.0  # fixed real-unit penalty, not a model prediction
                 
             traj_rewards.append(pred_reward)
             traj_continues.append(pred_continue)

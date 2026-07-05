@@ -28,25 +28,105 @@ class DRCChecker:
         Run all design rule checks on current board layout
         """
         violations = []
-        
+
         # 1. Check Short Circuits (different nets overlapping on same layer)
         violations.extend(self._check_short_circuits(traces, vias, board.pins))
-        
+
         # 2. Check Clearances (different nets too close but not shorted)
         violations.extend(self._check_clearances(traces, vias, board.pins))
-        
+
         # 3. Check Width Rules (trace widths vs design rules)
         violations.extend(self._check_widths(traces, board.nets))
-        
+
         # 4. Check Keep Out Zones
         violations.extend(self._check_keep_outs(traces, vias, board.keep_out_zones))
-        
+
         # 5. Check Via Rules
         violations.extend(self._check_vias(vias))
-        
+
         # 6. Check Electrical Connectivity
         violations.extend(self._check_connectivity(board, traces, vias))
-        
+
+        return violations
+
+    def check_incremental(
+        self,
+        board_state: BoardState,
+        traces: List[TraceSegment],
+        vias: List[Via],
+        board: Board,
+        prev_trace_count: int,
+        cached_pairwise_violations: List[DRCViolation],
+    ) -> Tuple[List[DRCViolation], List[DRCViolation]]:
+        """
+        Same result as check_all(), but avoids redoing the O(T^2) trace-to-trace
+        short-circuit/clearance scan for pairs that were already checked on a
+        previous call.
+
+        `traces` only ever grows (segments are appended, never moved or removed
+        mid-episode — see BoardState.add_routed_trace), so any pair fully inside
+        traces[:prev_trace_count] was already checked and cannot have changed.
+        Only pairs touching a newly-appended segment need to be re-examined.
+        Width/keep-out/via/connectivity checks are already linear (or bounded
+        per-net), so they're still run in full every call.
+
+        Returns (all_violations, updated_cached_pairwise_violations) — pass the
+        second value back in as `cached_pairwise_violations` on the next call.
+        """
+        pairwise = list(cached_pairwise_violations)
+        if len(traces) > prev_trace_count:
+            new_traces = traces[prev_trace_count:]
+            pairwise.extend(self._check_short_circuits_incremental(new_traces, traces))
+            pairwise.extend(self._check_clearances_incremental(new_traces, traces))
+
+        violations = list(pairwise)
+        violations.extend(self._check_widths(traces, board.nets))
+        violations.extend(self._check_keep_outs(traces, vias, board.keep_out_zones))
+        violations.extend(self._check_vias(vias))
+        violations.extend(self._check_connectivity(board, traces, vias))
+
+        return violations, pairwise
+
+    def _check_short_circuits_incremental(self, new_traces: List[TraceSegment], all_traces: List[TraceSegment]) -> List[DRCViolation]:
+        violations = []
+        start_idx = len(all_traces) - len(new_traces)
+        for local_i, t2 in enumerate(new_traces):
+            k = start_idx + local_i
+            for j in range(k):
+                t1 = all_traces[j]
+                if t1.net_id != t2.net_id and t1.layer == t2.layer:
+                    dist = self.trace_gen._segment_to_segment_distance(t1, t2)
+                    if dist <= 0.001:
+                        violations.append(DRCViolation(
+                            type='short_circuit', severity='error',
+                            x=int((t1.start_x + t1.end_x)/2), y=int((t1.start_y + t1.end_y)/2),
+                            layer=t1.layer,
+                            description=f"Short circuit: net {t1.net_id} overlaps trace of net {t2.net_id}",
+                            net_id_a=t1.net_id, net_id_b=t2.net_id
+                        ))
+        return violations
+
+    def _check_clearances_incremental(self, new_traces: List[TraceSegment], all_traces: List[TraceSegment]) -> List[DRCViolation]:
+        violations = []
+        start_idx = len(all_traces) - len(new_traces)
+        for local_i, t2 in enumerate(new_traces):
+            k = start_idx + local_i
+            for j in range(k):
+                t1 = all_traces[j]
+                if t1.net_id != t2.net_id and t1.layer == t2.layer:
+                    dist = self.trace_gen._segment_to_segment_distance(t1, t2)
+                    rule_1 = self.design_rules.get('default')
+                    min_clearance = rule_1['clearance']
+                    allowed_dist = min_clearance + (t1.width + t2.width) / 2.0
+
+                    if 0.001 < dist < allowed_dist:
+                        violations.append(DRCViolation(
+                            type='clearance', severity='error',
+                            x=int((t1.start_x + t1.end_x)/2), y=int((t1.start_y + t1.end_y)/2),
+                            layer=t1.layer,
+                            description=f"Clearance violation: net {t1.net_id} and {t2.net_id} too close ({dist:.3f}mm < {allowed_dist:.3f}mm)",
+                            net_id_a=t1.net_id, net_id_b=t2.net_id
+                        ))
         return violations
 
     def _check_short_circuits(self, traces: List[TraceSegment], vias: List[Via], pins: Dict[int, Pin]) -> List[DRCViolation]:

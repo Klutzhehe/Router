@@ -264,10 +264,29 @@ class JEPAWorldModel(nn.Module):
             post_p = post_probs.reshape(B, self.stochastic_groups, self.stochastic_classes)
             prior_p = prior_probs.reshape(B, self.stochastic_groups, self.stochastic_classes)
 
-            kl = post_p * (torch.log(post_p + 1e-8) - torch.log(prior_p + 1e-8))
-            kl_sum = kl.sum(dim=-1).mean(dim=-1)
+            # KL balancing (DreamerV3): split into a "dynamics" term that only trains the
+            # prior to chase the (stop-gradient) posterior, and a "representation" term
+            # that only trains the posterior to stay close to the (stop-gradient) prior.
+            # self.kl_balance (~0.8) weights the dynamics term so the prior catches up to
+            # the posterior quickly, while the posterior stays lightly regularized and
+            # grounded in the real observation instead of collapsing toward an
+            # undertrained prior early in training. Without this split, a single joint
+            # KL[post||prior] pulls both distributions toward each other symmetrically,
+            # which is the classic early-training posterior-collapse failure mode.
+            prior_p_detached = prior_p.detach()
+            post_p_detached = post_p.detach()
 
-            kl_balanced = torch.max(kl_sum, torch.tensor(self.free_bits, device=device))
+            kl_dynamics = post_p_detached * (torch.log(post_p_detached + 1e-8) - torch.log(prior_p + 1e-8))
+            kl_representation = post_p * (torch.log(post_p + 1e-8) - torch.log(prior_p_detached + 1e-8))
+
+            kl_dynamics_sum = kl_dynamics.sum(dim=-1).mean(dim=-1)
+            kl_representation_sum = kl_representation.sum(dim=-1).mean(dim=-1)
+
+            free_bits_floor = torch.tensor(self.free_bits, device=device)
+            kl_dynamics_clamped = torch.max(kl_dynamics_sum, free_bits_floor)
+            kl_representation_clamped = torch.max(kl_representation_sum, free_bits_floor)
+
+            kl_balanced = self.kl_balance * kl_dynamics_clamped + (1.0 - self.kl_balance) * kl_representation_clamped
             kl_losses.append(kl_balanced * mask_t)
 
             pred_reward = self.reward_head(torch.cat([h, z], dim=-1)).squeeze(-1)
