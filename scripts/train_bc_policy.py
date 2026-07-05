@@ -315,12 +315,23 @@ def main():
         for p in list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters()):
             p.requires_grad = False
             
-    # Setup optimizer
+    # Setup optimizer. When encoders are unfrozen they are trained FROM RANDOM INIT here, which
+    # is far less stable than fine-tuning a pretrained ViT — a full args.lr on the transformer
+    # tends to overflow under fp16 AMP and NaN out mid-training. Give the encoders a gentler LR
+    # (0.2x) via a separate param group; the cosine scheduler scales both groups equally so the
+    # ratio is preserved. `params` (used for grad clipping) still spans everything trainable.
     params = list(policy.parameters())
     if args.unfreeze_encoders:
-        params += list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters())
+        enc_params = list(vit.parameters()) + list(gnn.parameters()) + list(fusion.parameters())
+        params += enc_params
+        opt_groups = [
+            {'params': list(policy.parameters()), 'lr': args.lr},
+            {'params': enc_params, 'lr': args.lr * 0.2},
+        ]
+    else:
+        opt_groups = [{'params': list(policy.parameters()), 'lr': args.lr}]
     # fused=True drastically speeds up the optimizer step on the GPU
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4, fused=torch.cuda.is_available())
+    optimizer = torch.optim.AdamW(opt_groups, lr=args.lr, weight_decay=1e-4, fused=torch.cuda.is_available())
     
     # Cosine annealing with linear warmup (standard for transformer training)
     warmup_epochs = max(1, int(args.epochs * 0.05))  # 5% warmup
@@ -451,10 +462,16 @@ def main():
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)  # gradient clipping
-            scaler.step(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)  # gradient clipping
+            # Non-finite guard: if this batch produced inf/NaN gradients (fp16 overflow in the
+            # from-scratch ViT), grad_norm is inf/NaN — skip the optimizer step so the bad update
+            # never touches the weights. Without this, a single overflow permanently NaNs the model
+            # (fused AdamW + GradScaler don't always skip reliably). GradScaler.update() still lowers
+            # the loss scale so subsequent batches are less likely to overflow.
+            if torch.isfinite(grad_norm):
+                scaler.step(optimizer)
             scaler.update()
-            
+
             train_loss += loss.item() * rasters.size(0)
             preds = masked_logits.argmax(dim=-1)
             train_acc += (preds == actions).sum().item()
