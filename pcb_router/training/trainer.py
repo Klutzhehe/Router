@@ -451,10 +451,9 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         #  - fusion: cross-attention over dynamic N_nodes → cannot compile.
         self.compile_models = t_cfg.get('compile_models', True)
         if self.compile_models and hasattr(torch, 'compile') and self.device.type == 'cuda':
-            print("Compiling world model and policy with torch.compile() (static-shape models only)...")
+            print("Compiling world model with torch.compile()...")
             try:
                 self.jepa = torch.compile(self.jepa)
-                self.policy = torch.compile(self.policy)
             except Exception as e:
                 print(f"torch.compile failed (falling back to uncompiled execution): {e}")
         
