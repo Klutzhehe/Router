@@ -33,7 +33,7 @@ def generate_dataset(out_dir="data/bc_dataset"):
     os.makedirs(out_dir, exist_ok=True)
     
     curriculum = CurriculumManager("configs/curriculum.yaml")
-    # We will generate dataset for stages s00 to s06 (Blocks A and B)
+    # We will generate dataset for stages s00 to s06 (Blocks A and B) plus via-intro and via-multi-net
     stages_to_generate = [
         "s00_single_net_empty_board",
         "s01_single_net_sparse_obstacles",
@@ -41,7 +41,9 @@ def generate_dataset(out_dir="data/bc_dataset"):
         "s03_two_nets",
         "s04_three_nets",
         "s05_four_nets",
-        "s06_five_nets_congestion"
+        "s06_five_nets_congestion",
+        "s09_via_intro",
+        "s10_via_plus_multi_net"
     ]
     
     episodes_per_stage = 40 # 40 boards per stage
