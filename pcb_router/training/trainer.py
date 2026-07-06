@@ -621,7 +621,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 
         return net_embs, unrouted_mask, fused_spatial
 
-    def _phase1_collect_real(self, num_steps: int, explore: bool = True) -> float:
+    def _phase1_collect_real(self, num_steps: int, explore: bool = True, on_step=None) -> float:
         self.vit.train()
         self.gnn.train()
         self.fusion.train()
@@ -898,6 +898,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                                 
                         cursor_prev = self.env.cursor_pos
                         next_obs, reward, terminated, truncated, next_info = self.env.step({'action_id': action})
+                        if on_step is not None:
+                            on_step(self, self.env)
                         if next_info and 'dist_delta' in next_info:
                             dist_deltas.append(next_info['dist_delta'])
                         cursor_curr = self.env.cursor_pos
@@ -1683,7 +1685,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         frac = self.total_timesteps / self.imagination_horizon_ramp_iters
         return int(self.imagination_horizon_start + frac * (self.imagination_horizon_end - self.imagination_horizon_start))
 
-    def train(self, total_timesteps: int, on_update=None):
+    def train(self, total_timesteps: int, on_update=None, on_step=None):
         print("Starting GNN + JEPA DreamerV3-style training...")
         progress_bar = tqdm(total=total_timesteps, desc="Training")
         
@@ -1692,7 +1694,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             self._phase1_collect_real(num_steps=64, explore=True)
             
         while self.total_timesteps < total_timesteps:
-            mean_completion = self._phase1_collect_real(num_steps=self.real_steps_per_iteration, explore=True)
+            mean_completion = self._phase1_collect_real(num_steps=self.real_steps_per_iteration, explore=True, on_step=on_step)
             wm_metrics = self._phase2_train_world_model()
             enc_metrics = self._phase2b_train_encoders()
             ac_metrics = self._phase3_train_actor_critic()
