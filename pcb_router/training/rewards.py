@@ -1,5 +1,22 @@
 from typing import Dict, Any, Optional
 
+# Proximity attractor for the final approach to a target pad. The plain distance reward gives the
+# same weak pull whether the cursor is far from or one cell short of the target, so near the pad
+# that pull is drowned out by exploration noise and the turn penalty — the agent jitters next to
+# the pad and never lands, so the net never completes. This potential ramps up steeply within
+# NEAR_TARGET_RADIUS cells, giving the last few steps a strong, committing reward. It is applied as
+# a per-step DELTA (potential-based shaping), so it cannot be farmed by hovering near the target.
+# Keep these constants in sync with DreamerJEPATrainer._imagine_autoregressive_rollout, which
+# imports them so the imagined objective matches the real one.
+NEAR_TARGET_RADIUS = 6.0
+NEAR_TARGET_GAIN = 1.5
+
+
+def near_target_potential(dist: float) -> float:
+    """Potential that is high on the target and decays to zero beyond NEAR_TARGET_RADIUS cells."""
+    return NEAR_TARGET_GAIN * max(0.0, NEAR_TARGET_RADIUS - dist)
+
+
 class RewardCalculator:
     def __init__(self, weights: Optional[Dict[str, float]] = None):
         # Default weight parameters
@@ -91,10 +108,17 @@ class RewardCalculator:
         invalid_move_penalty = 1.0  # matches step size order of magnitude
         
         r = 0.0
-        
+
         # 1. Distance progress (positive is good, negative is bad)
         r += step_info.get('dist_delta', 0.0)
-        
+
+        # 1b. Proximity attractor (potential-based): a steep extra pull within NEAR_TARGET_RADIUS
+        # of the target so the agent commits to landing on the pad instead of jittering next to it.
+        dist_prev = step_info.get('dist_prev')
+        dist_curr = step_info.get('dist_curr')
+        if dist_prev is not None and dist_curr is not None:
+            r += near_target_potential(dist_curr) - near_target_potential(dist_prev)
+
         # 2. Invalid move penalty
         if step_info.get('invalid_move', False):
             r -= invalid_move_penalty

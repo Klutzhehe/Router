@@ -271,6 +271,8 @@ class PCBRoutingEnv(gym.Env):
         # Calculate step reward
         step_info = {
             'dist_delta': float(dist_delta),
+            'dist_prev': float(dist_prev),
+            'dist_curr': float(dist_curr),
             'invalid_move': invalid_move,
             'direction_changed': direction_changed,
             'is_via': is_via

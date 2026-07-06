@@ -15,7 +15,7 @@ from pcb_router.models.fusion import CrossAttentionFusion
 
 from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.training.curriculum import CurriculumManager
-from pcb_router.training.rewards import RewardCalculator
+from pcb_router.training.rewards import RewardCalculator, NEAR_TARGET_RADIUS, NEAR_TARGET_GAIN
 from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 
 class RolloutBuffer:
@@ -1440,6 +1440,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             dist_curr = _dist_to_target(cursor_grid_new)
             dist_delta = dist_prev - dist_curr
 
+            # Proximity attractor (potential-based), matching RewardCalculator.near_target_potential:
+            # a steep extra pull within NEAR_TARGET_RADIUS so the imagined actor learns to commit to
+            # the pad on the final approach instead of jittering next to it and timing out.
+            prox_prev = NEAR_TARGET_GAIN * torch.clamp(NEAR_TARGET_RADIUS - dist_prev, min=0.0)
+            prox_curr = NEAR_TARGET_GAIN * torch.clamp(NEAR_TARGET_RADIUS - dist_curr, min=0.0)
+            prox_bonus = prox_curr - prox_prev
+
             prev_dir = torch.sign(prev_delta)
             curr_dir = torch.sign(cursor_delta)
             prev_nonzero = (prev_dir != 0).any(-1)
@@ -1448,6 +1455,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             # Turn penalty 0.5 (was 0.2) to match RewardCalculator.calculate_step — discourages the
             # jagged staircase traces that a near-free turn penalty allowed.
             reward = dist_delta \
+                + prox_bonus \
                 - 0.5 * dir_changed.float() \
                 - 0.5 * is_via.float() \
                 - 1.0 * oob.float()
