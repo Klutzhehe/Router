@@ -82,7 +82,11 @@ class RewardCalculator:
         # NOTE: Unlike pathfinder.py's static A* search costs (where 15.0 acts as a tie-breaker),
         # these values act as dense step rewards. They are scaled relative to dist_delta (+/-1.0)
         # to prevent via/turn avoidance from overpowering the progress signal.
-        direction_change_penalty = 0.2
+        # The turn penalty is 0.5 (was 0.2): at 0.2 turns were nearly free relative to ~1.0 progress,
+        # so the policy produced jagged staircase traces. 0.5 favors straight runs while still
+        # allowing a necessary turn (progress ~1.0 - 0.5 = net positive). Keep this in sync with the
+        # imagined-rollout turn penalty in DreamerJEPATrainer._imagine_autoregressive_rollout.
+        direction_change_penalty = 0.5
         base_via_cost = 0.5
         invalid_move_penalty = 1.0  # matches step size order of magnitude
         

@@ -44,13 +44,6 @@ jepa:
   invariance_weight: 25.0
   covariance_weight: 1.0
 
-# Heatmap CNN Decoder
-heatmap_decoder:
-  latent_dim: 128             # policy outputs 128-dim latent vector
-  hidden_channels: [128, 64, 32, 16]
-  max_layers: 8               # max copper layers supported
-  output_channels: 9          # 8 layer heatmaps + 1 via probability map
-
 # PPO Policy Network
 policy:
   net_selector_dim: 128

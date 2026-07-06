@@ -12,7 +12,6 @@ from typing import Dict, Any, List, Optional, Tuple
 from pcb_router.models.vit_encoder import ViTEncoder
 from pcb_router.models.gnn_encoder import HeteroGATEncoder
 from pcb_router.models.fusion import CrossAttentionFusion
-from pcb_router.models.heatmap_decoder import HeatmapDecoder
 
 from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.training.curriculum import CurriculumManager
@@ -175,14 +174,6 @@ class BaseRoutingTrainer:
             dropout=fus_cfg['dropout']
         ).to(self.device)
         
-        # Heatmap Decoder
-        dec_cfg = self.model_cfg['heatmap_decoder']
-        self.decoder = HeatmapDecoder(
-            latent_dim=dec_cfg['latent_dim'],
-            spatial_dim=vit_cfg['embed_dim'],
-            max_layers=dec_cfg['max_layers']
-        ).to(self.device)
-
         self.total_timesteps = 0
         self.last_action_probs = None
         self.current_net_values = None
@@ -408,21 +399,13 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             weight_decay=weight_decay
         )
         
-        if self.routing_mode == 'autoregressive':
-            actor_params_raw = (
-                list(self.policy.state_proj.parameters()) +
-                list(self.policy.net_scorer.parameters()) +
-                list(self.policy.step_policy.parameters())
-            )
-        else:
-            actor_params_raw = (
-                list(self.policy.state_proj.parameters()) +
-                list(self.policy.net_scorer.parameters()) +
-                list(self.policy.heatmap_mlp.parameters()) +
-                list(self.policy.heatmap_mean.parameters()) +
-                list(self.decoder.parameters()) +
-                [self.policy.heatmap_log_std]
-            )
+        # Only autoregressive routing is trained; the step policy is the actor. (The neural
+        # heatmap-decoder actor path was removed — A* is kept solely for BC dataset generation.)
+        actor_params_raw = (
+            list(self.policy.state_proj.parameters()) +
+            list(self.policy.net_scorer.parameters()) +
+            list(self.policy.step_policy.parameters())
+        )
         
         # Remove duplicates while preserving order
         actor_params = list(dict.fromkeys(actor_params_raw))
@@ -539,7 +522,6 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             'fusion': self.fusion.state_dict(),
             'jepa': self.jepa.state_dict(),
             'policy': self.policy.state_dict(),
-            'decoder': self.decoder.state_dict(),
             'wm_opt': self.wm_opt.state_dict(),
             'actor_opt': self.actor_opt.state_dict(),
             'critic_opt': self.critic_opt.state_dict(),
@@ -578,7 +560,6 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             self._safe_load(self.fusion, state['fusion'])
             self._safe_load(self.jepa, state['jepa'])
             self._safe_load(self.policy, state['policy'])
-            self._safe_load(self.decoder, state['decoder'])
             if 'wm_opt' in state:
                 self.wm_opt.load_state_dict(state['wm_opt'])
             if 'actor_opt' in state:
@@ -627,195 +608,19 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         self.fusion.train()
         self.jepa.train()
         self.policy.train()
-        self.decoder.train()
         
         steps_collected = 0
         completion_rates = []
         dist_deltas = []
         
-        if self.routing_mode == 'heatmap':
-            while steps_collected < num_steps:
-                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
-                episode = Episode()
-                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
-                done = False
-                self.all_episode_heatmaps = []  # reset per-episode heatmap log
-    
-                
-                while not done and steps_collected < num_steps:
-                    raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
-                    graph = info['graph']
-                    x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
-                    edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
-                    layer_mask = torch.tensor(obs['layer_mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
-                    
-                    with torch.amp.autocast('cuda', enabled=self.use_amp):
-                        # 1. Forward pass WITH gradients enabled for supervised path training
-                        context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
-                    target_context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=True)
-                    net_embs, unrouted_mask, fused_spatial = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
-                    
-                    # Run policy forward to select net and sample heatmap_latent (differentiable rsample)
-                    net_idx_tensor, log_prob_net, ent_net = self.policy.select_net(net_embs, unrouted_mask, h, z, deterministic=not explore)
-                    
-                    selected_net_emb = net_embs[0, net_idx_tensor.item()].unsqueeze(0)
-                    state = torch.cat([h, z], dim=-1)
-                    x_feat = torch.cat([selected_net_emb, state], dim=-1)
-                    h_feat = self.policy.heatmap_mlp(x_feat)
-                    mean = self.policy.heatmap_mean(h_feat)
-                    log_std = torch.clamp(self.policy.heatmap_log_std, min=-20.0, max=2.0).expand_as(mean)
-                    std = torch.exp(log_std)
-                    
-                    dist = torch.distributions.Normal(mean, std)
-                    if not explore:
-                        heatmap_latent = mean
-                    else:
-                        heatmap_latent = dist.rsample()  # Differentiable path!
-                    
-                    # Decode heatmap using current fused_spatial
-                    heatmaps_via = self.decoder(
-                        heatmap_latent, fused_spatial,
-                        self.env.H, self.env.W, active_layers_mask=layer_mask
-                    )
-                    # Step the environment using detached numpy arrays
-                    heatmaps_np = heatmaps_via[0, :self.env.board.num_layers].detach().cpu().numpy()
-                    via_prob_np = heatmaps_via[0, 8].detach().cpu().numpy()
-                    
-                    self.last_heatmap = heatmaps_np
-                    self.last_net_idx = net_idx_tensor.item()
-                    net_idx_int = net_idx_tensor.item()
-                    nets_list = self.env.board.nets
-                    net_name = nets_list[net_idx_int].name if net_idx_int < len(nets_list) else f"Net {net_idx_int}"
-                    self.all_episode_heatmaps.append({
-                        'net_name': net_name or f"Net {net_idx_int}",
-                        'net_idx': net_idx_int,
-                        'heatmaps_np': heatmaps_np,
-                    })
-                    
-                    next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
-                        net_idx_tensor.item(), heatmaps_np, via_prob_np
-                    )
-                    done = terminated or truncated
-                    steps_collected += 1
-                    
-                    # Supervised update for decoder and encoders on successful paths
-                    if next_info.get('connected', False) and 'path' in next_info and len(next_info['path']) > 1:
-                        all_routed_path = next_info['path']
-                        # target has same layers as env + 1 (for via)
-                        target_heatmap = torch.zeros((self.env.board.num_layers + 1, self.env.H, self.env.W), device=self.device)
-                        for idx, wp in enumerate(all_routed_path):
-                            wx, wy, wl = wp
-                            if 0 <= wx < self.env.W and 0 <= wy < self.env.H and 0 <= wl < self.env.board.num_layers:
-                                target_heatmap[wl, wy, wx] = 1.0
-                                # Mark via
-                                if idx > 0 and all_routed_path[idx-1][2] != wl:
-                                    target_heatmap[-1, wy, wx] = 1.0
-                                    
-                        # Match channels: pred has shape (9, H, W). We take layers 0..num_layers, and layer 8 (via map)
-                        pred_layers = heatmaps_via[0, :self.env.board.num_layers]
-                        pred_via = heatmaps_via[0, 8:9]
-                        pred_selected = torch.cat([pred_layers, pred_via], dim=0)
-                        
-                        with torch.amp.autocast('cuda', enabled=self.use_amp):
-                            # Use weighted BCE to handle the massive class imbalance of sparse path pixels
-                            # Cast to float32 to prevent underflow or NaN issues with BCE in float16
-                            with torch.amp.autocast('cuda', enabled=False):
-                                bce_loss = F.binary_cross_entropy(pred_selected.float(), target_heatmap.float(), reduction='none')
-                            weight_mask = torch.where(target_heatmap > 0, torch.tensor(50.0, device=self.device), torch.tensor(1.0, device=self.device))
-                            loss_dec = (bce_loss * weight_mask).mean()
-                        
-                        self.actor_opt.zero_grad(set_to_none=True)
-        if self.routing_mode == 'astar_guided':
-            while steps_collected < num_steps:
-                obs, info = self.env.reset(options={'board_config': self.curriculum.get_board_config()})
-                episode = Episode()
-                h, z = self.jepa.initial_state(batch_size=1, device=self.device)
-                
-                done = False
-                while not done and steps_collected < num_steps:
-                    raster_tensor = torch.tensor(obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
-                    graph = info['graph']
-                    x_dict = {k: v.to(self.device) for k, v in graph.x_dict.items()}
-                    edge_index_dict = {k: v.to(self.device) for k, v in graph.edge_index_dict.items()}
-                    
-                    with torch.no_grad():
-                        # Online encoder: this is the input the RSSM posterior conditions on.
-                        context_emb = self.jepa.get_context_embedding(raster_tensor, x_dict, edge_index_dict, use_target=False)
-
-                    net_embs, unrouted_mask, _ = self._get_net_embeddings_and_mask(raster_tensor, x_dict, edge_index_dict)
-                    
-                    with torch.no_grad():
-                        net_idx_tensor, heatmap_latent, log_prob_net, log_prob_heatmap, value = self.policy.act(
-                            net_embs, unrouted_mask, h, z, explore=explore
-                        )
-                        
-                    with torch.no_grad():
-                        heatmaps = self.heatmap_decoder(heatmap_latent)
-                        heatmaps_np = heatmaps.cpu().squeeze(0).numpy()
-                        via_prob_map = torch.sigmoid(heatmaps[:, -1]).cpu().squeeze(0).numpy()
-                        
-                    next_obs, reward, terminated, truncated, next_info = self.env.step_with_heatmaps(
-                        net_idx_tensor.item(), heatmaps_np, via_prob_map
-                    )
-                    
-                    done = terminated or truncated
-                    if next_info and 'dist_delta' in next_info:
-                        dist_deltas.append(next_info['dist_delta'])
-                    
-                    with torch.no_grad():
-                        next_raster = torch.tensor(next_obs['board_raster'], dtype=torch.float32).unsqueeze(0).to(self.device)
-                        next_graph = next_info['graph']
-                        next_x_dict = {k: v.to(self.device) for k, v in next_graph.x_dict.items()}
-                        next_edge_index_dict = {k: v.to(self.device) for k, v in next_graph.edge_index_dict.items()}
-
-                        # EMA target encoder (JEPAWorldModel.target_vit/target_gnn/target_fusion),
-                        # NOT the online encoder — the predictor must chase a slowly-moving target,
-                        # otherwise the online encoder can trivially collapse to minimize the
-                        # invariance loss against itself.
-                        target_context_emb = self.jepa.get_context_embedding(next_raster, next_x_dict, next_edge_index_dict, use_target=True)
-                        
-                    with torch.no_grad():
-                        action_tuple = (net_idx_tensor.detach().squeeze(0).cpu(), heatmap_latent.detach().squeeze(0).cpu())
-                        action_emb = self.jepa.get_action_embedding(net_idx_tensor, heatmap_latent.detach())
-                        h, z, _, _ = self.jepa.rssm_step(h, z, context_emb.detach(), action_emb)
-                        h = h.detach()
-                        z = z.detach()
-                        
-                        if not hasattr(episode, 'target_context_embeddings'):
-                            episode.target_context_embeddings = []
-                        if not hasattr(episode, 'net_embeddings_list'):
-                            episode.net_embeddings_list = []
-                        if not hasattr(episode, 'unrouted_masks_list'):
-                            episode.unrouted_masks_list = []
-                            
-                        episode.append(context_emb.detach().squeeze(0).cpu(), action_tuple, reward, done)
-                        episode.target_context_embeddings.append(target_context_emb.detach().squeeze(0).cpu())
-                        episode.net_embeddings_list.append(net_embs.detach().squeeze(0).cpu())
-                        episode.unrouted_masks_list.append(unrouted_mask.detach().squeeze(0).cpu())
-                        
-                    obs = next_obs
-                    info = next_info
-                    steps_collected += 1
-                    self.total_timesteps += 1
-                    if steps_collected % 5 == 0 or steps_collected == num_steps:
-                        print(f"  Collected {steps_collected}/{num_steps} steps...")
-                        
-                if episode.length > 0:
-                    episode.net_embeddings = episode.net_embeddings_list[0]
-                    episode.unrouted_masks = episode.unrouted_masks_list
-                    self.replay_buffer.add_episode(episode)
-                    cr = info.get('completion_rate', 0.0)
-                    drc_viol = info.get('drc_violations', 0)
-                    num_nets = len(self.env.board.nets)
-                    drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
-                    self.curriculum.record_episode(cr, drc_rate)
-                    completion_rates.append(cr)
-                    
-                    self.last_completed_board_state = copy.deepcopy(self.env.board_state)
-                    self.last_completed_board = copy.deepcopy(self.env.board)
-                    
-            self.mean_dist_delta = np.mean(dist_deltas) if dist_deltas else 0.0
-            return np.mean(completion_rates) if completion_rates else 0.0
+        # Autoregressive is the only supported routing mode for RL collection. The neural
+        # heatmap-decoder path (routing_mode 'heatmap' / 'astar_guided') has been removed;
+        # A* pathfinding is retained only for offline BC dataset generation, which calls
+        # env.pathfinder.find_path directly (see scripts/generate_bc_dataset.py).
+        if self.routing_mode != 'autoregressive':
+            raise ValueError(
+                f"collect_rollout supports only routing_mode='autoregressive'; got {self.routing_mode!r}"
+            )
         else:
             # Autoregressive mode
             while steps_collected < num_steps:
@@ -1621,9 +1426,18 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             # board summary with no cursor/target geometry — and so could only ever hallucinate a
             # correlation like "diagonal move => +2". The real reward is exactly known here because
             # we simulate the cursor kinematics, so we compute it directly.
-            dist_prev = (cursor_grid - target_grid).abs().sum(-1)
+            # Euclidean planar distance + L1 layer distance, matching env.step_move (see the note
+            # there): Manhattan L1 double-counts diagonal moves (drops distance by 2 for one step)
+            # and trains staircase geometry. Euclidean keeps the imagined objective consistent with
+            # the real reward, giving a diagonal ~1.41 progress and preferring straight axis-aligned
+            # moves toward the target.
+            def _dist_to_target(grid):
+                planar = torch.sqrt(((grid[:, :2] - target_grid[:, :2]) ** 2).sum(-1) + 1e-8)
+                layer = (grid[:, 2] - target_grid[:, 2]).abs()
+                return planar + layer
             cursor_grid_new = cursor_grid + cursor_delta
-            dist_curr = (cursor_grid_new - target_grid).abs().sum(-1)
+            dist_prev = _dist_to_target(cursor_grid)
+            dist_curr = _dist_to_target(cursor_grid_new)
             dist_delta = dist_prev - dist_curr
 
             prev_dir = torch.sign(prev_delta)
@@ -1631,8 +1445,10 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             prev_nonzero = (prev_dir != 0).any(-1)
             dir_changed = prev_nonzero & (prev_dir != curr_dir).any(-1)
 
+            # Turn penalty 0.5 (was 0.2) to match RewardCalculator.calculate_step — discourages the
+            # jagged staircase traces that a near-free turn penalty allowed.
             reward = dist_delta \
-                - 0.2 * dir_changed.float() \
+                - 0.5 * dir_changed.float() \
                 - 0.5 * is_via.float() \
                 - 1.0 * oob.float()
 

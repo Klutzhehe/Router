@@ -247,9 +247,15 @@ class PCBRoutingEnv(gym.Env):
             if prev_dir != (0, 0, 0) and prev_dir != curr_dir:
                 direction_changed = True
 
-        # Calculate previous distance to target
-        dist_prev = abs(cx - tx) + abs(cy - ty) + abs(cl - (0 if tl == -1 else tl))
-        
+        # Calculate previous distance to target.
+        # Use EUCLIDEAN planar distance (not Manhattan) so progress reward is proportional to
+        # physical distance covered. Manhattan double-counts a diagonal step (it drops L1 distance
+        # by 2 for a single move vs 1 for an orthogonal move), which trains the policy to zig-zag
+        # into staircase traces — bad PCB geometry / self-clearance DRC. Euclidean gives a diagonal
+        # ~1.41 progress and also naturally prefers straight moves when the target is axis-aligned.
+        tl_eff = 0 if tl == -1 else tl
+        dist_prev = math.hypot(cx - tx, cy - ty) + abs(cl - tl_eff)
+
         # Process the move
         if not invalid_move:
             # Apply incremental occupancy update to board raster
@@ -257,9 +263,9 @@ class PCBRoutingEnv(gym.Env):
             self.cursor_pos = (nx, ny, nl)
             self.current_net_path.append(self.cursor_pos)
             cx, cy, cl = nx, ny, nl
-        
+
         # Calculate new distance to target
-        dist_curr = abs(cx - tx) + abs(cy - ty) + abs(cl - (0 if tl == -1 else tl))
+        dist_curr = math.hypot(cx - tx, cy - ty) + abs(cl - tl_eff)
         dist_delta = dist_prev - dist_curr
         
         # Calculate step reward
