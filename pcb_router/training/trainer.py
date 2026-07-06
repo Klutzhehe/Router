@@ -791,15 +791,25 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 if episode.length > 0:
                     episode.net_embeddings = episode.net_embeddings_list[0]
                     episode.unrouted_masks = episode.unrouted_masks_list
+                    # Always keep the episode for world-model / policy training — partial rollouts
+                    # are still valid transitions.
                     self.replay_buffer.add_episode(episode)
                     if self.train_encoders and len(raw_steps) > 1:
                         self._push_raw_episode(raw_steps)
-                    cr = info.get('completion_rate', 0.0)
-                    drc_viol = info.get('drc_violations', 0)
-                    num_nets = len(self.env.board.nets)
-                    drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
-                    self.curriculum.record_episode(cr, drc_rate)
-                    completion_rates.append(cr)
+
+                    # Only record completion/DRC for boards that reached a genuine conclusion:
+                    # `done` (terminated = fully routed, or truncated = a net actually failed its
+                    # move budget). If instead the per-iteration collection budget (num_steps) ran
+                    # out mid-board, `done` is False and the board's completion is unknown — logging
+                    # its partial rate (e.g. 0/1) as a failure biases the curriculum metric downward
+                    # and stalls advancement. Skip it from the stat; it still trains the model.
+                    if done:
+                        cr = info.get('completion_rate', 0.0)
+                        drc_viol = info.get('drc_violations', 0)
+                        num_nets = len(self.env.board.nets)
+                        drc_rate = drc_viol / num_nets if num_nets > 0 else 0.0
+                        self.curriculum.record_episode(cr, drc_rate)
+                        completion_rates.append(cr)
 
                     self.last_completed_board_state = copy.deepcopy(self.env.board_state)
                     self.last_completed_board = copy.deepcopy(self.env.board)
