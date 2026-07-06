@@ -53,7 +53,7 @@ if _here not in sys.path:
 
 from pcb_router.env.pcb_env import PCBRoutingEnv
 from pcb_router.data.board_generator import BoardGenerator, BoardConfig
-from pcb_router.training.trainer import DreamerJEPATrainer, PPOJEPATrainer
+from pcb_router.training.trainer import DreamerJEPATrainer
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 NET_COLORS   = ['#3B82F6','#10B981','#EC4899','#8B5CF6','#06B6D4',
@@ -698,15 +698,9 @@ def launch_gradio_visualizer(
         cur_cfg = yaml.safe_load(f)
 
     # Load model
-    try:
-        trainer = DreamerJEPATrainer(device='cpu', load_checkpoint_path=checkpoint_path)
-        is_dreamer = True
-        print("✅ Loaded DreamerJEPA model")
-    except Exception as e:
-        print(f"DreamerJEPA failed ({e}), using PPOJEPATrainer…")
-        trainer = PPOJEPATrainer(device='cpu', load_checkpoint_path=checkpoint_path)
-        is_dreamer = False
-        print("✅ Loaded PPO-JEPA model")
+    trainer = DreamerJEPATrainer(device='cpu', load_checkpoint_path=checkpoint_path)
+    is_dreamer = True
+    print("✅ Loaded DreamerJEPA model")
 
     demo = build_gradio_app(trainer, is_dreamer, cur_cfg)
     print("\nLaunching Gradio app…")
