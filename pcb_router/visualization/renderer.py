@@ -39,7 +39,8 @@ class BoardRenderer:
         board_state: BoardState,
         board: Board,
         layer: int = 0,
-        show_all_layers: bool = False
+        show_all_layers: bool = False,
+        heatmap: Optional[np.ndarray] = None
     ):
         """
         Draws the board state including outline, components, pads, traces, and vias
@@ -52,6 +53,10 @@ class BoardRenderer:
         
         # Draw grid lines
         ax.grid(True, color=self.grid_color, linestyle='--', linewidth=0.5)
+        
+        if heatmap is not None:
+            ax.imshow(heatmap, cmap='inferno', origin='lower', alpha=0.55,
+                      extent=[0, board.width, 0, board.height], zorder=0)
         
         # 1. Draw obstacles (channel 9 of board_state)
         # We can also draw them from the board object directly for clear dimensions
