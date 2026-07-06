@@ -163,97 +163,109 @@ class BoardGenerator:
         # 1. Generate components and place them without overlap
         components = []
         board_margin = 30
-        pin_counter = 0
         
-        for c_idx in range(config.num_components):
-            max_allowed_w = config.board_width - 2 * board_margin
-            max_allowed_h = config.board_height - 2 * board_margin
+        # Retry loop for the entire component placement layout
+        for layout_attempt in range(25):
+            components = []
+            pin_counter = 0
+            all_placed = True
             
-            # Find all package options that can fit
-            valid_packages = []
-            
-            # DIP options
-            dip_pins_opts = [p for p in [8, 14, 16, 20] if 60 <= max_allowed_w and int((p / 2) * 25.4) <= max_allowed_h]
-            if dip_pins_opts:
-                valid_packages.append(('DIP', dip_pins_opts))
+            for c_idx in range(config.num_components):
+                max_allowed_w = config.board_width - 2 * board_margin
+                max_allowed_h = config.board_height - 2 * board_margin
                 
-            # QFP options
-            qfp_pins_opts = [p for p in [16, 32, 48] if (30 + (p // 4) * 25) <= min(max_allowed_w, max_allowed_h)]
-            if qfp_pins_opts:
-                valid_packages.append(('QFP', qfp_pins_opts))
+                # Find all package options that can fit
+                valid_packages = []
                 
-            # BGA options
-            bga_grid_opts = [g for g in [4, 6, 8] if (20 + g * 10) <= min(max_allowed_w, max_allowed_h)]
-            if bga_grid_opts:
-                valid_packages.append(('BGA', bga_grid_opts))
-                
-            # SOT option (always fits since it is 30x20)
-            if 30 <= max_allowed_w and 20 <= max_allowed_h:
-                valid_packages.append(('SOT', [3]))
-                
-            # Connector options
-            conn_pins_opts = [p for p in [4, 6, 8, 10] if 20 <= max_allowed_w and (p * 25) <= max_allowed_h]
-            if conn_pins_opts:
-                valid_packages.append(('connector', conn_pins_opts))
-                
-            # Fallback if board is extremely small (SOT-like small component)
-            if not valid_packages:
-                pkg_type = 'SOT'
-                num_pins = 3
-                w_cells, h_cells = 30, 20
-            else:
-                pkg_type, pin_opts = random.choice(valid_packages)
-                num_pins = random.choice(pin_opts)
-                if pkg_type == 'DIP':
-                    w_cells = 60
-                    h_cells = int((num_pins / 2) * 25.4)
-                elif pkg_type == 'QFP':
-                    w_cells = 30 + (num_pins // 4) * 25
-                    h_cells = w_cells
-                elif pkg_type == 'BGA':
-                    grid_side = num_pins
-                    num_pins = grid_side ** 2
-                    w_cells = 20 + grid_side * 10
-                    h_cells = w_cells
-                elif pkg_type == 'SOT':
-                    w_cells = 30
-                    h_cells = 20
-                else: # connector
-                    w_cells = 20
-                    h_cells = num_pins * 25
-                
-            rotation = random.choice([0, 90, 180, 270])
-            
-            # Rotated bounding box dimensions
-            w_cells_placed = h_cells if rotation in [90, 270] else w_cells
-            h_cells_placed = w_cells if rotation in [90, 270] else h_cells
-            
-            # Place component avoiding overlaps
-            max_placement_attempts = 100
-            placed = False
-            for _ in range(max_placement_attempts):
-                max_x = max(board_margin, config.board_width - w_cells_placed - board_margin)
-                max_y = max(board_margin, config.board_height - h_cells_placed - board_margin)
-                cx = random.randint(board_margin, max_x)
-                cy = random.randint(board_margin, max_y)
-                
-                # Check overlap
-                overlap = False
-                for ex_c in components:
-                    if not (cx + w_cells_placed < ex_c.x or cx > ex_c.x + ex_c.width or
-                            cy + h_cells_placed < ex_c.y or cy > ex_c.y + ex_c.height):
-                        overlap = True
-                        break
-                if not overlap:
-                    # Place component
-                    comp = Component(id=c_idx, name=f"U{c_idx+1}", x=cx, y=cy, width=w_cells_placed, height=h_cells_placed, rotation=rotation)
+                # DIP options
+                dip_pins_opts = [p for p in [8, 14, 16, 20] if 60 <= max_allowed_w and int((p / 2) * 25.4) <= max_allowed_h]
+                if dip_pins_opts:
+                    valid_packages.append(('DIP', dip_pins_opts))
                     
-                    # Generate component pins
-                    self._generate_pins(comp, pkg_type, num_pins, pin_counter)
-                    pin_counter += len(comp.pins)
-                    components.append(comp)
-                    placed = True
-                    break
+                # QFP options
+                qfp_pins_opts = [p for p in [16, 32, 48] if (30 + (p // 4) * 25) <= min(max_allowed_w, max_allowed_h)]
+                if qfp_pins_opts:
+                    valid_packages.append(('QFP', qfp_pins_opts))
+                    
+                # BGA options
+                bga_grid_opts = [g for g in [4, 6, 8] if (20 + g * 10) <= min(max_allowed_w, max_allowed_h)]
+                if bga_grid_opts:
+                    valid_packages.append(('BGA', bga_grid_opts))
+                    
+                # SOT option (always fits since it is 30x20)
+                if 30 <= max_allowed_w and 20 <= max_allowed_h:
+                    valid_packages.append(('SOT', [3]))
+                    
+                # Connector options
+                conn_pins_opts = [p for p in [4, 6, 8, 10] if 20 <= max_allowed_w and (p * 25) <= max_allowed_h]
+                if conn_pins_opts:
+                    valid_packages.append(('connector', conn_pins_opts))
+                    
+                # Fallback if board is extremely small (SOT-like small component)
+                if not valid_packages:
+                    pkg_type = 'SOT'
+                    num_pins = 3
+                    w_cells, h_cells = 30, 20
+                else:
+                    pkg_type, pin_opts = random.choice(valid_packages)
+                    num_pins = random.choice(pin_opts)
+                    if pkg_type == 'DIP':
+                        w_cells = 60
+                        h_cells = int((num_pins / 2) * 25.4)
+                    elif pkg_type == 'QFP':
+                        w_cells = 30 + (num_pins // 4) * 25
+                        h_cells = w_cells
+                    elif pkg_type == 'BGA':
+                        grid_side = num_pins
+                        num_pins = grid_side ** 2
+                        w_cells = 20 + grid_side * 10
+                        h_cells = w_cells
+                    elif pkg_type == 'SOT':
+                        w_cells = 30
+                        h_cells = 20
+                    else: # connector
+                        w_cells = 20
+                        h_cells = num_pins * 25
+                    
+                rotation = random.choice([0, 90, 180, 270])
+                
+                # Rotated bounding box dimensions
+                w_cells_placed = h_cells if rotation in [90, 270] else w_cells
+                h_cells_placed = w_cells if rotation in [90, 270] else h_cells
+                
+                # Place component avoiding overlaps
+                max_placement_attempts = 100
+                placed = False
+                for _ in range(max_placement_attempts):
+                    max_x = max(board_margin, config.board_width - w_cells_placed - board_margin)
+                    max_y = max(board_margin, config.board_height - h_cells_placed - board_margin)
+                    cx = random.randint(board_margin, max_x)
+                    cy = random.randint(board_margin, max_y)
+                    
+                    # Check overlap
+                    overlap = False
+                    for ex_c in components:
+                        if not (cx + w_cells_placed < ex_c.x or cx > ex_c.x + ex_c.width or
+                                cy + h_cells_placed < ex_c.y or cy > ex_c.y + ex_c.height):
+                            overlap = True
+                            break
+                    if not overlap:
+                        # Place component
+                        comp = Component(id=c_idx, name=f"U{c_idx+1}", x=cx, y=cy, width=w_cells_placed, height=h_cells_placed, rotation=rotation)
+                        
+                        # Generate component pins
+                        self._generate_pins(comp, pkg_type, num_pins, pin_counter)
+                        pin_counter += len(comp.pins)
+                        components.append(comp)
+                        placed = True
+                        break
+                
+                if not placed:
+                    all_placed = False
+                    break # failed to place one component, break and retry entire board layout
+            
+            if all_placed:
+                break # successfully placed all components!
                     
         # Re-assign component IDs sequentially to prevent gaps from failed placements
         for new_id, comp in enumerate(components):
