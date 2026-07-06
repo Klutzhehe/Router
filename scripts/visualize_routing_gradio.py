@@ -576,7 +576,7 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
 
     # ── Gradio Blocks UI ──────────────────────────────────────────────────────
     with gr.Blocks(
-        title="JEPA PCB Router — Step Visualizer",
+        title="JEPA PCB Router — Visualizer Dashboard",
         theme=gr.themes.Base(
             primary_hue="indigo",
             secondary_hue="cyan",
@@ -592,77 +592,121 @@ def build_gradio_app(trainer, is_dreamer, cur_cfg):
         last_rendered_step = gr.State(value=-1)
         timer = gr.Timer(value=3, active=False)
 
-        gr.Markdown("""
-        # ⚡ JEPA PCB Router — Step-by-Step Routing Visualizer
-        Watch the JEPA world model plan routes **net-by-net**, seeing how it responds to previously placed copper.
+        gr.Markdown("# ⚡ JEPA PCB Router — Visualizer Dashboard")
 
-        > **How to read the heatmap:**
-        > - 🟡 **Bright (yellow/white)** = JEPA learned to *avoid* this area
-        > - 🟣 **Dark (purple/black)** = JEPA *prefers* routing here
-        > - ⬜ **White overlay lines** = previously routed copper (channel 10 of the board raster)
-        > - If bright zones correlate with white lines → JEPA **is** avoiding existing traces ✅
-        > - If heatmap looks the same regardless → model hasn't learned avoidance yet ❌
-        """)
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                stage_dd   = gr.Dropdown(stage_names, value=stage_names[0],
-                                          label="Curriculum Stage")
-                seed_num   = gr.Number(value=42, label="Board Seed", precision=0)
-                layer_dd   = gr.Dropdown([0, 1, 2, 3], value=0, label="Heatmap Layer to Show")
-                progress   = gr.Textbox(value="0 / ? nets routed", label="Progress",
-                                         interactive=False)
+        with gr.Tabs():
+            with gr.Tab("📡 Live Training Stream"):
+                gr.Markdown("### Watch Training Rollouts Step-by-Step")
+                gr.Markdown("This panel updates in real-time with the active layout of the board as the model takes steps in the training environment.")
                 
-                live_monitor = gr.Checkbox(
-                    label="📡 Live Training Monitor (Auto-refresh on training progress)", 
-                    value=False
+                with gr.Row():
+                    btn_enable_viz = gr.Checkbox(label="Enable Live Step viz (Will override CONFIG.LIVE_STEP_VIZ)", value=False)
+                    btn_delay = gr.Slider(0.01, 0.5, value=0.02, label="Live Step Delay (seconds)")
+                
+                with gr.Row():
+                    live_board_img = gr.Image(label="Active Board State", type="pil", height=500)
+                    with gr.Column():
+                        live_metrics_md = gr.Markdown("Waiting for training steps...")
+                
+                def toggle_live_step_viz(checked, delay_val):
+                    trainer.train_cfg.get('training', {})['LIVE_STEP_VIZ'] = checked
+                    trainer.train_cfg.get('training', {})['LIVE_STEP_DELAY'] = delay_val
+                    trainer.live_step_viz = checked
+                    trainer.live_step_delay = delay_val
+                    return f"Live viz: {'Enabled' if checked else 'Disabled'} (delay={delay_val}s)"
+                
+                btn_enable_viz.change(toggle_live_step_viz, inputs=[btn_enable_viz, btn_delay], outputs=live_metrics_md)
+                btn_delay.change(toggle_live_step_viz, inputs=[btn_enable_viz, btn_delay], outputs=live_metrics_md)
+                
+                live_timer = gr.Timer(value=0.5, active=True)
+                
+                def update_live_stream_view():
+                    img = getattr(trainer, 'last_training_board_image', None)
+                    if img is None:
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        fig.patch.set_facecolor(BG)
+                        ax.set_facecolor(BG)
+                        ax.axis('off')
+                        ax.text(0.5, 0.5, "Training hasn't started or LIVE_STEP_VIZ is False.\nEnable the checkbox above to start streaming.", color=FG, ha='center', va='center')
+                        img = _fig_to_pil(fig)
+                        plt.close(fig)
+                    
+                    status = getattr(trainer, 'live_training_status', "Waiting for training steps...")
+                    return img, status
+                
+                live_timer.tick(update_live_stream_view, outputs=[live_board_img, live_metrics_md])
+
+            with gr.Tab("🔍 Interactive Evaluator"):
+                gr.Markdown("""
+                Watch the JEPA world model plan routes **net-by-net**, seeing how it responds to previously placed copper.
+
+                > **How to read the heatmap:**
+                > - 🟡 **Bright (yellow/white)** = JEPA learned to *avoid* this area
+                > - 🟣 **Dark (purple/black)** = JEPA *prefers* routing here
+                > - ⬜ **White overlay lines** = previously routed copper (channel 10 of the board raster)
+                > - If bright zones correlate with white lines → JEPA **is** avoiding existing traces ✅
+                > - If heatmap looks the same regardless → model hasn't learned avoidance yet ❌
+                """)
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        stage_dd   = gr.Dropdown(stage_names, value=stage_names[0],
+                                                  label="Curriculum Stage")
+                        seed_num   = gr.Number(value=42, label="Board Seed", precision=0)
+                        layer_dd   = gr.Dropdown([0, 1, 2, 3], value=0, label="Heatmap Layer to Show")
+                        progress   = gr.Textbox(value="0 / ? nets routed", label="Progress",
+                                                 interactive=False)
+                        
+                        live_monitor = gr.Checkbox(
+                            label="📡 Live Training Monitor (Auto-refresh on training progress)", 
+                            value=False
+                        )
+
+                        with gr.Row():
+                            btn_new  = gr.Button("🔄 New Board",     variant="secondary")
+                            btn_step = gr.Button("➡ Route Next Net", variant="primary")
+
+                        with gr.Row():
+                            btn_all  = gr.Button("▶ Route All Nets", variant="primary")
+
+                        step_view_num = gr.Number(value=1, label="View Specific Step #", precision=0)
+                        btn_view      = gr.Button("🔍 View This Step")
+
+                    with gr.Column(scale=3):
+                        status_md = gr.Markdown("Press **New Board** then **Route Next Net** to begin.")
+                        board_img = gr.Image(label="Board Layout (Before → After)", type="pil",
+                                              height=400, show_label=True)
+                        heat_img  = gr.Image(label="JEPA Cost Heatmap + Occupancy", type="pil",
+                                              height=300, show_label=True)
+                        via_img   = gr.Image(label="Via Placement Probability", type="pil",
+                                              height=200, show_label=True)
+
+                gr.Markdown("### 📋 Routing History (all steps)")
+                hist_img = gr.Image(label="All Routing Steps", type="pil",
+                                     height=350, show_label=False)
+
+                # ── Wire events ──────────────────────────────────────────────────────
+                outputs = [status_md, board_img, heat_img, via_img, hist_img, progress]
+
+                btn_new.click(handle_new_board, inputs=[stage_dd, seed_num], outputs=outputs)
+                btn_step.click(handle_step_one, inputs=[stage_dd, seed_num, layer_dd], outputs=outputs)
+                btn_all.click(handle_route_all, inputs=[stage_dd, seed_num, layer_dd], outputs=outputs)
+                btn_view.click(handle_view_step,
+                               inputs=[stage_dd, seed_num, layer_dd, step_view_num],
+                               outputs=outputs)
+
+                # Live monitor timer toggle & tick
+                live_monitor.change(
+                    lambda active: gr.Timer(active=active), 
+                    inputs=[live_monitor], 
+                    outputs=[timer]
                 )
-
-                with gr.Row():
-                    btn_new  = gr.Button("🔄 New Board",     variant="secondary")
-                    btn_step = gr.Button("➡ Route Next Net", variant="primary")
-
-                with gr.Row():
-                    btn_all  = gr.Button("▶ Route All Nets", variant="primary")
-
-                step_view_num = gr.Number(value=1, label="View Specific Step #", precision=0)
-                btn_view      = gr.Button("🔍 View This Step")
-
-            with gr.Column(scale=3):
-                status_md = gr.Markdown("Press **New Board** then **Route Next Net** to begin.")
-                board_img = gr.Image(label="Board Layout (Before → After)", type="pil",
-                                      height=400, show_label=True)
-                heat_img  = gr.Image(label="JEPA Cost Heatmap + Occupancy", type="pil",
-                                      height=300, show_label=True)
-                via_img   = gr.Image(label="Via Placement Probability", type="pil",
-                                      height=200, show_label=True)
-
-        gr.Markdown("### 📋 Routing History (all steps)")
-        hist_img = gr.Image(label="All Routing Steps", type="pil",
-                             height=350, show_label=False)
-
-        # ── Wire events ──────────────────────────────────────────────────────
-        outputs = [status_md, board_img, heat_img, via_img, hist_img, progress]
-
-        btn_new.click(handle_new_board, inputs=[stage_dd, seed_num], outputs=outputs)
-        btn_step.click(handle_step_one, inputs=[stage_dd, seed_num, layer_dd], outputs=outputs)
-        btn_all.click(handle_route_all, inputs=[stage_dd, seed_num, layer_dd], outputs=outputs)
-        btn_view.click(handle_view_step,
-                       inputs=[stage_dd, seed_num, layer_dd, step_view_num],
-                       outputs=outputs)
-
-        # Live monitor timer toggle & tick
-        live_monitor.change(
-            lambda active: gr.Timer(active=active), 
-            inputs=[live_monitor], 
-            outputs=[timer]
-        )
-        
-        timer.tick(
-            handle_live_poll,
-            inputs=[stage_dd, seed_num, layer_dd, last_rendered_step],
-            outputs=outputs + [last_rendered_step]
-        )
+                
+                timer.tick(
+                    handle_live_poll,
+                    inputs=[stage_dd, seed_num, layer_dd, last_rendered_step],
+                    outputs=outputs + [last_rendered_step]
+                )
 
     return demo
 
