@@ -87,20 +87,30 @@ class BoardState:
                 net_rules[net.id] = rules
             default_rules = self.board.design_rules.get('default', {})
             
+            current_net = next((n for n in self.board.nets if n.id == self.current_net_id), None)
+            current_rules = net_rules.get(self.current_net_id, default_rules)
+            current_width = current_rules.get('width', 0.15)
+            
+            exempt_net_ids = {self.current_net_id}
+            if current_net and current_net.is_diff_pair and current_net.diff_pair_id is not None:
+                exempt_net_ids.add(current_net.diff_pair_id)
+            
+            # 2 cells (0.2mm) of extra clearance for length-matched nets to reserve space
+            length_matched_inflation = 2.0 if (current_net and current_net.target_length > 0) else 0.0
+            
             for pin in self.board.pins.values():
-                if pin.net_id != self.current_net_id:
+                if pin.net_id not in exempt_net_ids:
                     # Block all layers for through-hole pins (-1), block specific layer for SMD pads
                     if pin.layer == -1 or pin.layer == layer:
                         rules = net_rules.get(pin.net_id, default_rules)
-                        clearance = rules.get('clearance', 0.15)
-                        trace_width = rules.get('width', 0.15)
+                        clearance = max(rules.get('clearance', 0.15), current_rules.get('clearance', 0.15))
                         
                         # Pad radius is 3. We inflate the pad obstacle by:
                         # clearance + trace_radius to ensure the trace center stays far enough away.
                         pad_r = 3.0
                         clearance_cells = clearance / self.resolution
-                        trace_r_cells = (trace_width / 2.0) / self.resolution
-                        avoid_r = pad_r + clearance_cells + trace_r_cells
+                        trace_r_cells = (current_width / 2.0) / self.resolution
+                        avoid_r = pad_r + clearance_cells + trace_r_cells + length_matched_inflation
                         
                         cx, cy = pin.global_x, pin.global_y
                         
@@ -137,8 +147,14 @@ class BoardState:
         for net in self.board.nets:
             net_rules[net.id] = self.board.design_rules.get(net.net_class, self.board.design_rules.get('default', {}))
         default_rules = self.board.design_rules.get('default', {})
+        
+        current_net = next((n for n in self.board.nets if n.id == self.current_net_id), None)
+        exempt_net_ids = {self.current_net_id}
+        if current_net and current_net.is_diff_pair and current_net.diff_pair_id is not None:
+            exempt_net_ids.add(current_net.diff_pair_id)
+            
         for pin in self.board.pins.values():
-            if pin.net_id != self.current_net_id and (pin.layer == -1 or pin.layer == layer):
+            if pin.net_id not in exempt_net_ids and (pin.layer == -1 or pin.layer == layer):
                 rules = net_rules.get(pin.net_id, default_rules)
                 clearance = rules.get('clearance', 0.15)
                 trace_width = rules.get('width', 0.15)
@@ -173,8 +189,13 @@ class BoardState:
                 net.net_class, default_rules
             )
         
+        current_net = next((n for n in self.board.nets if n.id == self.current_net_id), None)
+        exempt_net_ids = {self.current_net_id}
+        if current_net and current_net.is_diff_pair and current_net.diff_pair_id is not None:
+            exempt_net_ids.add(current_net.diff_pair_id)
+        
         for pin in self.board.pins.values():
-            if pin.net_id == self.current_net_id:
+            if pin.net_id in exempt_net_ids:
                 continue  # Skip our own net's pads
                 
             # Block all layers for through-hole pins (-1), specific layer for SMD

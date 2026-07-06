@@ -72,7 +72,7 @@ def build_via_blocked_maps(board_state, obstacle_maps, active_layers, shape=None
         obs = obstacle_maps[l]
         blocked = np.zeros_like(obs)
         for dx, dy in via_clearance_offsets:
-            shifted = np.ones_like(obs)
+            shifted = np.zeros_like(obs)
             y_start_dst = max(0, -dy)
             y_end_dst = min(H, H - dy)
             y_start_src = max(0, dy)

@@ -33,7 +33,7 @@ class DRCChecker:
         violations.extend(self._check_short_circuits(traces, vias, board.pins))
 
         # 2. Check Clearances (different nets too close but not shorted)
-        violations.extend(self._check_clearances(traces, vias, board.pins))
+        violations.extend(self._check_clearances(traces, vias, board.pins, board))
 
         # 3. Check Width Rules (trace widths vs design rules)
         violations.extend(self._check_widths(traces, board.nets))
@@ -42,7 +42,7 @@ class DRCChecker:
         violations.extend(self._check_keep_outs(traces, vias, board.keep_out_zones))
 
         # 5. Check Via Rules
-        violations.extend(self._check_vias(vias))
+        violations.extend(self._check_vias(vias, board=board))
 
         # 6. Check Electrical Connectivity
         violations.extend(self._check_connectivity(board, traces, vias))
@@ -82,7 +82,7 @@ class DRCChecker:
         violations = list(pairwise)
         violations.extend(self._check_widths(traces, board.nets))
         violations.extend(self._check_keep_outs(traces, vias, board.keep_out_zones))
-        violations.extend(self._check_vias(vias))
+        violations.extend(self._check_vias(vias, board=board))
         violations.extend(self._check_connectivity(board, traces, vias))
 
         return violations, pairwise
@@ -147,8 +147,15 @@ class DRCChecker:
                         ))
         return violations
 
-    def _check_clearances(self, traces: List[TraceSegment], vias: List[Via], pins: Dict[int, Pin]) -> List[DRCViolation]:
+    def _check_clearances(self, traces: List[TraceSegment], vias: List[Via], pins: Dict[int, Pin], board: Board = None) -> List[DRCViolation]:
         violations = []
+        # Precompute net clearances from board
+        net_clearances = {}
+        if board:
+            for net in board.nets:
+                rules = self.design_rules.get(net.net_class, self.design_rules.get('default', {}))
+                net_clearances[net.id] = rules.get('clearance', 0.15)
+                
         # Check trace-to-trace clearance
         for i in range(len(traces)):
             for j in range(i + 1, len(traces)):
@@ -156,8 +163,9 @@ class DRCChecker:
                 if t1.net_id != t2.net_id and t1.layer == t2.layer:
                     dist = self.trace_gen._segment_to_segment_distance(t1, t2)
                     # Min clearance is default or specific class rule
-                    rule_1 = self.design_rules.get('default') # simplifed
-                    min_clearance = rule_1['clearance']
+                    clearance_1 = net_clearances.get(t1.net_id, 0.15)
+                    clearance_2 = net_clearances.get(t2.net_id, 0.15)
+                    min_clearance = max(clearance_1, clearance_2)
                     allowed_dist = min_clearance + (t1.width + t2.width) / 2.0
                     
                     if 0.001 < dist < allowed_dist:
@@ -214,10 +222,15 @@ class DRCChecker:
                         ))
         return violations
 
-    def _check_vias(self, vias: List[Via]) -> List[DRCViolation]:
+    def _check_vias(self, vias: List[Via], board: Board = None) -> List[DRCViolation]:
         violations = []
+        net_classes = {}
+        if board:
+            net_classes = {net.id: net.net_class for net in board.nets}
+            
         for via in vias:
-            rules = self.design_rules.get('default')
+            net_class = net_classes.get(via.net_id, 'default')
+            rules = self.design_rules.get(net_class, self.design_rules.get('default'))
             min_drill = rules.get('via_drill', 0.3)
             min_annular = rules.get('via_annular', 0.15)
             
