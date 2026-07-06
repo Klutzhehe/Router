@@ -67,12 +67,16 @@ FG  = '#E2E8F0'
 #  Drawing helpers (identical to wandb script so we can share the logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _draw_board_on_ax(ax, env, board_state, highlight_net_id=None, path=None):
+def _draw_board_on_ax(ax, env, board_state, highlight_net_id=None, path=None, heatmap=None):
     board = env.board
     ax.set_facecolor(BG)
     ax.set_xlim(0, board.width);  ax.set_ylim(0, board.height)
     ax.set_aspect('equal');       ax.set_xticks([]); ax.set_yticks([])
     ax.grid(True, color='#1A1C2E', linewidth=0.4, linestyle='--')
+
+    if heatmap is not None:
+        ax.imshow(heatmap, cmap='inferno', origin='lower', alpha=0.55,
+                  extent=[0, board.width, 0, board.height], zorder=0)
 
     for obs in board.obstacles:
         ax.add_patch(patches.Rectangle((obs.x, obs.y), obs.width, obs.height,
@@ -355,13 +359,13 @@ def render_step_image(session: RoutingSession, step_dict: dict, layer_idx: int =
         color=FG, fontsize=12, fontweight='bold'
     )
     before.set_current_net(net.id)
-    _draw_board_on_ax(ax_b, env, before, highlight_net_id=net.id)
+    _draw_board_on_ax(ax_b, env, before, highlight_net_id=net.id, heatmap=heatmaps_np[layer])
     ax_b.set_title(
         f"Board BEFORE (step {step_dict['step_num']})\n"
         "White lines in heatmap = this copper",
         color=FG, fontsize=10, pad=8
     )
-    _draw_board_on_ax(ax_a, env, after, highlight_net_id=net.id, path=path)
+    _draw_board_on_ax(ax_a, env, after, highlight_net_id=net.id, path=path, heatmap=heatmaps_np[layer])
     ax_a.set_title(
         f"Board AFTER routing '{net.name}'",
         color=FG, fontsize=10, pad=8
