@@ -18,6 +18,10 @@ from pcb_router.training.curriculum import CurriculumManager
 from pcb_router.training.rewards import RewardCalculator, NEAR_TARGET_RADIUS, NEAR_TARGET_GAIN
 from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 
+# Max foreign-pad obstacle discs stored per step for obstacle-aware imagination. Boards with more
+# foreign pads than this truncate (rare; the nearest ones matter most for local routing).
+MAX_OBSTACLE_DISCS = 64
+
 class RolloutBuffer:
     def __init__(self):
         self.rasters = []
@@ -632,6 +636,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 episode.moves_remaining_fracs = []
                 episode.fused_spatials = []
                 episode.max_moves_fracs = []
+                episode.obstacle_discs = []
                 episode.board_dims = (self.env.W, self.env.H, self.env.board.num_layers)
 
                 # Per-episode raw observations for encoder fine-tuning (kept only if enabled).
@@ -655,6 +660,22 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                         
                     self.env.start_routing_net(net_idx_tensor.item())
                     self.current_net_values = []
+
+                    # Foreign-pad obstacle discs for this net (constant across its steps). Stored so
+                    # imagination forbids the same cells the real valid-move mask blocks, letting the
+                    # actor learn to route AROUND pad clusters instead of jamming into them.
+                    disc_rows = []
+                    seen_disc = set()
+                    for _l in range(self.env.board.num_layers):
+                        for (dcx, dcy, dr) in self.env.board_state.get_foreign_pad_discs(_l):
+                            if (dcx, dcy) not in seen_disc:
+                                seen_disc.add((dcx, dcy))
+                                disc_rows.append((dcx, dcy, dr))
+                    disc_arr = torch.zeros((MAX_OBSTACLE_DISCS, 3), dtype=torch.float32)
+                    for _j, (dcx, dcy, dr) in enumerate(disc_rows[:MAX_OBSTACLE_DISCS]):
+                        disc_arr[_j, 0] = dcx
+                        disc_arr[_j, 1] = dcy
+                        disc_arr[_j, 2] = dr
                     
                     net_done = False
                     while not net_done and steps_collected < num_steps:
@@ -776,7 +797,8 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                             # Stored in fp16 to halve replay RAM (this is the largest per-step
                             # tensor: full board patch grid). Re-cast to fp32 when used in imagination.
                             episode.fused_spatials.append(fused_spatial.detach().squeeze(0).half().cpu())
-                            
+                            episode.obstacle_discs.append(disc_arr)
+
                             max_moves = curr_info.get('max_moves_per_net', 0)
                             moves_frac_val = 1.0 / max(1, max_moves)
                             episode.max_moves_fracs.append(moves_frac_val)
@@ -1346,6 +1368,21 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
         moves_decrement = torch.stack(moves_dec_list).to(device).unsqueeze(-1)
         board_dims = torch.tensor([ep.board_dims for ep in sampled_episodes], dtype=torch.float32, device=device)
 
+        # Foreign-pad obstacle discs at each seed (constant across the imagined horizon since the
+        # board is held static). Lets the imagined rollout forbid moves into pad clusters, so the
+        # actor practices detouring instead of driving straight through them. Episodes collected
+        # before this feature (no obstacle_discs_tensor) fall back to "no discs" = old behavior.
+        disc_list = []
+        for _i, ep in enumerate(sampled_episodes):
+            if hasattr(ep, 'obstacle_discs_tensor'):
+                disc_list.append(ep.obstacle_discs_tensor[sampled_indices[_i]])
+            else:
+                disc_list.append(torch.zeros((MAX_OBSTACLE_DISCS, 3), dtype=torch.float32))
+        obstacle_discs_img = torch.stack(disc_list).to(device)   # (B, MAX_OBSTACLE_DISCS, 3)
+        disc_centers = obstacle_discs_img[:, :, :2]              # (B, MAX, 2)
+        disc_r2 = obstacle_discs_img[:, :, 2] ** 2               # (B, MAX)
+        disc_valid = obstacle_discs_img[:, :, 2] > 0.0           # (B, MAX)
+
         # Static-map approximation: the board representation is held fixed across the imagined
         # horizon (only the cursor moves and re-crops). Because it is static, we upload each
         # episode's fused spatial map to the GPU exactly ONCE here (grouped by patch count so
@@ -1398,14 +1435,26 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 cropped_spatial, cursor_pos_img, target_pos_img, moves_remaining_frac_img, h, z
             )
 
-            # Boundary action masking — mirror the real env, which masks off-board moves during
-            # collection (get_valid_mask). Without this, imagination trains in a world with free
-            # boundaries and the actor learns to walk off the board (the corner-walk exploit).
+            # Boundary + obstacle action masking — mirror the real env's get_valid_mask, which masks
+            # both off-board moves AND moves into occupied cells. Without the obstacle part the
+            # imagined board is empty, so the actor only ever learns to drive straight at the target
+            # and jams into real pad clusters it never practiced routing around.
             proposed_all = cursor_grid.unsqueeze(1) + all_moves.unsqueeze(0)  # (B, 10, 3)
             in_bounds = ((proposed_all >= 0).all(-1) &
                          (proposed_all < board_dims.unsqueeze(1)).all(-1))     # (B, 10)
-            any_valid = in_bounds.any(-1, keepdim=True)
-            safe_mask = torch.where(any_valid, in_bounds, torch.ones_like(in_bounds))
+
+            # A planar destination cell inside any foreign pad disc is blocked. Vias (moves 8/9)
+            # keep the cursor's planar cell — never inside a disc — so they are unaffected.
+            prop_xy = proposed_all[:, :, :2]                                   # (B, 10, 2)
+            d2 = (prop_xy.unsqueeze(2) - disc_centers.unsqueeze(1)).pow(2).sum(-1)  # (B, 10, MAX)
+            obstacle_blocked = ((d2 <= disc_r2.unsqueeze(1)) & disc_valid.unsqueeze(1)).any(-1)  # (B,10)
+
+            legal = in_bounds & (~obstacle_blocked)
+            any_legal = legal.any(-1, keepdim=True)
+            # If fully boxed in by obstacles, fall back to on-board moves; if somehow no on-board
+            # move exists either, fall back to all moves — never all-mask (which would NaN softmax).
+            safe_mask = torch.where(any_legal, legal, in_bounds)
+            safe_mask = torch.where(in_bounds.any(-1, keepdim=True), safe_mask, torch.ones_like(safe_mask))
             masked_logits = logits.masked_fill(~safe_mask, -1e4)
 
             probs = F.softmax(masked_logits, dim=-1)
@@ -1424,12 +1473,16 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             cursor_delta = all_moves.index_select(0, action_id)  # (B, 3)
             is_via = (action_id >= 8)
 
-            # Safety net: if a row was fully masked and an off-board action still slipped
-            # through, treat it as an invalid (no-op) move exactly like the real env.
+            # Safety net: if a row was fully masked and an off-board OR into-obstacle action still
+            # slipped through, treat it as an invalid (no-op) move exactly like the real env, which
+            # leaves the cursor in place and applies an invalid-move penalty.
             proposed_sel = cursor_grid + cursor_delta
             oob = ((proposed_sel < 0).any(-1) | (proposed_sel >= board_dims).any(-1))
-            if oob.any():
-                cursor_delta = torch.where(oob.unsqueeze(-1), torch.zeros_like(cursor_delta), cursor_delta)
+            sel_d2 = (proposed_sel[:, :2].unsqueeze(1) - disc_centers).pow(2).sum(-1)  # (B, MAX)
+            hit_disc = ((sel_d2 <= disc_r2) & disc_valid).any(-1)                      # (B,)
+            invalid = oob | hit_disc
+            if invalid.any():
+                cursor_delta = torch.where(invalid.unsqueeze(-1), torch.zeros_like(cursor_delta), cursor_delta)
 
             # --- Analytic step reward (closed form; mirrors RewardCalculator.calculate_step). ---
             # This replaces the learned reward head, which conditioned only on (h, z) — a global
@@ -1468,7 +1521,7 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
                 + prox_bonus \
                 - 0.5 * dir_changed.float() \
                 - 0.5 * is_via.float() \
-                - 1.0 * oob.float()
+                - 1.0 * invalid.float()
 
             # Completion bonus when the imagined cursor reaches the target pin (xy within the pad
             # tolerance and correct layer), and terminate imagination there (continue = 0).

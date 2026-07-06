@@ -121,6 +121,34 @@ class BoardState:
                             
         return np.clip(occ, 0, 1)
 
+    def get_foreign_pad_discs(self, layer: int) -> list:
+        """Geometry (not raster) version of the foreign-pad obstacles get_occupancy rasterizes.
+
+        Returns a list of (cx, cy, radius) discs in grid cells for pads belonging to OTHER nets
+        that block routing on `layer`. Used by obstacle-aware imagination so the imagined cursor
+        must route around the very same pad discs the real valid-move mask blocks — without
+        rasterizing and storing a full occupancy grid per step. Radius matches get_occupancy's
+        inflated avoidance radius (pad + clearance + trace half-width).
+        """
+        discs = []
+        if self.current_net_id is None:
+            return discs
+        net_rules = {}
+        for net in self.board.nets:
+            net_rules[net.id] = self.board.design_rules.get(net.net_class, self.board.design_rules.get('default', {}))
+        default_rules = self.board.design_rules.get('default', {})
+        for pin in self.board.pins.values():
+            if pin.net_id != self.current_net_id and (pin.layer == -1 or pin.layer == layer):
+                rules = net_rules.get(pin.net_id, default_rules)
+                clearance = rules.get('clearance', 0.15)
+                trace_width = rules.get('width', 0.15)
+                pad_r = 3.0
+                clearance_cells = clearance / self.resolution
+                trace_r_cells = (trace_width / 2.0) / self.resolution
+                avoid_r = pad_r + clearance_cells + trace_r_cells
+                discs.append((float(pin.global_x), float(pin.global_y), float(avoid_r)))
+        return discs
+
     def get_pin_exclusion_mask(self, layer: int, extra_margin: int = 2) -> np.ndarray:
         """Returns a mask where 1.0 = routable, 0.0 = within clearance of another net's pad.
         

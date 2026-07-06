@@ -16,6 +16,7 @@ class Episode:
         self.cached_z = None
         self.fused_spatials: List[torch.Tensor] = []
         self.max_moves_fracs: List[float] = []
+        self.obstacle_discs: List[torch.Tensor] = []  # per step: (MAX_OBSTACLE_DISCS, 3) = (cx, cy, r)
 
     def append(self, context_embedding: torch.Tensor, action: Tuple[torch.Tensor, torch.Tensor], reward: float, done: bool):
         if self._finalized:
@@ -70,6 +71,8 @@ class Episode:
             self.fused_spatials_tensor = torch.stack(self.fused_spatials).cpu()
         if hasattr(self, 'max_moves_fracs') and self.max_moves_fracs:
             self.max_moves_fracs_tensor = torch.tensor(self.max_moves_fracs, dtype=torch.float32).cpu()
+        if hasattr(self, 'obstacle_discs') and self.obstacle_discs:
+            self.obstacle_discs_tensor = torch.stack(self.obstacle_discs).cpu()
 
         # Clear lists to reclaim memory
         self.context_embeddings = []
@@ -94,6 +97,8 @@ class Episode:
             self.fused_spatials = []
         if hasattr(self, 'max_moves_fracs'):
             self.max_moves_fracs = []
+        if hasattr(self, 'obstacle_discs'):
+            self.obstacle_discs = []
         self._finalized = True
 
 
