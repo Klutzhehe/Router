@@ -199,8 +199,58 @@ def demand_loss(logits, target, lmask, smask, pos_weight: float = 20.0):
     return bce / denom
 
 
+def _in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None and "IPKernel" in str(type(get_ipython()))
+    except Exception:
+        return False
+
+
+def _render_progress(sample, pred, losses, epoch, out_dir, show, layer=0):
+    """Save (and, in a notebook, live-display) a loss curve + prediction panels for one sample.
+    sample=(x, y) numpy tensors; pred=(MAX_LAYERS, H, W) predicted demand for the same sample."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x, y = sample
+    def npy(t):
+        return t.cpu().numpy() if hasattr(t, "cpu") else np.asarray(t)
+    x, y, pred = npy(x), npy(y), npy(pred)
+
+    fig = plt.figure(figsize=(16, 7))
+    gs = fig.add_gridspec(2, 4, height_ratios=[1.0, 1.5])
+    axl = fig.add_subplot(gs[0, :])
+    axl.plot(range(1, len(losses) + 1), losses, "-o", ms=3, color="#3B82F6")
+    axl.set_title(f"training loss (epoch {epoch}, latest {losses[-1]:.4f})")
+    axl.set_xlabel("epoch"); axl.grid(alpha=0.3)
+
+    panels = [(x[MAX_LAYERS], "current net pins"),
+              (x[MAX_LAYERS + 1], "next-K nets pins"),
+              (pred[layer], f"PREDICTED demand (L{layer})"),
+              (y[layer], f"ACTUAL future routes (L{layer})")]
+    for j, (im, title) in enumerate(panels):
+        a = fig.add_subplot(gs[1, j])
+        a.imshow(im, origin="lower", cmap="inferno" if j >= 2 else "viridis")
+        a.set_title(title, fontsize=9); a.axis("off")
+    fig.tight_layout()
+
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(os.path.join(out_dir, f"epoch_{epoch:03d}.png"), dpi=90,
+                bbox_inches="tight", facecolor="white")
+    if show and _in_notebook():
+        from IPython.display import clear_output, display
+        clear_output(wait=True)
+        display(fig)
+    plt.close(fig)
+
+
 def train(dataset_path: str, epochs: int = 20, batch_size: int = 8, lr: float = 2e-3,
-          K: int = 3, device: str = "auto", ckpt: str = "checkpoints/demand_predictor.pt"):
+          K: int = 3, device: str = "auto", ckpt: str = "checkpoints/demand_predictor.pt",
+          viz_every: int = 5, viz_sample: int = 0, viz_dir: str = "checkpoints/viz",
+          show: bool = True):
     device = torch.device("cuda" if (device == "auto" and torch.cuda.is_available()) else
                           (device if device != "auto" else "cpu"))
     with open(dataset_path, "rb") as f:
@@ -211,21 +261,37 @@ def train(dataset_path: str, epochs: int = 20, batch_size: int = 8, lr: float = 
     model = DemandPredictor().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     print(f"train: {len(ds)} samples from {len(samples)} boards, device={device}", flush=True)
+
+    # Fixed sample for the live visualizer (its input never changes, only the prediction does).
+    viz_sample = min(viz_sample, len(ds) - 1)
+    vx, vy, vlm = ds[viz_sample]
+    vxb, _, vlmb, _ = collate_pad([ds[viz_sample]])
+
+    losses = []
     for ep in range(epochs):
         model.train()
         tot, nb = 0.0, 0
         for x, y, lm, sm in dl:
             x, y, lm, sm = x.to(device), y.to(device), lm.to(device), sm.to(device)
-            logits = model(x)
-            loss = demand_loss(logits, y, lm, sm)
+            loss = demand_loss(model(x), y, lm, sm)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             tot += loss.item(); nb += 1
-        print(f"epoch {ep+1:3d}  loss {tot/max(1,nb):.4f}", flush=True)
+        losses.append(tot / max(1, nb))
+        print(f"epoch {ep+1:3d}  loss {losses[-1]:.4f}", flush=True)
+
+        if viz_every and ((ep + 1) % viz_every == 0 or ep == epochs - 1):
+            model.eval()
+            with torch.no_grad():
+                pred = model.predict(vxb.to(device), vlmb.to(device))[0]
+            # crop prediction back to the un-padded sample size
+            pred = pred[:, :vx.shape[1], :vx.shape[2]].cpu()
+            _render_progress((vx, vy), pred, losses, ep + 1, viz_dir, show)
+
     os.makedirs(os.path.dirname(ckpt) or ".", exist_ok=True)
     torch.save({"model": model.state_dict(), "K": K}, ckpt)
-    print(f"saved -> {ckpt}", flush=True)
+    print(f"saved -> {ckpt}  (progress PNGs in {viz_dir}/)", flush=True)
     return model
 
 
@@ -235,11 +301,15 @@ if __name__ == "__main__":
     ap.add_argument("--stages", nargs="+", default=["s10_via_plus_multi_net"])
     ap.add_argument("--boards", type=int, default=40)
     ap.add_argument("--data", default="data/demand_dataset.pkl")
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--K", type=int, default=3)
+    ap.add_argument("--viz_every", type=int, default=5)
+    ap.add_argument("--no_show", action="store_true", help="save viz PNGs but don't display")
     args = ap.parse_args()
     if args.gen:
         generate_dataset(args.stages, args.boards, args.data)
     else:
-        train(args.data, epochs=args.epochs, batch_size=args.batch, K=args.K)
+        train(args.data, epochs=args.epochs, batch_size=args.batch, lr=args.lr, K=args.K,
+              viz_every=args.viz_every, show=not args.no_show)
