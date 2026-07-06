@@ -9,7 +9,7 @@ training:
   seed: 42
   
   real_steps_per_iteration: 64
-  train_ratio: 16              # gradient updates per iteration. Was 100 → ~50x over-optimization
+  train_ratio: 4               # gradient updates per iteration. Dropped to 4 to prevent over-optimization and stabilize training
                                # against a still-wrong world model; the actor sprinted into the
                                # reward model's blind spots (corner-walk exploit) faster than the
                                # WM could correct. DreamerV3 uses O(8-32).
@@ -45,7 +45,7 @@ training:
 
   world_model_lr: 3.0e-4
   actor_lr: 8.0e-5
-  critic_lr: 8.0e-5
+  critic_lr: 3.0e-5
   wm_weight_decay: 1.0e-6
   wm_grad_clip: 100.0
   actor_grad_clip: 100.0

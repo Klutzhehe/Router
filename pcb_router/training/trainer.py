@@ -324,7 +324,7 @@ class BaseRoutingTrainer:
             print(f"Warning: Failed to save visual checkpoint: {e}")
 
 
-from pcb_router.models.jepa import JEPAWorldModel, symexp
+from pcb_router.models.jepa import JEPAWorldModel, symexp, symlog
 from pcb_router.models.policy import DreamerActorCritic
 from pcb_router.training.replay_buffer import ReplayBuffer, Episode
 from collections import defaultdict, deque
@@ -1425,21 +1425,21 @@ class DreamerJEPATrainer(BaseRoutingTrainer):
             
             lambda_returns = compute_lambda_returns(
                 rewards=traj_rewards,
-                values=traj_values,
+                values=symexp(traj_values),
                 continues=traj_continues,
-                bootstrap=bootstrap_value,
+                bootstrap=symexp(bootstrap_value),
                 gamma=self.gamma,
                 lam=self.lambda_
             )
             
-            targets = lambda_returns.detach()
+            targets = symlog(lambda_returns.detach())
             
             self.actor_opt.zero_grad(set_to_none=True)
             self.critic_opt.zero_grad(set_to_none=True)
             
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 critic_loss = F.mse_loss(traj_values, targets)
-                advantages = (targets - traj_values).detach()
+                advantages = (symexp(targets) - symexp(traj_values)).detach()
                 # Normalize advantages to stabilize training and maintain correct scale relative to entropy
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 if self.routing_mode == 'autoregressive':
