@@ -231,6 +231,21 @@ class RipUpRerouteRouter:
                       f"routed {routed_count}/{len(nets)}, shared cells {int(shared.sum())}", flush=True)
             if not shared.any() and not failed:
                 break
+            # Stagnation early-exit: negotiated congestion only works by penalizing CONTESTED
+            # (shared) cells so conflicting nets peel apart over successive passes. If some nets
+            # still failed but there are zero shared cells, there is no contention signal left for
+            # the algorithm to act on - those nets aren't losing a conflict, they're structurally
+            # infeasible (e.g. no via-escape route exists at all). `history` only grows on shared
+            # cells, so with none, next pass's cost field for these nets is bit-for-bit identical
+            # and they will fail again, forever, burning a full expensive A* search each time.
+            # Observed directly: a real board looped "3/7 routed, 0 shared" unchanged for 5 straight
+            # iterations (most of a 41s run) before hitting max_iterations anyway. Stop immediately
+            # instead - the board is already correctly marked incomplete either way.
+            if failed and not shared.any():
+                if self.verbose:
+                    print(f"    [rip-up-reroute] stagnant (no contention left to resolve, "
+                          f"{len(failed)} net(s) infeasible) - stopping early", flush=True)
+                break
             # Grow the penalty on contested cells so the nets separate next pass.
             history[shared] += self.history_increment
 
