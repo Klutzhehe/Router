@@ -41,6 +41,8 @@ class RipUpRerouteRouter:
         history_increment: float = 1.0,
         max_iterations: int = 20,
         resolution: float = 0.1,
+        astar_max_iterations: int = 40000,
+        verbose: bool = True,
     ):
         self.board = board
         self.H = board.height
@@ -57,6 +59,16 @@ class RipUpRerouteRouter:
         self.congestion_alpha = congestion_alpha
         self.history_increment = history_increment
         self.max_iterations = max_iterations
+        # Per-search node budget for each A* call. The pathfinder's own default (200,000) means an
+        # unreachable/very-hard net can burn 100+ seconds on a SINGLE attempt, and route() calls
+        # this for every net on every rip-up pass (up to max_iterations passes) - on a congested
+        # multi-net board that can look "stuck" for minutes with zero output. 40,000 is generous for
+        # legitimate successful searches at these board sizes (paths typically only need a few
+        # thousand expansions) while bounding the worst case for a hopeless net to a small fraction
+        # of the old cost. A net that fails here simply gets rejected (dataset gen already discards
+        # incomplete boards and tries a new seed), so failing faster is a net win for throughput.
+        self.astar_max_iterations = astar_max_iterations
+        self.verbose = verbose
 
     # ── internals ────────────────────────────────────────────────────────────────
     def _pins_of(self, net):
@@ -73,7 +85,8 @@ class RipUpRerouteRouter:
         for p in pins[1:]:
             tgt = (p.global_x, p.global_y, p.layer if p.layer != -1 else 0)
             path, _cost = self.pathfinder.find_path(
-                heatmaps, via_prob, curr, tgt, self.active_layers, board_state=base_state
+                heatmaps, via_prob, curr, tgt, self.active_layers, board_state=base_state,
+                max_iterations=self.astar_max_iterations
             )
             if not path:
                 return None
@@ -186,7 +199,8 @@ class RipUpRerouteRouter:
                         base_state.set_current_net(p_net.id)
                         path_p, path_n, _cost = self.pathfinder.find_path_coupled(
                             heatmaps, via_prob, curr_p, curr_tgt_p, curr_n, curr_tgt_n,
-                            self.active_layers, board_state=base_state, gap_cells=gap_cells
+                            self.active_layers, board_state=base_state, gap_cells=gap_cells,
+                            max_iterations=self.astar_max_iterations
                         )
 
                         routes[p_net.id] = path_p
@@ -208,6 +222,13 @@ class RipUpRerouteRouter:
 
             shared = usage > 1.5  # a centerline cell claimed by >= 2 nets
             failed = [nid for nid, p in routes.items() if p is None]
+            routed_count = len(nets) - len(failed)
+            # Progress visibility: a single rip-up pass over a congested/many-net board can take a
+            # while (each net is a full A* search), and previously nothing printed until the WHOLE
+            # board finished - a slow board looked identical to a hung one. One line per pass.
+            if self.verbose:
+                print(f"    [rip-up-reroute] iter {iteration + 1}/{self.max_iterations}: "
+                      f"routed {routed_count}/{len(nets)}, shared cells {int(shared.sum())}", flush=True)
             if not shared.any() and not failed:
                 break
             # Grow the penalty on contested cells so the nets separate next pass.

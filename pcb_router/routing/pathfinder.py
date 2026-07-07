@@ -207,7 +207,7 @@ class AStarPathfinder:
 
         return None, float('inf')
 
-    def find_path_coupled(self, heatmaps, via_prob, source_p, target_p, source_n, target_n, active_layers, board_state, gap_cells=2):
+    def find_path_coupled(self, heatmaps, via_prob, source_p, target_p, source_n, target_n, active_layers, board_state, gap_cells=2, max_iterations=200000):
         N_layers, H, W = heatmaps.shape
         active_layers_set = set(active_layers)
 
@@ -313,7 +313,6 @@ class AStarPathfinder:
         heapq.heappush(pq, (self._heuristic((sx_c, sy_c, sl_c), (tx_c, ty_c, tl_c)), 0.0, sx_c, sy_c, sl_c, 0))
 
         iterations = 0
-        max_iterations = 200000
         while pq and iterations < max_iterations:
             iterations += 1
             f, g, cx, cy, cl, last_dir_idx = heapq.heappop(pq)
