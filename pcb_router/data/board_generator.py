@@ -137,6 +137,14 @@ class BoardGenerator:
             num_diff_pairs=resolve_val(board_gen_cfg.get('num_diff_pairs_range'), board_gen_cfg.get('num_diff_pairs', 0)),
             length_matching=board_gen_cfg.get('length_matching', False),
             length_tolerance_mm=board_gen_cfg.get('length_tolerance_mm', 1.0),
+            # NOTE: without this, curriculum stages with length_matching: true silently produced ZERO
+            # matched nets (BoardGenerator.generate only creates them when matched_group_size > 0,
+            # which this method never used to set). Default to 2 (a matched pair) when length_matching
+            # is on and the stage doesn't specify a size.
+            matched_group_size=resolve_val(
+                board_gen_cfg.get('matched_group_size_range'),
+                board_gen_cfg.get('matched_group_size', 2 if board_gen_cfg.get('length_matching') else 0)
+            ),
             net_classes=board_gen_cfg.get('net_classes', ['signal']),
             design_rules=board_gen_cfg.get('design_rules', stage_config.get('design_rules'))
         )
