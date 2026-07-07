@@ -18,11 +18,17 @@ Design choices (kept optimized):
   * GroupNorm (batch-size robust) + SiLU. Returns **logits** (use BCEWithLogits); `predict()` applies
     sigmoid and the active-layer mask.
 
-Input channels (MAX_LAYERS + 2 = 10):
-    [0:8]  per-layer occupancy the router sees (pads + obstacles + already-routed copper), padded to 8
-    [8]    current net's pins (disc-stamped)
-    [9]    next-K nets' pins (disc-stamped)
+Input channels (MAX_LAYERS * 3 = 24):
+    [0:8]    per-layer occupancy the router sees (pads + obstacles + already-routed copper)
+    [8:16]   current net's pins, PER-LAYER (disc-stamped on the pin's own layer; through-hole
+             pins, layer == -1, are stamped on every active layer)
+    [16:24]  next-K nets' pins, PER-LAYER (same convention)
 Output channels (8): per-layer demand in [0,1] after sigmoid.
+
+Pin channels are per-layer (not a single flattened 2D map) so the model is actually told which
+layer an upcoming pin sits on, instead of having to infer it indirectly — it needs this because the
+label it's trained against (future route occupancy) is itself per-layer and via-crossings show up
+as demand appearing in two different layer channels at the same (x, y).
 """
 
 from typing import List, Optional, Sequence, Tuple
@@ -33,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 MAX_LAYERS = 8
-IN_CHANNELS = MAX_LAYERS + 2
+IN_CHANNELS = MAX_LAYERS * 3
 PIN_STAMP_RADIUS = 3
 
 
@@ -114,10 +120,22 @@ def _stamp_disc(grid: np.ndarray, cx: int, cy: int, radius: int, value: float = 
     np.maximum(grid[y0:y1, x0:x1], mask * value, out=grid[y0:y1, x0:x1])
 
 
-def rasterize_pins(pins, H: int, W: int, radius: int = PIN_STAMP_RADIUS) -> np.ndarray:
-    grid = np.zeros((H, W), dtype=np.float32)
+def _pin_layers(pin_layer: int, num_layers: int):
+    """Which of the board's active layers a pin's disc should be stamped onto. Through-hole pins
+    (layer == -1) span every active layer; SMD pins stamp only their own layer. Mirrors
+    train_demand_predictor.base_occupancy's layers_of() so pins and occupancy agree on convention."""
+    if pin_layer == -1:
+        return range(min(num_layers, MAX_LAYERS))
+    return [pin_layer] if 0 <= pin_layer < MAX_LAYERS else []
+
+
+def rasterize_pins(pins, H: int, W: int, num_layers: int, radius: int = PIN_STAMP_RADIUS) -> np.ndarray:
+    """Per-layer pin map: (MAX_LAYERS, H, W), each pin disc-stamped onto its own layer (or every
+    active layer if through-hole) instead of a single layer-agnostic 2D map."""
+    grid = np.zeros((MAX_LAYERS, H, W), dtype=np.float32)
     for p in pins:
-        _stamp_disc(grid, int(p.global_x), int(p.global_y), radius)
+        for l in _pin_layers(p.layer, num_layers):
+            _stamp_disc(grid[l], int(p.global_x), int(p.global_y), radius)
     return grid
 
 
@@ -140,7 +158,7 @@ def rasterize_segments_per_layer(segments, H: int, W: int, num_layers: int,
 
 
 def encode_input(occupancy_per_layer: np.ndarray, current_pins, future_pins,
-                 H: int, W: int) -> np.ndarray:
+                 H: int, W: int, num_layers: int) -> np.ndarray:
     """Build the (IN_CHANNELS, H, W) model input.
 
     occupancy_per_layer: (num_layers, H, W) occupancy the router sees for the current net
@@ -149,8 +167,8 @@ def encode_input(occupancy_per_layer: np.ndarray, current_pins, future_pins,
     x = np.zeros((IN_CHANNELS, H, W), dtype=np.float32)
     n = min(occupancy_per_layer.shape[0], MAX_LAYERS)
     x[:n] = occupancy_per_layer[:n]
-    x[MAX_LAYERS] = rasterize_pins(current_pins, H, W)
-    x[MAX_LAYERS + 1] = rasterize_pins(future_pins, H, W)
+    x[MAX_LAYERS:MAX_LAYERS * 2] = rasterize_pins(current_pins, H, W, num_layers)
+    x[MAX_LAYERS * 2:MAX_LAYERS * 3] = rasterize_pins(future_pins, H, W, num_layers)
     return x
 
 

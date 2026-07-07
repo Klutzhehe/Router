@@ -191,8 +191,8 @@ class DemandDataset(Dataset):
 
         x = np.zeros((IN_CHANNELS, H, W), dtype=np.float32)
         x[:MAX_LAYERS] = occ
-        x[MAX_LAYERS] = rasterize_pins(cur_pins, H, W, PIN_STAMP_RADIUS)
-        x[MAX_LAYERS + 1] = rasterize_pins(future_pins, H, W, PIN_STAMP_RADIUS)
+        x[MAX_LAYERS:MAX_LAYERS * 2] = rasterize_pins(cur_pins, H, W, L, PIN_STAMP_RADIUS)
+        x[MAX_LAYERS * 2:MAX_LAYERS * 3] = rasterize_pins(future_pins, H, W, L, PIN_STAMP_RADIUS)
 
         # Label = occupancy of the future nets' actual routes.
         y = np.zeros((MAX_LAYERS, H, W), dtype=np.float32)
