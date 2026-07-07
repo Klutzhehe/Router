@@ -23,7 +23,7 @@ import math
 import pickle
 import random
 import argparse
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,7 +38,7 @@ if _here not in sys.path:
 import yaml
 
 from pcb_router.data.board_generator import BoardGenerator
-# NOTE: RipUpRerouteRouter is imported lazily inside generate_dataset() so that training / the
+# NOTE: RipUpRerouteRouter is imported lazily inside _gen_one_board() so that training / the
 # Dataset class do not depend on the routing package (and aren't blocked by any WIP there).
 from pcb_router.models.demand_predictor import (
     DemandPredictor, MAX_LAYERS, IN_CHANNELS, PIN_STAMP_RADIUS,
@@ -84,8 +84,29 @@ def stamp_route(dst: np.ndarray, cells, H: int, W: int, radius: int = LINE_STAMP
 
 
 # ── dataset generation (compact) ──────────────────────────────────────────────────
+def _gen_one_board(args):
+    """Worker: generate + route one board for one seed. Returns a sample dict (without 'stage')
+    or None if the board didn't fully route (labels must be clean full routes). Module-level so
+    it's picklable for multiprocessing on Windows (spawn)."""
+    stage, seed, max_iters = args
+    from pcb_router.routing.rip_up_router import RipUpRerouteRouter  # lazy: only needed to gen data
+    random.seed(seed)
+    cfg = BoardGenerator.from_curriculum_stage(stage)
+    cfg.seed = seed
+    board = BoardGenerator().generate(cfg)
+    res = RipUpRerouteRouter(board, max_iterations=max_iters, verbose=False).route()
+    if res["completed"] != res["total"] or res["total"] < 2:
+        return None
+    order = [n.id for n in board.nets]
+    routes = {nid: [(int(x), int(y), int(l)) for (x, y, l) in p]
+              for nid, p in res["routes"].items() if p}
+    return {"board": board, "order": order, "routes": routes,
+            "nets": res["total"]}
+
+
 def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: str,
-                     max_iters: int = 6, seed0: int = 0, save_every: int = 10):
+                     max_iters: int = 6, seed0: int = 0, save_every: int = 10,
+                     workers: Optional[int] = None):
     """Generate (and incrementally save) routed boards for the demand-predictor dataset.
 
     Resumable: if `out_path` already has boards saved (e.g. from a session that got
@@ -93,10 +114,16 @@ def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: st
     restarting from zero. Saves every `save_every` new boards (atomically, via a temp file +
     rename) plus once at the end, so a Colab disconnect mid-run only costs the boards generated
     since the last checkpoint, not the whole run.
+
+    workers=None uses all-but-one CPU core; boards are generated in parallel processes (routing
+    is pure-Python and single-threaded, and boards that fail to fully route are discarded after
+    paying the full routing cost — on hard stages like s11 most of the wall time is discarded
+    boards, so parallelism is nearly a linear speedup). workers=1 forces the old sequential path.
     """
-    from pcb_router.routing.rip_up_router import RipUpRerouteRouter  # lazy: only needed to gen data
     cur = yaml.safe_load(open(os.path.join(_here, "configs/curriculum.yaml")))
     stages = {s["name"]: s for s in cur["stages"]}
+    if workers is None:
+        workers = max(1, (os.cpu_count() or 2) - 1)
 
     samples: List[dict] = []
     next_seed = seed0
@@ -123,26 +150,48 @@ def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: st
     for sname in stage_names:
         stage = stages[sname]
         made = sum(1 for s in samples if s.get("stage") == sname)
-        while made < boards_per_stage:
-            random.seed(seed)
-            cfg = BoardGenerator.from_curriculum_stage(stage)
-            cfg.seed = seed
-            seed += 1
-            board = BoardGenerator().generate(cfg)
-            res = RipUpRerouteRouter(board, max_iterations=max_iters).route()
-            # Keep only boards where every net routed, so labels are clean full routes.
-            if res["completed"] != res["total"] or res["total"] < 2:
-                continue
-            order = [n.id for n in board.nets]
-            routes = {nid: [(int(x), int(y), int(l)) for (x, y, l) in p]
-                      for nid, p in res["routes"].items() if p}
-            samples.append({"board": board, "order": order, "routes": routes, "stage": sname})
+        attempts = 0
+
+        def accept(sample):
+            nonlocal made
+            n_nets = sample.pop("nets", "?")
+            sample["stage"] = sname
+            samples.append(sample)
             made += 1
+            board = sample["board"]
+            rate = made / max(1, attempts)
             print(f"  [{sname}] board {made}/{boards_per_stage} "
-                  f"({board.width}x{board.height} L{board.num_layers} nets={res['total']})", flush=True)
+                  f"({board.width}x{board.height} L{board.num_layers} nets={n_nets}) "
+                  f"acceptance {made}/{attempts} ({rate:.0%})", flush=True)
             if len(samples) % save_every == 0:
                 save()
                 print(f"  [checkpoint] saved {len(samples)} boards -> {out_path}", flush=True)
+
+        if workers > 1:
+            # Boards are independent, so keep `workers` routing jobs in flight and collect
+            # whichever finishes first. When the quota is hit we stop submitting but still
+            # keep any accepted boards from jobs already in flight (free extra data).
+            from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                pending = set()
+                while made < boards_per_stage or pending:
+                    while made < boards_per_stage and len(pending) < workers * 2:
+                        pending.add(ex.submit(_gen_one_board, (stage, seed, max_iters)))
+                        seed += 1
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        attempts += 1
+                        sample = fut.result()
+                        if sample is not None:
+                            accept(sample)
+        else:
+            while made < boards_per_stage:
+                attempts += 1
+                sample = _gen_one_board((stage, seed, max_iters))
+                seed += 1
+                # Keep only boards where every net routed, so labels are clean full routes.
+                if sample is not None:
+                    accept(sample)
 
     save()
     print(f"Saved {len(samples)} boards -> {out_path}", flush=True)
@@ -151,13 +200,21 @@ def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: st
 
 # ── torch Dataset (lazy rasterization) ─────────────────────────────────────────────
 class DemandDataset(Dataset):
-    def __init__(self, samples, K: int = 3):
+    def __init__(self, samples, K: int = 3, full_future_prob: float = 0.25):
         # Tolerate loading the raw pickle straight off disk: generate_dataset saves
         # {'samples': [...], 'next_seed': int} so runs are resumable; unwrap it here so both
         # notebook cells (which just do pickle.load(...)) keep working unchanged.
         if isinstance(samples, dict) and "samples" in samples:
             samples = samples["samples"]
         self.K = K
+        # Probability that a sample's "future nets" set is ALL remaining nets instead of the
+        # next k <= K. Full-horizon samples are what let the trained model double as a
+        # whole-board demand predictor at inference — warm-starting the rip-up router's cost
+        # field and computing the routability/overflow score — rather than only a next-K
+        # lookahead. Without them, querying with every unrouted net's pins would be
+        # out-of-distribution (the model would have only ever seen ~K nets' worth of pins in
+        # that channel and learned to predict ~K nets' worth of demand).
+        self.full_future_prob = full_future_prob
         self.samples = samples
         # Precompute base occupancy per board (once) and flat index of (board, net position).
         self.base_occ = [base_occupancy(s["board"]) for s in samples]
@@ -185,7 +242,14 @@ class DemandDataset(Dataset):
         cur_net = next(n for n in board.nets if n.id == order[i])
         cur_pins = [pins[p] for p in cur_net.pin_ids]
 
-        future_ids = order[i + 1: i + 1 + self.K]
+        # Variable horizon: usually the next k nets (k sampled in [1, K] so the model sees
+        # varying lookaheads), sometimes all remaining nets (see full_future_prob above).
+        n_remaining = len(order) - (i + 1)
+        if random.random() < self.full_future_prob:
+            k = n_remaining
+        else:
+            k = random.randint(1, min(self.K, n_remaining))
+        future_ids = order[i + 1: i + 1 + k]
         future_pins = [pins[p] for nid in future_ids
                        for p in next(n for n in board.nets if n.id == nid).pin_ids]
 
@@ -225,11 +289,19 @@ def collate_pad(batch, mult: int = 8):
 
 
 # ── loss ───────────────────────────────────────────────────────────────────────────
-def demand_loss(logits, target, lmask, smask, pos_weight: float = 20.0):
-    """Weighted BCE over active layers + valid spatial region. Positives (route cells) are rare,
-    so up-weight them."""
-    w = torch.where(target > 0.5, torch.full_like(target, pos_weight), torch.ones_like(target))
-    w = w * lmask[:, :, None, None] * smask  # zero out inactive layers and padded pixels
+def demand_loss(logits, target, lmask, smask, pos_weight: Optional[float] = None):
+    """Weighted BCE over active layers + valid spatial region. Positives (route cells) are up-
+    weighted. pos_weight=None (default) auto-balances per batch as neg/pos ratio clamped to
+    [1, 20]: with variable-horizon labels the positive rate spans a wide range (next-1-net
+    labels are very sparse; all-remaining-nets labels are dense), so any fixed weight is wrong
+    for part of the data — the old fixed 20.0 would badly over-weight positives on dense
+    full-horizon samples."""
+    valid = lmask[:, :, None, None] * smask  # zero out inactive layers and padded pixels
+    if pos_weight is None:
+        n_pos = ((target > 0.5).float() * valid).sum()
+        n_valid = valid.sum()
+        pos_weight = ((n_valid - n_pos) / n_pos.clamp_min(1.0)).clamp(1.0, 20.0)
+    w = (1.0 + (pos_weight - 1.0) * (target > 0.5).float()) * valid
     bce = F.binary_cross_entropy_with_logits(logits, target, weight=w, reduction="sum")
     denom = w.sum().clamp_min(1.0)
     return bce / denom
@@ -284,14 +356,15 @@ def _render_progress(sample, pred, losses, epoch, out_dir, show, layer=0):
 
 
 def train(dataset_path: str, epochs: int = 20, batch_size: int = 8, lr: float = 2e-3,
-          K: int = 3, device: str = "auto", ckpt: str = "checkpoints/demand_predictor.pt",
+          K: int = 3, full_future_prob: float = 0.25, device: str = "auto",
+          ckpt: str = "checkpoints/demand_predictor.pt",
           viz_every: int = 5, viz_sample: int = 0, viz_dir: str = "checkpoints/viz",
           show: bool = True):
     device = torch.device("cuda" if (device == "auto" and torch.cuda.is_available()) else
                           (device if device != "auto" else "cpu"))
     with open(dataset_path, "rb") as f:
         samples = pickle.load(f)
-    ds = DemandDataset(samples, K=K)
+    ds = DemandDataset(samples, K=K, full_future_prob=full_future_prob)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_pad,
                     num_workers=0, drop_last=False)
     model = DemandPredictor().to(device)
@@ -337,15 +410,21 @@ if __name__ == "__main__":
     ap.add_argument("--stages", nargs="+", default=["s10_via_plus_multi_net"])
     ap.add_argument("--boards", type=int, default=40)
     ap.add_argument("--data", default="data/demand_dataset.pkl")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="parallel board-generation processes (default: CPU count - 1; 1 = sequential)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--K", type=int, default=3)
+    ap.add_argument("--full_future_prob", type=float, default=0.25,
+                    help="fraction of samples whose future set is ALL remaining nets (enables "
+                         "whole-board demand prediction for warm-start + routability score)")
     ap.add_argument("--viz_every", type=int, default=5)
     ap.add_argument("--no_show", action="store_true", help="save viz PNGs but don't display")
     args = ap.parse_args()
     if args.gen:
-        generate_dataset(args.stages, args.boards, args.data)
+        generate_dataset(args.stages, args.boards, args.data, workers=args.workers)
     else:
         train(args.data, epochs=args.epochs, batch_size=args.batch, lr=args.lr, K=args.K,
+              full_future_prob=args.full_future_prob,
               viz_every=args.viz_every, show=not args.no_show)

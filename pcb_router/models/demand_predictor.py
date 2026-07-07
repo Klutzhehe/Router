@@ -22,7 +22,12 @@ Input channels (MAX_LAYERS * 3 = 24):
     [0:8]    per-layer occupancy the router sees (pads + obstacles + already-routed copper)
     [8:16]   current net's pins, PER-LAYER (disc-stamped on the pin's own layer; through-hole
              pins, layer == -1, are stamped on every active layer)
-    [16:24]  next-K nets' pins, PER-LAYER (same convention)
+    [16:24]  FUTURE nets' pins, PER-LAYER (same convention). Trained with a variable horizon:
+             usually the next k <= K nets, sometimes ALL remaining nets — so at inference this
+             channel may legally hold anything from one net's pins up to every unrouted net's
+             pins. The full-horizon mode is what makes the model usable as a whole-board demand
+             predictor: warm-starting the rip-up router's congestion cost field and computing
+             the routability/overflow score (predicted demand vs. capacity).
 Output channels (8): per-layer demand in [0,1] after sigmoid.
 
 Pin channels are per-layer (not a single flattened 2D map) so the model is actually told which

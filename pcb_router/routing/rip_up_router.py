@@ -27,6 +27,7 @@ import numpy as np
 import scipy.ndimage as ndimage
 
 from pcb_router.routing.pathfinder import AStarPathfinder
+from pcb_router.routing.obstacle_maps import build_obstacle_maps, build_via_blocked_maps
 from pcb_router.routing.trace_generator import TraceGenerator
 from pcb_router.routing.meander import MeanderInserter
 from pcb_router.env.board_state import BoardState
@@ -69,10 +70,31 @@ class RipUpRerouteRouter:
         # incomplete boards and tries a new seed), so failing faster is a net win for throughput.
         self.astar_max_iterations = astar_max_iterations
         self.verbose = verbose
+        self._maps_cache = {}  # populated per route() call; see _maps_for
 
     # ── internals ────────────────────────────────────────────────────────────────
     def _pins_of(self, net):
         return [self.board.pins[pid] for pid in net.pin_ids]
+
+    def _maps_for(self, base_state, net_id, exempt):
+        """Obstacle + via-blocked maps for one net's search, cached across rip-up passes.
+
+        Safe to cache because base_state never accumulates traces here (other nets' traces are
+        SOFT, expressed only through the usage/history cost maps), so its occupancy for a given
+        current net is identical on every pass — but building the via map is a full-board
+        dilation per layer, which used to be redone for every net on every pass and dominated
+        wall time on large multi-layer boards. Caller must have set_current_net(net_id) first.
+        """
+        key = (net_id, exempt)
+        m = self._maps_cache.get(key)
+        if m is None:
+            obs = build_obstacle_maps(
+                base_state, self.active_layers, exempt, shape=(self.H, self.W),
+                obstacle_threshold=self.pathfinder.obstacle_threshold,
+            )
+            via = build_via_blocked_maps(base_state, obs, self.active_layers, shape=(self.H, self.W))
+            self._maps_cache[key] = m = (obs, via)
+        return m
 
     def _route_one_net(self, net, heatmaps, via_prob, base_state) -> Optional[list]:
         """Route a (possibly multi-pin) net sequentially through its pins.
@@ -84,9 +106,12 @@ class RipUpRerouteRouter:
         full_path = [curr]
         for p in pins[1:]:
             tgt = (p.global_x, p.global_y, p.layer if p.layer != -1 else 0)
+            # Same exempt set find_path would build itself: {source cell, target cell}.
+            maps = self._maps_for(base_state, net.id,
+                                  frozenset({(curr[0], curr[1]), (tgt[0], tgt[1])}))
             path, _cost = self.pathfinder.find_path(
                 heatmaps, via_prob, curr, tgt, self.active_layers, board_state=base_state,
-                max_iterations=self.astar_max_iterations
+                max_iterations=self.astar_max_iterations, prebuilt_maps=maps
             )
             if not path:
                 return None
@@ -134,6 +159,8 @@ class RipUpRerouteRouter:
         # Base state carries pads/obstacles/keep-outs only (no traces), so other nets' *traces*
         # stay soft. set_current_net(id) per net exempts that net's own pads.
         base_state = BoardState(self.board, self.resolution)
+        # Obstacle/via-blocked map cache, valid for this base_state's lifetime (see _maps_for).
+        self._maps_cache = {}
 
         history = np.zeros((self.L, self.H, self.W), dtype=np.float32)
         usage = np.zeros((self.L, self.H, self.W), dtype=np.float32)
@@ -197,10 +224,22 @@ class RipUpRerouteRouter:
                         gap_cells = int(math.ceil((width + clearance) / self.resolution))
 
                         base_state.set_current_net(p_net.id)
+                        # Same exempt set find_path_coupled would build itself: the four pin
+                        # cells plus the derived source/target centreline cells (must mirror its
+                        # int(round(mean)) center computation).
+                        sx_c = int(round((curr_p[0] + curr_n[0]) / 2.0))
+                        sy_c = int(round((curr_p[1] + curr_n[1]) / 2.0))
+                        tx_c = int(round((curr_tgt_p[0] + curr_tgt_n[0]) / 2.0))
+                        ty_c = int(round((curr_tgt_p[1] + curr_tgt_n[1]) / 2.0))
+                        maps = self._maps_for(base_state, p_net.id, frozenset({
+                            (curr_p[0], curr_p[1]), (curr_tgt_p[0], curr_tgt_p[1]),
+                            (curr_n[0], curr_n[1]), (curr_tgt_n[0], curr_tgt_n[1]),
+                            (sx_c, sy_c), (tx_c, ty_c),
+                        }))
                         path_p, path_n, _cost = self.pathfinder.find_path_coupled(
                             heatmaps, via_prob, curr_p, curr_tgt_p, curr_n, curr_tgt_n,
                             self.active_layers, board_state=base_state, gap_cells=gap_cells,
-                            max_iterations=self.astar_max_iterations
+                            max_iterations=self.astar_max_iterations, prebuilt_maps=maps
                         )
 
                         routes[p_net.id] = path_p

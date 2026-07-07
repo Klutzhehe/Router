@@ -57,9 +57,15 @@ class AStarPathfinder:
         z_dist = 0 if (z1 == -1 or z2 == -1) else abs(z1 - z2)
         return d2d * (1.0 + self.heatmap_weight) + z_dist * self.base_via_cost
 
-    def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=200000, board_state=None):
+    def find_path(self, heatmaps, via_prob, source, target, active_layers, max_iterations=200000, board_state=None, prebuilt_maps=None):
         """
         Find path from source (x, y, layer) to target (x, y, layer)
+
+        prebuilt_maps: optional (obstacle_maps, via_blocked) pair built by the caller with the
+        same exempt cells {source[:2], target[:2]}. Building these is expensive (the via map is
+        a full-board dilation per layer) and the result is identical whenever board_state's
+        occupancy hasn't changed — rip-up-reroute calls this for the same net across many passes
+        against a trace-free base state, so caching there avoids rebuilding per pass.
         """
         N_layers, H, W = heatmaps.shape
         active_layers_set = set(active_layers)
@@ -96,14 +102,16 @@ class AStarPathfinder:
             p_sl = 0 if sl == -1 else sl
             return [(sx, sy, p_sl)], 0.0
 
-        exempt = {(sx, sy), (tx, ty)}
-
-        temp_obstacle_maps = build_obstacle_maps(
-            board_state, active_layers, exempt, shape=(H, W), obstacle_threshold=self.obstacle_threshold
-        )
-        via_blocked = build_via_blocked_maps(
-            board_state, temp_obstacle_maps, active_layers, shape=(H, W)
-        )
+        if prebuilt_maps is not None:
+            temp_obstacle_maps, via_blocked = prebuilt_maps
+        else:
+            exempt = {(sx, sy), (tx, ty)}
+            temp_obstacle_maps = build_obstacle_maps(
+                board_state, active_layers, exempt, shape=(H, W), obstacle_threshold=self.obstacle_threshold
+            )
+            via_blocked = build_via_blocked_maps(
+                board_state, temp_obstacle_maps, active_layers, shape=(H, W)
+            )
 
         # 1D Indexing Setup
         stride_y = W * 11
@@ -207,7 +215,7 @@ class AStarPathfinder:
 
         return None, float('inf')
 
-    def find_path_coupled(self, heatmaps, via_prob, source_p, target_p, source_n, target_n, active_layers, board_state, gap_cells=2, max_iterations=200000):
+    def find_path_coupled(self, heatmaps, via_prob, source_p, target_p, source_n, target_n, active_layers, board_state, gap_cells=2, max_iterations=200000, prebuilt_maps=None):
         N_layers, H, W = heatmaps.shape
         active_layers_set = set(active_layers)
 
@@ -227,18 +235,20 @@ class AStarPathfinder:
         if not (0 <= sx_c < W and 0 <= sy_c < H) or not (0 <= tx_c < W and 0 <= ty_c < H):
             return None, None, float('inf')
 
-        exempt = {
-            (source_p[0], source_p[1]), (target_p[0], target_p[1]),
-            (source_n[0], source_n[1]), (target_n[0], target_n[1]),
-            (sx_c, sy_c), (tx_c, ty_c)
-        }
-
-        temp_obstacle_maps = build_obstacle_maps(
-            board_state, active_layers, exempt, shape=(H, W), obstacle_threshold=self.obstacle_threshold
-        )
-        via_blocked = build_via_blocked_maps(
-            board_state, temp_obstacle_maps, active_layers, shape=(H, W)
-        )
+        if prebuilt_maps is not None:
+            temp_obstacle_maps, via_blocked = prebuilt_maps
+        else:
+            exempt = {
+                (source_p[0], source_p[1]), (target_p[0], target_p[1]),
+                (source_n[0], source_n[1]), (target_n[0], target_n[1]),
+                (sx_c, sy_c), (tx_c, ty_c)
+            }
+            temp_obstacle_maps = build_obstacle_maps(
+                board_state, active_layers, exempt, shape=(H, W), obstacle_threshold=self.obstacle_threshold
+            )
+            via_blocked = build_via_blocked_maps(
+                board_state, temp_obstacle_maps, active_layers, shape=(H, W)
+            )
 
         ref_dx = target_p[0] - source_p[0]
         ref_dy = target_p[1] - source_p[1]
