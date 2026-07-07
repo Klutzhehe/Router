@@ -16,6 +16,37 @@ class AStarPathfinder:
         self.SQRT2_MINUS_2 = math.sqrt(2.0) - 2.0
         self.debug = debug
 
+        # Precomputed turn-severity table (8x8, indices 0..7 matching self.moves) used to scale
+        # direction_change_penalty by the ACTUAL angle between the previous and next move, instead
+        # of a flat "changed direction at all" cost. Previously a gentle 45-degree bend and a full
+        # 180-degree U-turn cost the exact same penalty, so once local congestion made a straight
+        # push expensive, A* had no extra reason to prefer a small bend over a full reversal -
+        # producing paths that bend, overlap themselves, and U-turn back. Severity in [0, 1]:
+        # 0.0 = straight (same direction), 0.5 = 90-degree turn, 1.0 = full 180-degree reversal.
+        # A 45-degree bend now costs ~0.15x the old flat penalty; a reversal still costs the full
+        # penalty, so reversals are now much more expensive RELATIVE to gentle bends than before.
+        n = len(self.moves)
+        self._turn_severity = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            dx1, dy1, _ = self.moves[i]
+            len1 = math.hypot(dx1, dy1)
+            for j in range(n):
+                dx2, dy2, _ = self.moves[j]
+                len2 = math.hypot(dx2, dy2)
+                cos_theta = (dx1 * dx2 + dy1 * dy2) / (len1 * len2)
+                cos_theta = max(-1.0, min(1.0, cos_theta))
+                self._turn_severity[i][j] = (1.0 - cos_theta) / 2.0
+
+    def _turn_penalty(self, last_dir_idx: int, d_idx: int) -> float:
+        """direction_change_penalty scaled by turn angle. last_dir_idx/d_idx are 1..8 (index into
+        self.moves + 1); 0 means no established direction yet (path start) and 9/10 mean the
+        previous move was a via (no in-plane direction to compare against) - both are unpenalized,
+        matching prior behavior."""
+        if last_dir_idx <= 0 or last_dir_idx > 8:
+            return 0.0
+        severity = self._turn_severity[last_dir_idx - 1][d_idx - 1]
+        return self.direction_change_penalty * severity
+
     def _heuristic(self, p1, p2):
         """3D heuristic: 2D distance + layer transition cost estimation"""
         x1, y1, z1 = p1
@@ -138,10 +169,7 @@ class AStarPathfinder:
 
                     move_cost = 1.4142135623730951 if is_diag else 1.0
                     d_idx = i + 1
-
-                    penalty = 0.0
-                    if last_dir_idx > 0 and last_dir_idx != d_idx:
-                        penalty = self.direction_change_penalty
+                    penalty = self._turn_penalty(last_dir_idx, d_idx)
 
                     h_val = heatmaps[cl, ny, nx]
                     edge_cost = move_cost * (1.0 + self.heatmap_weight * (1.0 - h_val)) + penalty
@@ -431,7 +459,7 @@ class AStarPathfinder:
 
                     move_cost = 1.4142135623730951 if is_diag else 1.0
                     d_idx = i + 1
-                    penalty = self.direction_change_penalty if (last_dir_idx > 0 and last_dir_idx != d_idx) else 0.0
+                    penalty = self._turn_penalty(last_dir_idx, d_idx)
 
                     h_val_p = heatmaps[cl, P_next_y, P_next_x]
                     h_val_n = heatmaps[cl, N_next_y, N_next_x]

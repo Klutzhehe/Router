@@ -85,15 +85,44 @@ def stamp_route(dst: np.ndarray, cells, H: int, W: int, radius: int = LINE_STAMP
 
 # ── dataset generation (compact) ──────────────────────────────────────────────────
 def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: str,
-                     max_iters: int = 6, seed0: int = 0):
+                     max_iters: int = 6, seed0: int = 0, save_every: int = 10):
+    """Generate (and incrementally save) routed boards for the demand-predictor dataset.
+
+    Resumable: if `out_path` already has boards saved (e.g. from a session that got
+    disconnected), they're loaded and generation continues on top of them instead of
+    restarting from zero. Saves every `save_every` new boards (atomically, via a temp file +
+    rename) plus once at the end, so a Colab disconnect mid-run only costs the boards generated
+    since the last checkpoint, not the whole run.
+    """
     from pcb_router.routing.rip_up_router import RipUpRerouteRouter  # lazy: only needed to gen data
     cur = yaml.safe_load(open(os.path.join(_here, "configs/curriculum.yaml")))
     stages = {s["name"]: s for s in cur["stages"]}
-    samples = []
-    seed = seed0
+
+    samples: List[dict] = []
+    next_seed = seed0
+    if os.path.exists(out_path):
+        with open(out_path, "rb") as f:
+            loaded = pickle.load(f)
+        if isinstance(loaded, dict) and "samples" in loaded:
+            samples = loaded["samples"]
+            next_seed = loaded.get("next_seed", seed0 + len(samples))
+        else:
+            samples = loaded  # legacy bare-list pickle from before resumable saving existed
+            next_seed = seed0 + len(samples)
+        print(f"resuming: {len(samples)} boards already saved at {out_path}", flush=True)
+
+    seed = next_seed
+
+    def save():
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            pickle.dump({"samples": samples, "next_seed": seed}, f)
+        os.replace(tmp_path, out_path)
+
     for sname in stage_names:
         stage = stages[sname]
-        made = 0
+        made = sum(1 for s in samples if s.get("stage") == sname)
         while made < boards_per_stage:
             random.seed(seed)
             cfg = BoardGenerator.from_curriculum_stage(stage)
@@ -107,20 +136,27 @@ def generate_dataset(stage_names: List[str], boards_per_stage: int, out_path: st
             order = [n.id for n in board.nets]
             routes = {nid: [(int(x), int(y), int(l)) for (x, y, l) in p]
                       for nid, p in res["routes"].items() if p}
-            samples.append({"board": board, "order": order, "routes": routes})
+            samples.append({"board": board, "order": order, "routes": routes, "stage": sname})
             made += 1
             print(f"  [{sname}] board {made}/{boards_per_stage} "
                   f"({board.width}x{board.height} L{board.num_layers} nets={res['total']})", flush=True)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump(samples, f)
+            if len(samples) % save_every == 0:
+                save()
+                print(f"  [checkpoint] saved {len(samples)} boards -> {out_path}", flush=True)
+
+    save()
     print(f"Saved {len(samples)} boards -> {out_path}", flush=True)
     return samples
 
 
 # ── torch Dataset (lazy rasterization) ─────────────────────────────────────────────
 class DemandDataset(Dataset):
-    def __init__(self, samples: List[dict], K: int = 3):
+    def __init__(self, samples, K: int = 3):
+        # Tolerate loading the raw pickle straight off disk: generate_dataset saves
+        # {'samples': [...], 'next_seed': int} so runs are resumable; unwrap it here so both
+        # notebook cells (which just do pickle.load(...)) keep working unchanged.
+        if isinstance(samples, dict) and "samples" in samples:
+            samples = samples["samples"]
         self.K = K
         self.samples = samples
         # Precompute base occupancy per board (once) and flat index of (board, net position).
